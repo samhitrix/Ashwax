@@ -122,12 +122,12 @@ to keep losses small, known in advance and survivable.
 |---|---|---|
 | **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs, so no order ever reaches a broker. Live **market data still comes from a Kite Connect API key** (see below). |
 | **Zerodha Kite Connect** | ✅ Primary broker — required, even for paper (paid data plan; static IP for live orders) | Supplies market data in paper mode and orders in live mode. Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
-| **Angel One SmartAPI** | 🟡 Adapter implemented, not yet validated live | Quotes, history, option quotes, order placement / status. It has no native GTT, so stops use the manual SL / target-order fallback. Treat as experimental. |
-| **Upstox** | 🔲 Planned | Capability profile exists in `src/brokers/capability_matrix.json`; no adapter yet. |
+| **Angel One, Upstox** | 🔲 Planned | Not supported yet. See the [roadmap](#roadmap). |
 
-Select the broker with `BROKER=paper | kite | angel_one` in `.env` (unset = paper). Every adapter
-implements the same `BrokerInterface` (`src/brokers/base.py`), so the CRM, strategies and
-dashboard never call a broker directly. Per-broker differences — product codes, GTT support,
+Select the broker with `BROKER=paper | kite` in `.env` (unset = paper). Order execution goes
+through one `BrokerInterface` (`src/brokers/base.py`); some market-data and dashboard code still
+calls Kite directly today, which is what stops other brokers from being added yet (see the
+[roadmap](#roadmap)). Per-broker differences — product codes, GTT support,
 bracket orders, websocket limits — are declared in `src/brokers/capability_matrix.json`.
 
 Exchanges and instruments: NSE cash equities (CNC delivery and MIS intraday) and NSE index
@@ -177,7 +177,7 @@ unproven until it clears the promotion bar in [Going live](INSTALL.md#14-before-
   trading is tested.
 - Docker (`docker compose up -d --build`) is a single paper-only image with the dashboard's
   dev server; see [INSTALL.md](INSTALL.md#docker).
-- Only Kite Connect is run against real accounts. Angel One is unvalidated.
+- Only Zerodha Kite Connect is supported, and it is the only broker this has been run against.
 - Option stop-losses are enforced by the system, not by resting broker-side orders.
 
 ---
@@ -198,7 +198,9 @@ LLM review, learning engine, 17-tab dashboard, Docker one-command setup.
   time out) so `assisted` actually waits for you, replacing today's unused `ask_mode` settings.
 - **Promotion tooling.** One report per strategy that checks the written bar (trade count,
   profit factor, expectancy, slippage versus model) and refuses a switch to live until it is met.
-- **Validate Angel One** end to end: paper-versus-broker comparison runs, GTT fallback checks.
+- **Make the app broker-independent.** Route the dashboard API, the data downloader, login and
+  paper-mode prices through the broker interface instead of calling Kite directly. This is the
+  prerequisite for supporting any other broker.
 - **Production-grade containers.** Separate API, orchestrator and dashboard containers, a built
   (not dev-server) dashboard, and a tested live-broker login path.
 - **Automatic Kite session refresh in Docker** without pasting a daily token.
@@ -219,7 +221,8 @@ fail are recorded and dropped, not tuned until they pass. Candidates under resea
 **Usability and reach.**
 - Guided setup in the dashboard (broker login, API keys, Telegram) instead of editing `.env`.
 - A strategy builder UI on top of the USS JSON spec.
-- An Upstox adapter, using the capability profile already declared.
+- **More brokers:** Angel One first, then Upstox, each validated in paper-versus-broker runs
+  before it is listed as supported.
 - Hosted / multi-account mode with per-account risk limits.
 
 ### Phase 4 — better research and execution

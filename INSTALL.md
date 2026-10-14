@@ -177,9 +177,6 @@ Kite access tokens are valid for one trading day and expire the next morning bef
 and creating a new session invalidates the older token. This is why the system logs in again at
 each start.
 
-**Angel One SmartAPI** is a second, optional broker adapter. See the commented `ANGEL_ONE_*` and
-`BROKER=` lines in `.env.example`.
-
 ## 7. LLM providers
 
 LLMs tag news, generate ideas for the LLM agents and act as the G9 reviewer. Free tiers are
