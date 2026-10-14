@@ -622,9 +622,7 @@ class LLMClient:
             in_grace = grace > 0 and await LEDGER.seen_recently(f"{digest}:grace", grace)
             seen = await LEDGER.seen_recently(digest, window)
             is_retry = (
-                seen
-                and in_grace
-                and not await LEDGER.seen_recently(f"{digest}:retry_used", window)
+                seen and in_grace and not await LEDGER.seen_recently(f"{digest}:retry_used", window)
             )
             if seen and is_retry:
                 _log.info(

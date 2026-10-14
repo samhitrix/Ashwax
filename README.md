@@ -1,8 +1,10 @@
 # AshwaX
 
-Autonomous, **risk-first** trading system for Indian markets (NSE equities and NIFTY / BANKNIFTY
-index options). Every order — from any strategy, paper or live — passes an 11-gate Central
-Risk Manager and an independent LLM second opinion before it reaches a broker.
+**A fully automatic trading system for Indian markets** (NSE equities and NIFTY / BANKNIFTY
+index options). Once you switch it on and set your limits, it finds trades, sizes them, checks
+them, places them, protects them, manages them and closes them — **with no human clicking
+anything**. Every order, from every strategy, paper or live, must first pass an 11-gate Central
+Risk Manager and an independent LLM second opinion before it can reach a broker.
 
 > **Paper trading is the default and this repository ships paper-locked.** Nothing here is
 > financial advice. If you switch anything to live, you alone are responsible for the orders
@@ -12,11 +14,71 @@ Risk Manager and an independent LLM second opinion before it reaches a broker.
 
 <sub>All screenshots in this README use made-up sample data, not a real account.</sub>
 
-**Contents:** [How it works](#how-it-works) · [Supported brokers](#supported-brokers) ·
+**Contents:** [What "fully automatic" means](#what-fully-automatic-means-here) · [What makes it different](#what-makes-it-different) · [How it works](#how-it-works) · [Supported brokers](#supported-brokers) ·
 [Phase 1](#phase-1--what-is-in-this-release) · [Roadmap](#roadmap) ·
 [Dashboard tour](#dashboard-tour) · [Quick start](#quick-start) ·
 [Controlling the system](#controlling-the-system) · [Configuration](#configuration-at-a-glance) · [Safety design](#safety-design) ·
 [Project layout](#whats-inside)
+
+---
+
+## What "fully automatic" means here
+
+With `autonomy_mode: autonomous` (the shipped setting) a trade's whole life needs no human step:
+
+1. **Find** — strategies scan prices, breadth, sector strength, options chains and news all
+   session long, and an LLM agent proposes swing and intraday ideas.
+2. **Size** — position size is calculated from your live account equity and the distance to the
+   stop, so the rupees at risk are fixed in advance.
+3. **Check** — the Central Risk Manager runs 11 gates (kill switch, caps, loss breakers, time
+   windows, regime, news, strategy health, margin, stop-loss, LLM review, autonomy). One failed
+   gate and the trade never happens.
+4. **Second opinion** — a different LLM from the one that had the idea reviews it and can veto it.
+5. **Execute** — the entry is sent (simulated in paper mode, to the broker in live mode) and the
+   protective stop is placed first.
+6. **Manage** — an order monitor and reconciler watch every position against the broker; trailing
+   stops, targets, time stops and per-leg option stops fire on their own.
+7. **Close** — intraday positions are squared off before the close, a daily-loss breaker closes
+   all intraday positions if the day goes wrong, and an equity floor halts trading entirely.
+8. **Report and learn** — every decision is logged, Telegram alerts report what happened, and the
+   learning engine shrinks the size of any strategy that starts losing.
+
+What you still do: set the limits once, keep the broker session valid (Kite needs a fresh token
+each trading day; on Windows this can be automated, in Docker you paste it), and read the
+reports. You can pause everything at any time with the master switch, or set
+`autonomy_mode: manual` to stop new entries. See [Controlling the system](#controlling-the-system).
+
+## What makes it different
+
+These are specific, checkable properties of this codebase, not marketing claims:
+
+- **The risk manager cannot be bypassed.** There is one path to a broker, and every strategy goes
+  through the same 11 gates. The limits are %-of-equity numbers in config files, so they scale
+  with your account.
+- **Nothing grades its own homework.** The LLM that originates an idea is deliberately excluded
+  from reviewing it, and a missing verdict means no trade (fail closed), not a guess.
+- **Protection comes first.** The stop is placed before the position is considered "open", option
+  structures are defined-risk or carry per-leg stops, and swing stops are also backed by broker
+  GTT orders.
+- **It fails safe.** Missing data, a crashed component or a broken reconciliation blocks new
+  trades instead of continuing blindly; a daily-loss breaker for intraday and an absolute equity floor for the whole account are
+  built in.
+- **Paper first, with a written bar to go live.** One code path serves paper and live, strategies
+  start on paper, and each needs enough trades with positive after-cost expectancy before it is
+  promoted. Backtests run at 0.10 % costs and only ever add confidence; they never replace
+  forward results.
+- **Honest about edge.** Strategies that failed testing are disabled or removed rather than
+  tuned until they pass, and `scripts/research/` keeps the tests, including the failures.
+- **Every decision is explainable.** Signals, gate verdicts, LLM reasoning, orders and fills are
+  all stored in PostgreSQL and in an append-only trade ledger, and the dashboard shows only real
+  data, never placeholders.
+- **It learns, but only changes what you allow.** The learning engine tracks expectancy,
+  calibration and failure causes and scales position size by strategy health. Automatic
+  parameter promotion exists but is **switched off by default** (`config/learning.json`), and
+  nothing ever moves a strategy from paper to live on its own — that is always a manual edit.
+
+None of this guarantees profit. Markets can and do beat well-built systems; the design goal is
+to keep losses small, known in advance and survivable.
 
 ---
 

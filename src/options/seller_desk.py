@@ -1727,11 +1727,7 @@ class SellerDesk:
             except Exception:  # notify() must never break the trade path
                 pass
             return None
-        real_risk_blocked = (
-            None
-            if skip_shared_risk
-            else self.shared_risk_ceiling_reason(max_loss)
-        )
+        real_risk_blocked = None if skip_shared_risk else self.shared_risk_ceiling_reason(max_loss)
         if real_risk_blocked is not None:
             _LOG.info(
                 "seller_desk_execution_blocked_by_real_margin underlying=%s strategy=%s "

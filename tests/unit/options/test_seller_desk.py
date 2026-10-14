@@ -1042,16 +1042,24 @@ async def test_single_leg_vertical_is_not_closed_by_ordinary_delta_drift(
     assert "OPT-2" in desk.positions and executor.rolled == []
 
 
-def test_blackout_tightens_a_loosened_single_sided_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_blackout_tightens_a_loosened_single_sided_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.options import position_manager as pm
 
     monkeypatch.setattr(
         pm.seller_settings,
         "adjustment_settings",
-        lambda: {"single_sided_tested_delta": 0.50, "delta_breach_threshold": 0.35, "delta_breach_blackout": 0.25},
+        lambda: {
+            "single_sided_tested_delta": 0.50,
+            "delta_breach_threshold": 0.35,
+            "delta_breach_blackout": 0.25,
+        },
     )
     assert pm.single_sided_tested_delta() == 0.50
-    assert pm.single_sided_tested_delta(blackout_active=True) == pytest.approx(0.40)  # 0.50 - (0.35-0.25)
+    assert pm.single_sided_tested_delta(blackout_active=True) == pytest.approx(
+        0.40
+    )  # 0.50 - (0.35-0.25)
 
 
 def test_breach_thresholds_come_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1074,7 +1082,7 @@ def test_default_single_sided_threshold_is_the_spec_035() -> None:
 
 
 async def test_iron_condor_keeps_the_035_breach_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.options.position_manager import check_delta_breach_any_leg, single_sided_tested_delta
+    from src.options.position_manager import check_delta_breach_any_leg
     from src.options.structure_selector import OptionLeg
 
     def _leg(kind: str, delta: float) -> OptionLeg:
@@ -1090,11 +1098,13 @@ async def test_iron_condor_keeps_the_035_breach_threshold(monkeypatch: pytest.Mo
         )
 
     two_legs = [_leg("PE", -0.40), _leg("CE", 0.20)]
-    assert check_delta_breach_any_leg(two_legs, blackout_active=False).action == "ADJUST"  # 0.35 rule
+    assert (
+        check_delta_breach_any_leg(two_legs, blackout_active=False).action == "ADJUST"
+    )  # 0.35 rule
     one_leg = [_leg("PE", -0.40)]
-    assert check_delta_breach_any_leg(
-        one_leg, blackout_active=False, threshold=0.50
-    ).action == "NONE"
+    assert (
+        check_delta_breach_any_leg(one_leg, blackout_active=False, threshold=0.50).action == "NONE"
+    )
 
 
 def _bull_call_spread_position(position_id: str, *, expiry_days: int = 20) -> OpenPosition:

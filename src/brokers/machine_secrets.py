@@ -40,8 +40,8 @@ try:
     import win32crypt
     import win32cryptcon
 except ImportError:  # not Windows, or pywin32 not installed -> environment fallback
-    win32crypt = None  # type: ignore[assignment]
-    win32cryptcon = None  # type: ignore[assignment]
+    win32crypt = None  # type: ignore[assignment,unused-ignore]
+    win32cryptcon = None  # type: ignore[assignment,unused-ignore]
 
 from src.infrastructure.logger import get_logger
 
