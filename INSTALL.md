@@ -131,6 +131,9 @@ Prices and terms change; confirm on Zerodha's
 
 ### 6.3 Static IP (needed to place real orders)
 
+**Live trading will not work without a registered static IP.** Zerodha rejects every API order
+that does not come from a registered static public IP. Paper trading needs none.
+
 Under the retail algo-trading rules that apply to API trading in India, Zerodha only accepts API
 **order** requests from an **IP address you have registered**, and that address must be
 **static** — a fixed public IPv4 address that does not change. Facts from Zerodha's own

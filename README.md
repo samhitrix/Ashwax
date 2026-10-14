@@ -8,7 +8,8 @@ Risk Manager and an independent LLM second opinion before it can reach a broker.
 
 > **Paper trading is the default and this repository ships paper-locked.** Nothing here is
 > financial advice. If you switch anything to live, you alone are responsible for the orders
-> it places.
+> it places. **Live orders also require a registered static IP address** (see
+> [Quick start](#quick-start)).
 
 ![Dashboard overview (sample data)](assets/screenshots/overview.png)
 
@@ -269,8 +270,13 @@ Sample data throughout. Open `http://localhost:5173` after starting the system.
 ## Quick start
 
 > **Before you start you need a Zerodha Kite Connect developer app with the paid market-data
-> plan** — even paper trading takes live prices from Kite. **Live trading additionally needs a
-> registered static IP address**, because Zerodha rejects API orders from any other address.
+> plan** — even paper trading takes live prices from Kite.
+>
+> **LIVE TRADING WILL NOT WORK WITHOUT A REGISTERED STATIC IP ADDRESS.** Zerodha rejects every API
+> order that does not come from a static public IP registered in your Kite developer console, so
+> without one the system cannot place a single real order. Paper trading is not affected, because
+> it sends no orders to the broker.
+>
 > Step-by-step setup, plans and the static-IP rules are in
 > [INSTALL.md section 6](INSTALL.md#6-broker-connection-kite-connect--needed-even-for-paper-trading).
 
