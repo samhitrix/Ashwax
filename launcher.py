@@ -486,7 +486,9 @@ def main() -> None:
             cwd=str(DASHBOARD_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            shell=True,
+            # Windows needs the shell to resolve npm.cmd; with a list argument on POSIX
+            # shell=True would run a bare `npm` and drop "run dev".
+            shell=sys.platform == "win32",
             creationflags=_NEW_GROUP,
         )
         procs.append(dash)

@@ -20,16 +20,28 @@ filters the Administrators SID out of a non-elevated admin user's token --
 confirmed the hard way, twice, before this comment was written). Default
 file permissions are the right call for a single-user machine; the DPAPI
 encryption is the actual boundary being relied on here, not the filesystem.
+
+Where DPAPI is unavailable (Linux / macOS / Docker, or Windows without pywin32)
+secrets are read from environment variables instead -- ``ASHWAX_SECRET_`` plus
+the name upper-cased with every non-alphanumeric turned into ``_``, e.g.
+``kite_login:AB1234`` -> ``ASHWAX_SECRET_KITE_LOGIN_AB1234``. Writing is
+refused there: the environment (Docker/compose secrets) is the store.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import cast
 
-import win32crypt
-import win32cryptcon
+try:
+    import win32crypt
+    import win32cryptcon
+except ImportError:  # not Windows, or pywin32 not installed -> environment fallback
+    win32crypt = None  # type: ignore[assignment]
+    win32cryptcon = None  # type: ignore[assignment]
 
 from src.infrastructure.logger import get_logger
 
@@ -38,7 +50,13 @@ logger = get_logger(__name__)
 _DEFAULT_PATH = Path(__file__).parent.parent.parent / "config" / ".machine_secrets.dat"
 
 # The flag constant lives in win32cryptcon, not win32crypt itself.
-_CRYPTPROTECT_LOCAL_MACHINE = win32cryptcon.CRYPTPROTECT_LOCAL_MACHINE
+_CRYPTPROTECT_LOCAL_MACHINE = (
+    win32cryptcon.CRYPTPROTECT_LOCAL_MACHINE if win32cryptcon is not None else 0
+)
+
+
+def _env_name(name: str) -> str:
+    return "ASHWAX_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper()
 
 
 def _load(path: Path) -> dict[str, str]:
@@ -57,6 +75,10 @@ def set_machine_secret(name: str, value: str, path: Path = _DEFAULT_PATH) -> Non
     Other entries already in the file are preserved (one blob file holds
     several named secrets, each individually encrypted).
     """
+    if win32crypt is None:
+        raise RuntimeError(
+            f"DPAPI is unavailable here; set the environment variable {_env_name(name)} instead"
+        )
     blob: bytes = win32crypt.CryptProtectData(
         value.encode("utf-8"), name, None, None, None, _CRYPTPROTECT_LOCAL_MACHINE
     )
@@ -69,6 +91,8 @@ def set_machine_secret(name: str, value: str, path: Path = _DEFAULT_PATH) -> Non
 
 def get_machine_secret(name: str, path: Path = _DEFAULT_PATH) -> str | None:
     """Decrypt and return the named secret, or None if missing/unreadable."""
+    if win32crypt is None:
+        return os.environ.get(_env_name(name)) or None
     data = _load(path)
     hex_blob = data.get(name)
     if not hex_blob:

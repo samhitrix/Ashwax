@@ -58,8 +58,8 @@ Risk Manager and an independent LLM second opinion before it reaches a broker.
 
 | Broker | Status | Notes |
 |---|---|---|
-| **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs. No account needed. Everything in the dashboard works with it. |
-| **Zerodha Kite Connect** | ✅ Primary live broker | Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
+| **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs, so no order ever reaches a broker. Live **market data still comes from a Kite Connect API key** (see below). |
+| **Zerodha Kite Connect** | ✅ Primary broker — required, even for paper | Supplies market data in paper mode and orders in live mode. Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
 | **Angel One SmartAPI** | 🟡 Adapter implemented, not yet validated live | Quotes, history, option quotes, order placement / status. It has no native GTT, so stops use the manual SL / target-order fallback. Treat as experimental. |
 | **Upstox** | 🔲 Planned | Capability profile exists in `src/brokers/capability_matrix.json`; no adapter yet. |
 
@@ -89,6 +89,7 @@ honest, after-cost forward results for each strategy before any real money is in
 - Learning engine: expectancy, calibration of LLM confidence, failure attribution, strategy
   health tiers that shrink position size automatically.
 - React dashboard with 17 tabs, Telegram alerts, PostgreSQL storage with auto-applied migrations.
+- One-command Docker setup (`docker compose up -d --build`): app, PostgreSQL and Redis.
 - Backtest and research scripts in `scripts/` and `scripts/research/`, run at 0.10 % cost.
 
 **Strategies shipped (all `execution_mode: "paper"`)**
@@ -110,9 +111,10 @@ unproven until it clears the promotion bar in [Going live](INSTALL.md#14-before-
 **Known limits of Phase 1**
 
 - Windows is the tested platform. Stored broker credentials use the Windows machine-wide
-  DPAPI store; Linux / macOS work for paper trading only.
-- No container images yet — run it with Python, PostgreSQL and Node as described in
-  [INSTALL.md](INSTALL.md).
+  DPAPI store; on Linux / macOS / Docker they come from environment variables and only paper
+  trading is tested.
+- Docker (`docker compose up -d --build`) is a single paper-only image with the dashboard's
+  dev server; see [INSTALL.md](INSTALL.md#docker).
 - Only Kite Connect is run against real accounts. Angel One is unvalidated.
 - Option stop-losses are enforced by the system, not by resting broker-side orders.
 
@@ -120,34 +122,53 @@ unproven until it clears the promotion bar in [Going live](INSTALL.md#14-before-
 
 ## Roadmap
 
-The items below are plans, not promises, and are not in this release. They are ordered by
-how much they reduce risk, not by how exciting they are.
+Plans, not promises — none of this is in the current release. The order follows one rule:
+anything that protects capital comes before anything that adds trades.
 
-**Phase 2 — safe to run live, anywhere**
+### Phase 1 — paper-first lab *(this release)*
+Risk core, paper and live execution paths, seven options and equity strategies running in paper,
+LLM review, learning engine, 17-tab dashboard, Docker one-command setup.
 
-- Broker-side resting stop orders for option legs, so a stop survives a crash of this process.
-- Docker image and `docker-compose` (app + PostgreSQL + Redis), with a cross-platform secret
-  store so the stack runs on Linux without Windows DPAPI.
-- Validate the Angel One adapter end to end in paper-vs-broker comparison runs.
-- Promotion tooling: a report that checks each strategy against the written bar (trade count,
-  profit factor, expectancy, slippage vs model) before `execution_mode` may be changed.
+### Phase 2 — safe to run live
+- **Broker-side protection for options.** Resting stop orders for option legs so a stop survives
+  a crash or restart of this process.
+- **Promotion tooling.** One report per strategy that checks the written bar (trade count,
+  profit factor, expectancy, slippage versus model) and refuses a switch to live until it is met.
+- **Validate Angel One** end to end: paper-versus-broker comparison runs, GTT fallback checks.
+- **Production-grade containers.** Separate API, orchestrator and dashboard containers, a built
+  (not dev-server) dashboard, and a tested live-broker login path.
+- **Automatic Kite session refresh in Docker** without pasting a daily token.
 
-**Phase 3 — broader coverage**
+### Phase 3 — more strategies, each one tested first
+New strategies are added only after they pass an out-of-sample test **after costs**; ideas that
+fail are recorded and dropped, not tuned until they pass. Candidates under research in
+`scripts/research/`:
+- Pullback-in-trend and breakout variants for swing, with breadth and sector filters.
+- Intraday edges beyond the LLM agent (opening-range, last-hour behaviour), kept paper-only
+  until after-cost expectancy is proven.
+- More options structures (calendar and diagonal spreads, iron butterfly variants) with
+  defined risk and rule-based adjustments.
+- Volatility-regime strategies using IV rank, IV-versus-realised spread and term structure.
+- A strategy-selection layer that sizes each strategy by its recent health instead of
+  switching strategies on and off by hand.
 
-- Upstox adapter, using the capability profile already declared.
-- Walk-forward and Monte-Carlo validation built into the backtester, with out-of-sample
-  reports saved next to each strategy.
-- Better execution quality: slippage model calibrated from real fills, smarter order slicing.
+### Phase 4 — better research and execution
+- Walk-forward and Monte-Carlo validation built into the backtester, with an out-of-sample
+  report saved next to every strategy.
+- Slippage and fill model calibrated from real fills, and smarter order slicing for larger size.
+- Portfolio-level risk: correlation and sector exposure limits across strategies.
+- Event-aware trading: earnings, RBI and index-rebalance calendars wired into entries and exits.
+- Replay mode: re-run any past day through the full pipeline to reproduce a decision.
 
-**Phase 4 — usability**
-
-- Guided setup in the dashboard (broker login, keys, Telegram) instead of editing `.env`.
+### Phase 5 — usability and reach
+- Guided setup in the dashboard (broker login, API keys, Telegram) instead of editing `.env`.
 - Strategy builder UI on top of the USS JSON spec.
+- Upstox adapter, using the capability profile already declared.
+- Mobile-friendly dashboard and push alerts for key events.
 - Hosted / multi-account mode with per-account risk limits.
 
-Ideas that need data before they are built (for example new options structures or intraday
-equity edges) are tested in `scripts/research/` first and only become strategies if they pass
-out-of-sample after costs.
+Have an idea? Open an issue — and see [CONTRIBUTING.md](CONTRIBUTING.md) for what a strategy
+proposal needs.
 
 ---
 
@@ -251,6 +272,14 @@ baseline that a unit test checks.
 pytest -q
 ```
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules
+(risk controls, paper-first, evidence for strategies) and how to get set up.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[PolyForm Noncommercial 1.0.0](LICENSE). You may read, run, modify and share this software for
+**noncommercial** purposes. You may **not** sell it, or use it to provide a paid product or
+service. This is a source-available license, not an open-source (OSI) license. For any
+commercial use, contact the author for a separate license.

@@ -12,7 +12,7 @@ import type {
   OrderMonitorConfig,
 } from '../types/trading';
 
-const API_BASE = 'http://localhost:3000';
+const API_BASE = '';
 
 // ── Kite API → store type mappers ───────────────────────────────────────────
 

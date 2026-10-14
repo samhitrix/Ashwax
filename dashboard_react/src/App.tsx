@@ -1,5 +1,6 @@
 import { useEffect, lazy, Suspense } from 'react';
 import { Layout } from './components/Layout';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 // Overview is the default tab, so it stays in the main bundle — lazy-loading the
 // landing view would only add a spinner to the very first paint.
@@ -113,9 +114,11 @@ function AppContent() {
 
   return (
     <Layout>
-      <Suspense fallback={<div className="p-6 text-sm opacity-60">Loading…</div>}>
-        {renderContent()}
-      </Suspense>
+      <ErrorBoundary key={activeTab}>
+        <Suspense fallback={<div className="p-6 text-sm opacity-60">Loading…</div>}>
+          {renderContent()}
+        </Suspense>
+      </ErrorBoundary>
     </Layout>
   );
 }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, RefreshCw, ScrollText } from 'lucide-react';
 import { cn } from '../utils/cn';
 
-const API = 'http://localhost:3000';
+const API = '';
 
 interface LogFile {
   name: string;

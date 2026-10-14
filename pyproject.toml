@@ -7,7 +7,7 @@ name = "ashwax"
 version = "3.0.0"
 description = "Autonomous trading agent for Indian equities (NSE/BSE) and F&O"
 requires-python = ">=3.13"
-license = { text = "MIT" }
+license = { text = "PolyForm-Noncommercial-1.0.0" }
 authors = [{ name = "ashwax" }]
 
 # Lower bounds are the versions this project is developed and tested against.

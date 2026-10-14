@@ -9,7 +9,7 @@ after that.
 - [3. Python environment](#3-python-environment)
 - [4. PostgreSQL](#4-postgresql)
 - [5. Environment file (.env)](#5-environment-file-env)
-- [6. Broker connection (optional in paper mode)](#6-broker-connection-optional-in-paper-mode)
+- [6. Broker connection](#6-broker-connection-kite-connect--needed-even-for-paper-trading)
 - [7. LLM providers](#7-llm-providers)
 - [8. Telegram alerts (optional)](#8-telegram-alerts-optional)
 - [9. Dashboard](#9-dashboard)
@@ -95,10 +95,12 @@ DB_URL=postgresql://postgres:<your-password>@localhost:5432/ashwax
 Every other key in `.env.example` is optional and documented inline. `.env` is git-ignored;
 **never commit it.**
 
-## 6. Broker connection (optional in paper mode)
+## 6. Broker connection (Kite Connect — needed even for paper trading)
 
-Paper mode runs without a broker. For live prices, option chains and (much later) live
-orders, connect Zerodha Kite Connect:
+Paper mode simulates every order locally, so no order ever reaches a broker, but it takes live
+prices, option chains and history from **Zerodha Kite Connect**. Without `KITE_API_KEY` the
+orchestrator stops at startup. You need a Kite Connect developer app with the market-data (historical and live quotes)
+API enabled; check Zerodha's current plans and pricing. Connect it like this:
 
 1. Create an app at <https://developers.kite.trade> and note its API key and secret.
 2. On Windows, install the credential-store dependency used by the login helper:
@@ -242,20 +244,91 @@ To return to safety at any time, run `cp config/examples/*.json config/` and res
 
 ## Docker
 
-**Not supported yet.** There is no Dockerfile or `docker-compose.yml` in this release, and
-the stack can't simply be containerised as-is for these reasons:
+One command starts the whole system — the app (API, orchestrator and dashboard), PostgreSQL and
+Redis — as a Compose project named `ashwax`. Everything runs in **paper mode** with the shipped
+config.
 
-- Kite credentials are stored with the Windows machine-wide DPAPI store
-  (`src/brokers/machine_secrets.py`), which does not exist on Linux containers. Paper mode is
-  unaffected.
-- `launcher.py` starts the dashboard with the Vite dev server and is written for a Windows
-  console.
-- The dashboard code calls the API at a hardcoded `localhost:3000`, which only works when the browser can reach that port directly.
+### What you need
 
-A container setup is on the [roadmap](README.md#roadmap). Until then, run the PostgreSQL
-database in Docker if you like and the rest natively:
+- Docker with Compose v2 (Docker Desktop on Windows / macOS, or Docker Engine on Linux).
+- Kite Connect keys: the app cannot start without `KITE_API_KEY`, because paper trading takes
+  its market data from Kite (see [section 6](#6-broker-connection-kite-connect--needed-even-for-paper-trading)).
+
+### Start
 
 ```bash
-docker run -d --name ashwax-db -e POSTGRES_PASSWORD=<your-password> -e POSTGRES_DB=ashwax   -p 5432:5432 postgres:16
-# DB_URL=postgresql://postgres:<your-password>@localhost:5432/ashwax
+cp .env.example .env
+# edit .env: KITE_API_KEY, KITE_SECRET, KITE_USER_ID, KITE_ACCESS_TOKEN (today's token),
+# and at least one LLM key such as GEMINI_API_KEY
+docker compose up -d --build
 ```
+
+The first build takes several minutes. Then open **<http://localhost:5173>**. The container
+reports `healthy` once the API answers; check with `docker compose ps`.
+
+### What gets started
+
+| Service | Image | Purpose |
+|---|---|---|
+| `app` | built from `Dockerfile` (`ashwax:latest`) | `launcher.py`: API, orchestrator, dashboard |
+| `db` | `postgres:16` | all state; the schema is created automatically on first start |
+| `redis` | `redis:7-alpine` | news de-duplication and option-chain cache |
+
+Only the dashboard port is published. The API listens inside the container and the dashboard
+reaches it through its own `/api` address, so there is nothing else to open or secure.
+
+### Settings (all in `.env`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DASHBOARD_PORT` | `5173` | Host port for the dashboard (change it if 5173 is taken) |
+| `POSTGRES_PASSWORD` | `ashwax` | Database password. Change it if you ever expose the database port |
+| `KITE_ACCESS_TOKEN` | — | Kite's daily session token (see below) |
+
+### Where your data lives
+
+| Data | Location |
+|---|---|
+| Configuration (`config/*.json`) | your project folder, mounted into the container, so edits in the dashboard Configuration tab are saved there |
+| Database | Docker volume `ashwax_pgdata` |
+| Logs and downloaded market data | Docker volumes `ashwax_ashwax_logs` and `ashwax_ashwax_data` |
+
+### Everyday commands
+
+```bash
+docker compose logs -f app        # follow the application log
+docker compose restart app        # restart after editing config
+docker compose up -d --build      # rebuild after pulling new code
+docker compose down               # stop, keep all data
+docker compose down -v            # stop and DELETE the database and logs
+```
+
+### Daily Kite login
+
+Kite needs a fresh access token every trading day, and the image has no browser for the
+automated login. Each morning put the day's token into `KITE_ACCESS_TOKEN` in `.env`, then run
+`docker compose up -d` again. Without a valid token the app starts, but live quotes fail.
+
+Instead of `.env`, you can pass the login password and TOTP secret as
+`ASHWAX_SECRET_KITE_LOGIN_<USERID>` and `ASHWAX_SECRET_KITE_TOTP_<USERID>`; the Windows
+credential store is not available in a container.
+
+### Limits of the Docker setup
+
+- **Paper trading only.** Live trading from a container is untested — don't use it for real money.
+- The dashboard runs from the Vite development server inside the image. It is fine for one
+  user on a trusted machine, but don't put it on the public internet.
+- `restart` is deliberately off: if the app stops it stays stopped until you look at the logs,
+  the same as the Windows service.
+- The dashboard shows an error panel instead of going blank if one tab fails to render; the
+  error text is also in the browser console.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `app` exits straight away with `KeyError: 'KITE_API_KEY'` | Add the Kite keys to `.env` and run `docker compose up -d` |
+| Port already allocated | Set `DASHBOARD_PORT` to a free port in `.env` |
+| Dashboard loads but shows no live prices | `KITE_ACCESS_TOKEN` is missing or expired — refresh it |
+| `docker compose` can't connect to the daemon | Start Docker Desktop first |
+| Start over completely | `docker compose down -v`, then `docker compose up -d --build` |

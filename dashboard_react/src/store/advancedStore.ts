@@ -869,7 +869,7 @@ export const useAdvancedStore = create<AdvancedStore>((set) => ({
     // fetchT's abort still bounds each request, so the flag can never wedge.
     const _cycle: Promise<unknown>[] = [];
     _advCycle = _cycle;
-    const API = 'http://localhost:3000';
+    const API = '';
 
     // GTT orders from broker
     fetchT(`${API}/api/gtt`).then((r) => r.json()).then((data) => {
@@ -1198,7 +1198,7 @@ export const useAdvancedStore = create<AdvancedStore>((set) => ({
     }));
     try {
       const res = await fetchT(
-        `http://localhost:3000/api/orders/${encodeURIComponent(positionId)}/force-exit`,
+        `/api/orders/${encodeURIComponent(positionId)}/force-exit`,
         8000,
         { method: 'POST' }
       );
@@ -1220,7 +1220,7 @@ export const useAdvancedStore = create<AdvancedStore>((set) => ({
 
   refreshNews: async () => {
     try {
-      const res = await fetchT('http://localhost:3000/api/news');
+      const res = await fetchT('/api/news');
       if (!res.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const items: any[] = await res.json();
@@ -1280,7 +1280,7 @@ export const useAdvancedStore = create<AdvancedStore>((set) => ({
 
   refreshSectorSentiments: async () => {
     try {
-      const res = await fetchT('http://localhost:3000/api/sector_rotation');
+      const res = await fetchT('/api/sector_rotation');
       if (!res.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data: any = await res.json();
@@ -1313,7 +1313,7 @@ export const useAdvancedStore = create<AdvancedStore>((set) => ({
 
   refreshUpcomingEvents: async () => {
     try {
-      const res = await fetchT('http://localhost:3000/api/earnings_calendar');
+      const res = await fetchT('/api/earnings_calendar');
       if (!res.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data: any = await res.json();
@@ -1349,7 +1349,7 @@ const _initRealData = async () => {
   for (let attempt = 0; attempt < 10; attempt++) {
     await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
     try {
-      const res = await fetchT('http://localhost:3000/api/sector_rotation');
+      const res = await fetchT('/api/sector_rotation');
       if (res.ok) {
         const store = useAdvancedStore.getState();
         await store.refreshNews();

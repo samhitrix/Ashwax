@@ -55,7 +55,7 @@ interface ComponentInfo {
   core: string;
 }
 
-const API_BASE = 'http://localhost:3000';
+const API_BASE = '';
 
 export function AgentStatus() {
   const { agentState, kiteConnected } = useTradingStore();
