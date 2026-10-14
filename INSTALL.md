@@ -18,6 +18,7 @@ after that.
 - [12. Verify the install](#12-verify-the-install)
 - [13. Troubleshooting](#13-troubleshooting)
 - [14. Before you ever go live](#14-before-you-ever-go-live)
+- [Docker](#docker)
 
 ---
 
@@ -100,14 +101,16 @@ Paper mode runs without a broker. For live prices, option chains and (much later
 orders, connect Zerodha Kite Connect:
 
 1. Create an app at <https://developers.kite.trade> and note its API key and secret.
-2. Put them in `.env`:
+2. On Windows, install the credential-store dependency used by the login helper:
+   `pip install pywin32` (not needed for paper mode).
+3. Put the API key, secret and user ID in `.env`:
    ```ini
    KITE_API_KEY=...
    KITE_SECRET=...
    KITE_USER_ID=...
    # KITE_ACCESS_TOKEN is written automatically each day; leave it blank
    ```
-3. For automated daily login (needs the `[autologin]` extra), store your password and TOTP
+4. For automated daily login (needs the `[autologin]` extra), store your password and TOTP
    secret once in the OS-protected machine store. They are never written to a file:
    ```bash
    python -m src.brokers.kite_auth --setup
@@ -169,11 +172,11 @@ It starts:
 
 | Component | Address |
 |---|---|
-| FastAPI backend | <http://localhost:3000> |
-| React dashboard | <http://localhost:5173> |
+| API backend (`src/api/server.py`) | internal, port 3000 — the dashboard talks to it; you never open it |
+| **React dashboard — open this** | <http://localhost:5173> |
 | Orchestrator (scan / risk / exit loops) | background process |
 
-`launcher.py` is the **only** supported entry point; don't start uvicorn or the orchestrator
+`launcher.py` is the **only** supported entry point; don't start the API server or the orchestrator
 separately. Press `Ctrl+C` to stop everything cleanly.
 
 On the first start, AshwaX applies the migrations and begins backfilling market history. The
@@ -236,3 +239,23 @@ Do this only after the strategy has a long, positive **after-cost** paper record
 dozens of trades, profit factor ≥ 1.2, positive expectancy), the money limits in
 `config/capital.json` fit your account, and broker-side protective stops are confirmed working.
 To return to safety at any time, run `cp config/examples/*.json config/` and restart.
+
+## Docker
+
+**Not supported yet.** There is no Dockerfile or `docker-compose.yml` in this release, and
+the stack can't simply be containerised as-is for these reasons:
+
+- Kite credentials are stored with the Windows machine-wide DPAPI store
+  (`src/brokers/machine_secrets.py`), which does not exist on Linux containers. Paper mode is
+  unaffected.
+- `launcher.py` starts the dashboard with the Vite dev server and is written for a Windows
+  console.
+- The dashboard code calls the API at a hardcoded `localhost:3000`, which only works when the browser can reach that port directly.
+
+A container setup is on the [roadmap](README.md#roadmap). Until then, run the PostgreSQL
+database in Docker if you like and the rest natively:
+
+```bash
+docker run -d --name ashwax-db -e POSTGRES_PASSWORD=<your-password> -e POSTGRES_DB=ashwax   -p 5432:5432 postgres:16
+# DB_URL=postgresql://postgres:<your-password>@localhost:5432/ashwax
+```
