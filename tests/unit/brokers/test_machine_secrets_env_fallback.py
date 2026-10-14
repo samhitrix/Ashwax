@@ -1,7 +1,6 @@
 """machine_secrets falls back to environment variables where DPAPI is unavailable."""
 
 import pytest
-
 from src.brokers import machine_secrets as ms
 
 
