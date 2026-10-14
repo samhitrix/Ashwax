@@ -1,0 +1,50 @@
+{
+  "_options": {
+    "_note": "NAME IS GENERIC ON PURPOSE: straddle (offsets 0/0), strangle (default +150/-150) or fly (wing_points > 0) are the same strategy with different config. options_intraday_short_premium (docs/hypotheses/I_options_intraday_short_premium.md). Registry shim ONLY -- the real logic is src/options/short_premium.py (entry, per-leg SL, time exit), driven by orchestrator._options_intraday_short_premium_loop every poll_seconds, rules in config/options_settings.json options_trading.options_intraday_short_premium (every parameter editable there, applied on the next tick). entry_conditions are deliberately impossible (RSI > 1000) so this spec never fires through the per-bar USS scan (same shim as options_expiry_day.json); direction MUST stay LONG. 'enabled' in the registry IS a live switch, and this name is what CRM G9 llm_gate_required, execution_mode and the G7 uncapped exemption key on."
+  },
+  "meta": {
+    "name": "options_intraday_short_premium",
+    "display_name": "Options Intraday Short Premium (NIFTY straddle/strangle/fly, per-leg SL, optional profit target)",
+    "version": "1.0",
+    "product": "NRML",
+    "direction": "LONG",
+    "timeframe": "5MIN"
+  },
+  "universe_filter": {
+    "min_price": 0,
+    "min_adv_crores": 0,
+    "exchanges": [
+      "NFO"
+    ],
+    "index_filter": null
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 8.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 3.0
+  },
+  "intraday": {
+    "range_window": "0915-0920",
+    "entry_window": "0920-1500",
+    "exit_window": "1510-1516",
+    "timezone": "Asia/Kolkata"
+  }
+}

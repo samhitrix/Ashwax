@@ -1,0 +1,65 @@
+{
+  "_options": {
+    "_note": "LLM-originated intraday (MIS) agent -- the intraday counterpart of llm_swing_agent, NOT a chart-pattern strategy. Ideas come from src/strategies/llm_intraday/pipeline.py, run by src/orchestrator.py's _llm_intraday_agent_loop at config/global.json llm_intraday.decision_times_ist and published to shared['llm_intraday_ideas']; the 5-minute intraday scan turns a still-fresh idea into a Signal via _evaluate_llm_intraday_signal (same pattern as news_catalyst_momentum), so it rides the normal ranked placement -> _execute_intraday_signal -> CRM G0-G10 path, with an independent fail-closed G9 reviewer (llm.intraday_g9). The entry_conditions below are deliberately impossible so this spec is inert in the per-bar scan. stop_loss/target are NOT used -- the LLM proposes its own levels, bounded by the llm_intraday validation limits. exit_conditions ARE used: SmartExitTracker applies breakeven at 1R and an ATR trail from 1.5R, with NO partial booking (orb_intraday_smart's 50% partial at 1R capped realised payoff at 1.03:1 vs 2.13:1 planned). 2026-09-22: added giveback_lock (once MFE >= 0.5R the stop holds half of MFE) and time_decay (breakeven from 14:15 if MFE >= 0.3R; max -0.5R loss from 14:45) after HOMEFIRST/TATACHEM went 0.5R+ green and were force-exited red. Replay (scripts/replay_intraday_exits.py, 409 closed MIS trades, 0.10% cost): expectancy -0.808R -> -0.784R, green-then-red 75 -> 60 of 141, avg win 0.42R -> 0.32R. Marginal help; it does not fix entries. Forward pass/fail count restarts 2026-09-23 so old and new exit regimes are not mixed.",
+    "_source": "2026-09-11 session -- built per user request after all ORB variants were deleted on live paper evidence. Forced to execution_mode:paper in strategies_registry.json. There is no fixed rule set to backtest; the forward paper record is the validation (pass: >=40 closed trades with net expectancy >= +0.10R and PF >= 1.2; fail: after >=30 trades expectancy < 0 or PF < 0.8 -> disable)."
+  },
+  "meta": {
+    "name": "llm_intraday_agent",
+    "display_name": "LLM Intraday Agent",
+    "version": "1.0",
+    "product": "MIS",
+    "direction": "BOTH",
+    "timeframe": "5MIN"
+  },
+  "universe_filter": {
+    "min_price": 100,
+    "min_adv_crores": 50,
+    "exchanges": ["NSE"],
+    "index_filter": null
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 10.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 2.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "atr_trail",
+      "atr_period": 14,
+      "atr_multiplier": 1.5
+    },
+    "breakeven_at_r": 1.0,
+    "trail_activation_r": 1.5,
+    "reversal_exit": false,
+    "time_stop_days": 0,
+    "giveback_lock": {"activate_mfe_r": 0.5, "lock_fraction": 0.5},
+    "time_decay": [
+      {"at": "14:15", "min_mfe_r": 0.3, "lock_r": 0.0},
+      {"at": "14:45", "lock_r": -0.5}
+    ]
+  },
+  "intraday": {
+    "range_window": "0915-0920",
+    "entry_window": "0930-1430",
+    "exit_window": "1510-1514",
+    "timezone": "Asia/Kolkata"
+  }
+}

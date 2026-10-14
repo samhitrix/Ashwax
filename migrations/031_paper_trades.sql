@@ -1,0 +1,60 @@
+-- Migration 031: Paper trades (identical schema to trades + paper-specific fields)
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id                      BIGSERIAL   PRIMARY KEY,
+    agent_trade_id          TEXT        NOT NULL UNIQUE,
+    broker_order_id         TEXT,
+    exchange_order_id       TEXT,
+    broker_trade_id         TEXT,
+    broker_order_tag        TEXT,
+    symbol                  TEXT        NOT NULL,
+    exchange                TEXT        NOT NULL DEFAULT 'NSE',
+    product                 TEXT        NOT NULL DEFAULT 'MIS'
+                                CHECK (product IN ('MIS', 'CNC', 'NRML')),
+    direction               TEXT        NOT NULL CHECK (direction IN ('long', 'short')),
+    quantity                INTEGER     NOT NULL,
+    order_state             TEXT        NOT NULL DEFAULT 'PENDING_SUBMIT',
+    intended_price          NUMERIC(12, 2),
+    fill_price              NUMERIC(12, 2),
+    fill_timestamp          TIMESTAMPTZ,
+    exit_price              NUMERIC(12, 2),
+    exit_timestamp          TIMESTAMPTZ,
+    initial_sl              NUMERIC(12, 2),
+    current_sl              NUMERIC(12, 2),
+    initial_target          NUMERIC(12, 2),
+    current_target          NUMERIC(12, 2),
+    gtt_sl_id               TEXT,
+    gtt_target_id           TEXT,
+    sl_order_id             TEXT,
+    target_order_id         TEXT,
+    slippage_pct            NUMERIC(8, 4),
+    retry_count             SMALLINT    NOT NULL DEFAULT 0,
+    rejection_reason        TEXT,
+    parent_order_id         TEXT,
+    signal_id               BIGINT,
+    strategy_name           TEXT,
+    trade_type              TEXT        NOT NULL DEFAULT 'NORMAL'
+                                CHECK (trade_type IN ('NORMAL', 'NEWS_DRIVEN')),
+    regime_at_entry         TEXT,
+    rs_rank_at_entry        SMALLINT,
+    setup_quality_score     NUMERIC(5, 2),
+    pnl_realized            NUMERIC(12, 2),
+    pnl_unrealized          NUMERIC(12, 2),
+    charges_taxes           NUMERIC(12, 2),
+    actual_risk_rupees      NUMERIC(12, 2),
+    actual_rr_ratio         NUMERIC(8, 4),
+    scale_1_qty             INTEGER,
+    scale_1_target          NUMERIC(12, 2),
+    scale_2_qty             INTEGER,
+    scale_2_target          NUMERIC(12, 2),
+    scale_3_qty             INTEGER,
+    is_paper                BOOLEAN     NOT NULL DEFAULT TRUE,
+    simulated_fill_ts       TIMESTAMPTZ,
+    entry_timestamp         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_symbol      ON paper_trades (symbol);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_order_state ON paper_trades (order_state);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_ts    ON paper_trades (entry_timestamp DESC);

@@ -1,0 +1,123 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ashwax"
+version = "3.0.0"
+description = "Autonomous trading agent for Indian equities (NSE/BSE) and F&O"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "ashwax" }]
+
+# Lower bounds are the versions this project is developed and tested against.
+dependencies = [
+  "asyncpg>=0.29",
+  "python-dotenv>=1.0",
+  "pyyaml>=6.0",
+  "psutil>=5.9",
+  "aiohttp>=3.9",
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "pyarrow>=15",  # pandas.read_parquet (OHLCV cache)
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "pydantic>=2.6",
+  "kiteconnect>=5.0",  # Zerodha Kite Connect broker
+  "smartapi-python>=1.4",  # Angel One SmartAPI broker
+  # smartapi-python's own package metadata doesn't declare these three runtime
+  # deps (verified 2026-09-22: `pip install smartapi-python` alone leaves
+  # `import SmartApi` raising ModuleNotFoundError on logzero) — listed
+  # explicitly so a fresh install doesn't silently break.
+  "logzero>=1.7",
+  "websocket-client>=1.9",
+  "pycryptodome>=3.23",
+  "pyotp>=2.9",  # Kite / Angel One TOTP login
+  "keyring>=24",  # Kite / Angel One credentials (Windows Credential Manager / OS keyring)
+  "google-genai>=1.0",  # primary LLM provider (Gemini)
+]
+
+[project.optional-dependencies]
+# Optional features -- each degrades gracefully when absent:
+#   redis      -> news dedup / options chain cache fall back to in-memory
+#   anthropic  -> optional Claude LLM fallback provider
+#   yfinance   -> fundamentals snapshot (config/global.json fundamentals.enabled)
+#   playwright -> automated Kite login (src/brokers/kite_auth.py)
+redis = ["redis>=5"]
+anthropic = ["anthropic>=0.40"]
+fundamentals = ["yfinance>=0.2"]
+autologin = ["playwright>=1.40"]
+dev = [
+  "black>=24.4",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "pre-commit>=3.7",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/W = pycodestyle, F = pyflakes, I = isort, B = bugbear, UP = pyupgrade,
+# ASYNC = async pitfalls, S = bandit security, RET = return checks, SIM = simplify
+select = ["E", "F", "I", "W", "B", "UP", "ASYNC", "S", "RET", "SIM"]
+ignore = ["E501", "UP043", "S110", "S112", "SIM105"] # E501→black; UP043→mypy compat; S110/S112/SIM105→deliberate best-effort try/except idiom used throughout
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"] # asserts/hardcoded strings fine in tests
+# Pre-existing best-effort patterns: silent try/except (S110/S112) is a deliberate
+# resilience idiom here; B023 loop-closures are working code we don't rewrite;
+# S310 urlopen targets are trusted constant NSE URLs.
+"src/orchestrator.py" = ["S110", "S112", "SIM105", "B023"]
+"src/market_data/ohlcv_downloader.py" = ["S110", "S310"]
+"src/market_data/sector_constituents.py" = ["S310"]
+# Deliberate polling/timeout idioms (predate CI): supervisor loops poll shared state on an
+# interval; the leg executor and Kite adapter expose an explicit timeout argument.
+"src/supervisor/supervisor.py" = ["ASYNC110"]
+"src/options/options_leg_executor.py" = ["ASYNC109"]
+"tests/unit/brokers/test_kite_adapter.py" = ["ASYNC109"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "dashboard_api.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "src.api.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# orchestrator imports several untyped third-party libs (redis, etc.) whose
+# import-untyped ignores are env-dependent (present/absent in the hook venv).
+module = "src.orchestrator"
+warn_unused_ignores = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+  "unit: fast, isolated, no network",
+  "integration: requires DB / Redis / broker sandbox",
+  "chaos: fault injection",
+]

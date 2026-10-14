@@ -1,0 +1,21 @@
+{
+  "heartbeat_interval_seconds": 10,
+  "heartbeat_timeout_seconds": 30,
+  "invariant_check_interval_seconds": 60,
+  "remediation": {
+    "auto_restart_on_crash": true,
+    "max_restart_attempts": 3,
+    "restart_backoff_seconds": 5
+  },
+  "ai_brain": {
+    "enabled": true,
+    "model": "gemini",
+    "analysis_dimensions": 5
+  },
+  "alert_tiers": {
+    "tier_2_notify": true,
+    "tier_3_repeat_seconds": 60,
+    "tier_4_continuous": true,
+    "tier_5_cannot_silence": true
+  }
+}

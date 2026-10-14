@@ -1,0 +1,60 @@
+{
+  "_comment": "OPERATOR-DEFINED CONFIG — read-once at startup. App never writes here. Production: attrib +R config\\operator.json",
+  "capital": {
+    "total_capital_rupees": 2000000,
+    "max_risk_per_trade_rupees": 2000,
+    "default_risk_pct": 0.0,
+    "max_risk_per_trade_pct_ceiling": 2.0,
+    "max_daily_loss_rupees": 4000,
+    "max_total_exposure_rupees": 1000000,
+    "cash_buffer_rupees": 20000
+  },
+  "account": {
+    "broker": "kite",
+    "account_type": "individual",
+    "segment_permissions": ["equity", "fno"],
+    "paper_mode_locked": true
+  },
+  "sector_gate_enabled": true,
+  "hard_limits": {
+    "max_open_positions": 10,
+    "max_new_trades_per_day": 10,
+    "max_single_position_pct_of_capital": 10,
+    "min_risk_reward_ratio": 1.8,
+    "max_stop_loss_pct": 8.0,
+    "intraday": {
+      "_counts_superseded_by": "config/capital.json intraday.* (2026-10-07) -- max_new_trades_per_day, max_new_trades_per_day_per_strategy and max_open_positions below are read here then immediately OVERWRITTEN at boot (src/orchestrator.py ~12650) from config/capital.json, so editing them here does nothing. Edit config/capital.json instead. per_strategy_overrides/bear_gate_threshold/bull_gate_threshold/regime below are NOT part of that redesign and are still live here.",
+      "max_new_trades_per_day": 6,
+      "max_open_positions": 6,
+      "max_new_trades_per_day_per_strategy": 3,
+      "per_strategy_overrides": {},
+      "bear_gate_threshold": 0.60,
+      "bull_gate_threshold": 0.60,
+      "structural_regime_gate": true,
+      "gap_breach_slippage_pct": 0.05,
+      "regime": {
+        "index_symbol": "NIFTY 50",
+        "index_move_min_pct": 0.10,
+        "breadth_confirm": 0.50,
+        "fallback": "block_all"
+      }
+    },
+    "swing": {
+      "_counts_superseded_by": "config/capital.json swing.* (2026-10-07) -- max_new_trades_per_day, cash_cushion_pct, max_new_trades_per_day_per_strategy and max_open_positions below are read here then immediately OVERWRITTEN at boot (src/orchestrator.py ~12650) / replaced by RiskBudget (orchestrator.py ~5162, swing_cash_cushion_pct from capital.json swing.keep_unused_cash_buffer), so editing them here does nothing. Edit config/capital.json instead. per_strategy_overrides below is NOT part of that redesign and is still live here.",
+      "max_new_trades_per_day": 2,
+      "cash_cushion_pct": 10,
+      "max_new_trades_per_day_per_strategy": 2,
+      "per_strategy_overrides": {},
+      "max_open_positions": 12
+    }
+  },
+  "agent_permissions": {
+    "can_trade_equity": true,
+    "can_trade_options": true,
+    "can_trade_futures": false,
+    "can_create_strategies": true,
+    "can_deploy_strategies_autonomously": false,
+    "strategy_deployment_requires_human": true,
+    "max_agent_created_strategies_live": 2
+  }
+}

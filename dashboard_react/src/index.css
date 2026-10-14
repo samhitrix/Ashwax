@@ -1,0 +1,210 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+ * Light theme
+ *
+ * The dashboard is built entirely on a fixed set of literal dark-theme
+ * Tailwind classes (`bg-[#0d1117]`, `bg-[#161b22]`, the gray-100..800 scale)
+ * repeated across every tab component, rather than design tokens. Retrofitting
+ * every component individually would mean editing 25+ files; instead this
+ * retargets those exact classes app-wide whenever [data-theme="light"] is set
+ * on <html>, so every tab gets a light theme without being touched directly.
+ * Default (no attribute, or [data-theme="dark"]) is unchanged from today.
+ * ------------------------------------------------------------------------ */
+
+/* Wrapped in Tailwind's own "utilities" layer (already last in the
+ * `theme, base, components, utilities` order @import "tailwindcss" declares)
+ * instead of left unlayered: CSS cascade-layer rules put ALL unlayered
+ * normal-importance styles ahead of ANY layered one, but that ordering
+ * flips for !important — an unlayered !important loses to a layered one.
+ * Living in the same layer sidesteps that trap entirely and falls back to
+ * plain specificity, where our attribute-selector + class beats Tailwind's
+ * bare class every time. */
+@layer utilities {
+[data-theme="light"] {
+  color-scheme: light;
+}
+
+[data-theme="light"] .bg-\[\#0d1117\] { background-color: #f3f4f6 !important; }
+[data-theme="light"] .bg-\[\#161b22\] { background-color: #ffffff !important; }
+[data-theme="light"] .bg-\[\#0d1117\]\/50 { background-color: #f3f4f680 !important; }
+
+[data-theme="light"] .border-gray-700,
+[data-theme="light"] .border-gray-800 { border-color: #dde1e6 !important; }
+
+[data-theme="light"] .text-white { color: #000000 !important; }
+[data-theme="light"] .text-gray-100 { color: #05070a !important; }
+[data-theme="light"] .text-gray-200 { color: #0d1117 !important; }
+[data-theme="light"] .text-gray-300 { color: #1a2029 !important; }
+[data-theme="light"] .text-gray-400 { color: #2b333d !important; }
+[data-theme="light"] .text-gray-500 { color: #3f4750 !important; }
+[data-theme="light"] .text-gray-600 { color: #545c66 !important; }
+
+[data-theme="light"] .bg-gray-700 { background-color: #e8eaed !important; }
+[data-theme="light"] .bg-gray-800 { background-color: #eef0f3 !important; }
+[data-theme="light"] .hover\:bg-gray-800:hover { background-color: #eef0f3 !important; }
+[data-theme="light"] .hover\:bg-gray-700:hover { background-color: #e2e5ea !important; }
+[data-theme="light"] .hover\:bg-gray-600:hover { background-color: #d8dce3 !important; }
+[data-theme="light"] .hover\:text-gray-200:hover { color: #111418 !important; }
+
+[data-theme="light"] ::-webkit-scrollbar-track { background: #e5e7eb; }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: #94a3b8; }
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+
+/* Accent status colors: every tab uses the same "text-X-400/500 on a
+ * bg-X-500/10 pill" pattern (P&L, health badges, log levels, risk tags).
+ * Those -400/-500 shades are tuned for dark cards; over the near-white
+ * light-theme backgrounds above they wash out to near-invisible. Darken
+ * just the text to a value with real contrast on white, and leave the
+ * tinted pill backgrounds and every -200/-300 shade (already paired with
+ * a solid dark -900/-950 box) alone. */
+[data-theme="light"] .text-green-400,
+[data-theme="light"] .text-green-500 { color: #15803d !important; }
+[data-theme="light"] .text-red-400,
+[data-theme="light"] .text-red-500 { color: #b91c1c !important; }
+[data-theme="light"] .text-yellow-400,
+[data-theme="light"] .text-yellow-500 { color: #854d0e !important; }
+[data-theme="light"] .text-orange-400,
+[data-theme="light"] .text-orange-500 { color: #9a3412 !important; }
+[data-theme="light"] .text-blue-400,
+[data-theme="light"] .text-blue-500 { color: #1d4ed8 !important; }
+[data-theme="light"] .text-purple-400,
+[data-theme="light"] .text-purple-500 { color: #7e22ce !important; }
+[data-theme="light"] .text-cyan-400,
+[data-theme="light"] .text-cyan-500 { color: #0e7490 !important; }
+[data-theme="light"] .text-pink-400,
+[data-theme="light"] .text-pink-500 { color: #be185d !important; }
+[data-theme="light"] .text-indigo-400,
+[data-theme="light"] .text-indigo-500 { color: #4338ca !important; }
+[data-theme="light"] .text-amber-400,
+[data-theme="light"] .text-amber-500 { color: #92400e !important; }
+[data-theme="light"] .text-emerald-400,
+[data-theme="light"] .text-emerald-500 { color: #047857 !important; }
+
+/* Same problem one shade lighter: alert/toast/badge pills built as
+ * "text-X-200/300 on a translucent bg-X-500/NN or bg-X-900/NN chip"
+ * (System Alerts, AlertToast, Signal Scanner's "Last scan" chip, the
+ * options DAILY/WEEKLY/expiry tags, StrategyStudio timeframe chips…) —
+ * the chip background is a faint tint over the near-white page, and the
+ * -200/300 text is tuned for a dark card, so together they nearly vanish.
+ * Darkened to the same values as the -400/500 mapping above so a chip's
+ * text reads at the same weight regardless of which shade the component
+ * happened to pick. */
+[data-theme="light"] .text-green-300 { color: #15803d !important; }
+[data-theme="light"] .text-red-300,
+[data-theme="light"] .text-red-200 { color: #b91c1c !important; }
+[data-theme="light"] .text-yellow-300 { color: #854d0e !important; }
+[data-theme="light"] .text-orange-300 { color: #9a3412 !important; }
+[data-theme="light"] .text-blue-300 { color: #1d4ed8 !important; }
+[data-theme="light"] .text-purple-300 { color: #7e22ce !important; }
+[data-theme="light"] .text-cyan-300 { color: #0e7490 !important; }
+[data-theme="light"] .text-indigo-300 { color: #4338ca !important; }
+[data-theme="light"] .text-amber-300 { color: #92400e !important; }
+[data-theme="light"] .hover\:text-red-300:hover { color: #991b1b !important; }
+[data-theme="light"] .hover\:text-blue-300:hover { color: #1e40af !important; }
+
+/* Exception: AdvancedOrderMonitor's PAPER tag is a SOLID dark-yellow chip
+ * (bg-yellow-900 + text-yellow-300), not a translucent one — it's already
+ * high-contrast light-on-dark and theme-independent, so the blanket
+ * text-yellow-300 darkening above would turn it into unreadable dark-on-dark.
+ * Same element, both classes, so this compound selector wins on specificity
+ * and restores the original light text. */
+[data-theme="light"] .bg-yellow-900.text-yellow-300 { color: #fde68a !important; }
+
+/* Table legibility, every tab: data cells semi-bold, headers bold, in both
+ * themes. Bare element selectors (0,0,2) sit below any component's own
+ * `font-normal` / `font-bold` class (0,1,0), so a cell that deliberately sets
+ * a weight keeps it; child spans (the small "+8.0%" sub-lines, badges without
+ * their own weight) inherit it. */
+table tbody td { font-weight: 600; }
+table thead th { font-weight: 700; }
+} /* @layer utilities */
+
+/* Custom scrollbar (dark, default) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #545c66;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #6e7681;
+}
+
+/* Range input styling */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  width: 100%;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 6px;
+  background: #30363d;
+  border-radius: 3px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  background: #58a6ff;
+  border-radius: 50%;
+  cursor: pointer;
+  margin-top: -5px;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  background: #79b8ff;
+}
+
+/* Animation */
+@keyframes pulse-slow {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 2s ease-in-out infinite;
+}
+
+/* Line clamp */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Smooth transitions */
+* {
+  transition-property: background-color, border-color, color, fill, stroke, opacity, box-shadow, transform;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 150ms;
+}
+
+/* Font */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', Consolas, monospace;
+}

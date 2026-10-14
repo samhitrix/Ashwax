@@ -1,0 +1,21 @@
+{
+  "exception_type_map": {
+    "TokenException":      {"code": "TOKEN",      "retryable": true},
+    "PermissionException": {"code": "PERMISSION", "retryable": false},
+    "OrderException":      {"code": "ORDER",      "retryable": false},
+    "InputException":      {"code": "INPUT",      "retryable": false},
+    "DataException":       {"code": "DATA",       "retryable": false},
+    "NetworkException":    {"code": "NETWORK",    "retryable": true},
+    "GeneralException":    {"code": "UNKNOWN",    "retryable": false}
+  },
+  "message_overrides": [
+    {"contains": "insufficient margin",   "code": "MARGIN",     "retryable": false},
+    {"contains": "margin",               "code": "MARGIN",     "retryable": false},
+    {"contains": "circuit limit",        "code": "CIRCUIT",    "retryable": false},
+    {"contains": "circuit",             "code": "CIRCUIT",    "retryable": false},
+    {"contains": "product type",        "code": "PRODUCT",    "retryable": false},
+    {"contains": "too many requests",   "code": "RATE_LIMIT", "retryable": true},
+    {"contains": "rate limit",          "code": "RATE_LIMIT", "retryable": true},
+    {"contains": "access denied",       "code": "RATE_LIMIT", "retryable": true}
+  ]
+}

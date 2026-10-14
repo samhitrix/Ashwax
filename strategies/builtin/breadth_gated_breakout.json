@@ -1,0 +1,82 @@
+{
+  "_options": {
+    "_note": "Hypothesis D (docs/hypotheses/D_breadth_gated_breakout.md). Pre-registered 2026-10-05; backtest verdict IN-BETWEEN (stock selection beat random by +0.23R in train AND hold-out 1, but long-only lost in falling markets; breadth gate added ~0R). Deployed to PAPER ONLY as forward data collection by explicit user override -- NOT a validated strategy. Live-vs-test differences (accepted to keep the same controls as every other swing strategy): (1) stop capped at operator max_stop_loss_pct 8% (test: uncapped 2xATR); (2) the trail is enforced intrabar by OrderMonitor/GTT (test: checked on close, exit next open); (3) G9 LLM review + CRM G0-G10 + daily caps apply (test: none); (4) target is a 20R placeholder because USS requires one (test: no target). Judge it on picks-vs-NIFTY and R, not rupees; promotion needs >=30 paper trades, PF>=1.2, E>=+0.10R."
+  },
+  "meta": {
+    "name": "breadth_gated_breakout",
+    "display_name": "Breadth-Gated Breakout",
+    "version": "1.0",
+    "product": "DELIVERY",
+    "direction": "LONG",
+    "timeframe": "DAILY"
+  },
+  "universe_filter": {
+    "min_price": 50,
+    "max_price": 5000,
+    "min_adv_crores": 10,
+    "exchanges": ["NSE"],
+    "index_filter": "NIFTY500"
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "close_above_50d_closing_high",
+        "type": "PRICE",
+        "params": {"reference": "closing_high", "lookback_days": 50}
+      },
+      {
+        "name": "sma50_above_sma200",
+        "type": "INDICATOR",
+        "params": {"indicator": "SMA", "period": 50, "condition": "indicator_above", "other_period": 200}
+      },
+      {
+        "name": "volume_1_5x_50d_avg",
+        "type": "VOLUME",
+        "params": {"condition": "volume_ratio_above", "ratio": 1.5, "average_days": 50}
+      },
+      {
+        "name": "min_price",
+        "type": "PRICE",
+        "params": {"condition": "price_above", "threshold": 50}
+      },
+      {
+        "name": "max_price",
+        "type": "PRICE",
+        "params": {"condition": "price_below", "threshold": 5000}
+      },
+      {
+        "name": "turnover_10cr",
+        "type": "VOLUME",
+        "params": {"condition": "turnover_above", "threshold_crores": 10, "average_days": 20}
+      }
+    ]
+  },
+  "market_filter": {
+    "enabled": true,
+    "mode": "breadth",
+    "sma_period": 200,
+    "min_breadth": 0.5
+  },
+  "risk_pct": 0.25,
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 2.0,
+    "max_sl_pct": 8.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 20.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "atr_trail",
+      "atr_period": 14,
+      "atr_multiplier": 3.0
+    },
+    "trail_activation_r": 0.0,
+    "time_stop_days": null,
+    "reversal_exit": false
+  }
+}

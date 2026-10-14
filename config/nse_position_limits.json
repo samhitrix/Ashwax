@@ -1,0 +1,10 @@
+{
+  "_comment": "NSE client-level position (OI) limits for index options. Refreshed quarterly from NSE circulars. Breaching the client-level limit FREEZES THE ENTIRE F&O ACCOUNT — checked atomically with margin + Greeks budget as a 3-way gate before any entry. A 4-leg Iron Condor counts as 4x notional toward the limit.",
+  "_VERIFY_BEFORE_ENABLE": "Placeholder values. The operator MUST replace with the current NSE/SEBI client-level limits (these change; SEBI moved to a net-delta-based framework). Boot validation only checks presence/structure when enabled=true.",
+  "as_of": "2026-Q3",
+  "limits": {
+    "NIFTY":     { "client_oi_limit_lots": 0, "_note": "Set from NSE circular before enabling." },
+    "BANKNIFTY": { "client_oi_limit_lots": 0, "_note": "Set from NSE circular before enabling." },
+    "FINNIFTY":  { "client_oi_limit_lots": 0, "_note": "Set from NSE circular before enabling." }
+  }
+}

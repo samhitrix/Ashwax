@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev,redis]"
+      - name: Lint
+        run: ruff check src tests
+      - name: Unit tests
+        # The unit suite needs no database, broker, Redis or API keys.
+        run: pytest -q
+
+  migrations:
+    # Proves a fresh PostgreSQL database can be built from migrations/ alone.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ashwax
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      DB_URL: postgresql://postgres:ci@localhost:5432/ashwax
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e .
+      - name: Apply all migrations
+        run: python -m src.db.migrate
+      - name: Migrations are idempotent (second run applies nothing)
+        run: python -m src.db.migrate

@@ -1,0 +1,61 @@
+{
+  "_options": {
+    "_note": "Catalyst-confirmed momentum — NOT a chart-pattern strategy. Entry is decided entirely by the news-driven code path in src/orchestrator.py (_scan_news_catalyst_signals), which requires a live NewsOpportunity (HIGH magnitude + BULLISH + BOOST + confidence>=0.65, already computed by src.news.opportunity_scanner.OpportunityScanner) PLUS price-above-VWAP and 2x volume confirmation before it will ever synthesize a Signal. The entry_conditions below are deliberately impossible (RSI can never exceed 100) so this spec is inert if evaluated through the normal per-bar scan — it exists only to supply a validated stop_loss / target / exit_conditions definition that the news code path reuses via CompiledStrategy.compute_sl/compute_target, and that SmartExitTracker reuses for partial/BE/trail/reversal exit management, exactly like every other intraday strategy.",
+    "_source": "2026-08-05 session — pivot away from a 20th ORB/mean-reversion variant (both categories already proven to lose to costs) toward a structurally different edge: a real corporate/news event as the primary trigger, not a price-shape pattern."
+  },
+  "meta": {
+    "name": "news_catalyst_momentum",
+    "display_name": "News Catalyst Momentum",
+    "version": "1.0",
+    "product": "MIS",
+    "direction": "BOTH",
+    "timeframe": "5MIN"
+  },
+  "universe_filter": {
+    "min_price": 50,
+    "min_adv_crores": 50,
+    "exchanges": ["NSE"],
+    "index_filter": null
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 10.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 3.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "atr_trail",
+      "atr_period": 14,
+      "atr_multiplier": 1.0
+    },
+    "breakeven_at_r": 1.0,
+    "partial_book_r": 1.0,
+    "trail_activation_r": 1.5,
+    "reversal_exit": true,
+    "time_stop_days": 0
+  },
+  "intraday": {
+    "range_window": "0915-0920",
+    "entry_window": "0920-1500",
+    "exit_window": "1510-1516",
+    "timezone": "Asia/Kolkata"
+  }
+}

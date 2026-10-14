@@ -1,0 +1,44 @@
+{
+  "order_types": {
+    "MIS_intraday": "SL",
+    "CNC_swing_entry": "LIMIT",
+    "CNC_swing_sl": "GTT",
+    "CNC_swing_target": "GTT",
+    "CNC_swing_gtt_sl_leg": "LIMIT"
+  },
+  "monitoring": {
+    "cycle_seconds": 2.0,
+    "gtt_check_interval_seconds": 30,
+    "breach_approaching_pct": 0.5,
+    "chase_cap_pct": 0.15,
+    "chase_max_attempts": 3
+  },
+  "backtest": {
+    "_note": "max_parallel_pairs bounds how many (strategy x symbol) backtests run at once. engine.run() is pandas/numpy work that holds the GIL in bursts; firing every pair at once (thousands of asyncio.to_thread tasks) starved the event loop so badly the 2s order monitor fell to one cycle per ~24s and the DB pool timed out (INV_C8 'DB unreachable', 2026-08-28 21:31). Keep this well below the CPU count so live monitoring always gets loop time.",
+    "max_parallel_pairs": 4
+  },
+  "idempotency": {
+    "_note": "Durable duplicate-order guard (src/execution/idempotency.py, table order_intents). mode: off | shadow | enforce. shadow (default) records every entry-order attempt and LOGS an exact duplicate (same signal/symbol/side/qty/price still PENDING or SUBMITTED inside window_seconds) but never blocks anything. enforce additionally refuses that exact duplicate. A previous FAILED attempt, or one older than window_seconds, never blocks -- window_seconds (120) is deliberately shorter than the 5-minute same-day AMO retry interval, so genuine retries always go through. A guard/DB error or timeout always fails OPEN. Review 'idempotency_duplicate_detected' logs in shadow for a while before enabling enforce.",
+    "mode": "shadow",
+    "window_seconds": 120,
+    "db_timeout_seconds": 2.0,
+    "retention_days": 3
+  },
+  "rejection_retry": {
+    "max_retries": 2,
+    "retry_delay_seconds": 1
+  },
+  "options_execution": {
+    "enabled": true,
+    "max_open_positions": 5,
+    "max_premium_at_risk_rupees": 4000,
+    "max_delta_exposure": 0.7,
+    "preferred_strategies": ["bull_call_spread", "protective_put", "long_call"],
+    "avoid_naked_selling": true,
+    "min_days_to_expiry": 14,
+    "max_iv_percentile_for_buying": 70,
+    "min_iv_percentile_for_selling": 50,
+    "liquidity_min_oi": 1000,
+    "liquidity_min_volume": 500
+  }
+}

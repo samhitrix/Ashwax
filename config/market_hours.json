@@ -1,0 +1,36 @@
+{
+  "_note": "SINGLE source of truth for every trading-session / order-window / schedule time (IST, 24h HH:MM). Read only through src/market/sessions.py — no other config file or code literal may define a session time. A missing or invalid file stops startup (no built-in defaults). markets.<m>.regular_session = live exchange session (REGULAR orders). amo = after-market-order window: opens amo.open the same evening and closes amo.close the next morning; between regular_session.close and amo.open (and amo.close and regular_session.open) NO order can be placed. entry_windows are half-open [start,end) inside the regular session; the evening/pre-open SWING entry windows are DERIVED from amo, never repeated here. allowed: ALL | SWING | ORB_ONLY | EXIT_ONLY. min_llm_confidence 0 = no requirement. Per-strategy intraday range/entry/exit windows in strategies/builtin/*.json may only NARROW these — validated at load. Add another exchange/segment as another block under markets.",
+  "timezone": "Asia/Kolkata",
+  "markets": {
+    "nse_equity": {
+      "regular_session": { "open": "09:15", "close": "15:30" },
+      "amo": { "open": "16:00", "close": "08:57" },
+      "morning_open_block_minutes": 15,
+      "mis_flat_by": "15:10",
+      "last_entry_by": "14:30",
+      "entry_windows": [
+        { "start": "09:15", "end": "14:30", "allowed": "ALL", "min_llm_confidence": 0.0 },
+        { "start": "14:30", "end": "15:15", "allowed": "SWING", "min_llm_confidence": 0.85 },
+        { "start": "15:15", "end": "15:30", "allowed": "EXIT_ONLY", "min_llm_confidence": 0.0 }
+      ]
+    },
+    "nse_fo": {
+      "regular_session": { "open": "09:15", "close": "15:40" },
+      "amo": { "open": "16:00", "close": "08:57" },
+      "expiry_guardian": { "stage1": "15:00", "stage2": "15:15" },
+      "iv_history_close": "15:30"
+    }
+  },
+  "schedules": {
+    "llm_intraday_first_pass": "09:45",
+    "market_holiday_notice": "08:00",
+    "llm_health_morning": "08:10",
+    "llm_health_evening": "16:30",
+    "llm_swing_morning_scan": "08:30",
+    "gap_risk_check": { "start": "14:30", "end": "15:00" },
+    "daily_ohlcv_download": "16:00",
+    "heavy_learning_run": "22:00",
+    "position_update_notifications": { "start": "09:20", "end": "15:30" },
+    "eod_summary": "15:50"
+  }
+}

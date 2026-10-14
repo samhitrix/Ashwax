@@ -1,0 +1,61 @@
+{
+  "_options": {
+    "_note": "ASHWAX seller-first options desk (credit spreads / iron condors on NIFTY/BANKNIFTY/FINNIFTY). Entry is decided entirely by _seller_desk_loop / SellerDesk.run_cycle() in src/orchestrator.py / src/options/seller_desk.py -- regime + IVR + term-structure classification drives strategy_selector.candidates(), NOT the entry_conditions below, which are deliberately impossible (RSI can never exceed 100) so this spec is inert if ever evaluated through the normal per-bar USS scan. It exists only so this strategy is listed/toggleable in strategies_registry.json like every other strategy, per this project's registry-visibility convention. Real risk gating now flows through src/risk/crm.py's G0-G10 pipeline via src/options/seller_crm_adapter.build_seller_crm_signal() (see strategies_registry.json's entry for this strategy for the live on/off switch, which is NOT this file's enabled flag). direction MUST stay 'LONG', not 'BOTH': the compiler mirrors entry_conditions for the SHORT leg (value_above -> value_below), so 'RSI > 1000' -- impossible on the LONG side -- becomes 'RSI < 1000' on the SHORT side, which is ALWAYS true (RSI is bounded 0-100). With 'BOTH' this fired thousands of bogus equity SHORT signals under this strategy's name every scan cycle (found 2026-09-04, only saved from reaching real orders by intraday_regime happening to read BULL that day, which blocks all SHORT entries) -- do not change back without fixing the mirroring issue first.",
+    "_source": "2026-09-04 session -- CRM retrofit for the pre-existing seller desk (ASHWAX), following the same registry-shim pattern as news_catalyst_momentum.json."
+  },
+  "meta": {
+    "name": "options_seller_desk_v3",
+    "display_name": "Options Seller Desk (ASHWAX)",
+    "version": "1.0",
+    "product": "NRML",
+    "direction": "LONG",
+    "timeframe": "5MIN"
+  },
+  "universe_filter": {
+    "min_price": 0,
+    "min_adv_crores": 0,
+    "exchanges": ["NFO"],
+    "index_filter": null
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 10.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 3.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "atr_trail",
+      "atr_period": 14,
+      "atr_multiplier": 1.0
+    },
+    "breakeven_at_r": 1.0,
+    "partial_book_r": 1.0,
+    "trail_activation_r": 1.5,
+    "reversal_exit": true,
+    "time_stop_days": 0
+  },
+  "intraday": {
+    "range_window": "0915-0920",
+    "entry_window": "0920-1500",
+    "exit_window": "1510-1516",
+    "timezone": "Asia/Kolkata"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "enabled": true,
+  "include_paper": true,
+  "include_live": true,
+  "events": {
+    "entry_fill": true,
+    "entry_rejected": true,
+    "exit": true,
+    "modify_sl": true,
+    "partial_book": true,
+    "position_update": true,
+    "eod_summary": true,
+    "strategy_error": true,
+    "llm_health": true,
+    "market_holiday": true
+  },
+  "throttle": {
+    "modify_min_seconds_per_trade": 90,
+    "modify_min_r_moved": 0.25,
+    "modify_coalesce_seconds": 20,
+    "modify_max_per_trade_per_day": 12,
+    "global_burst": 5,
+    "global_refill_seconds": 3.0,
+    "dedupe_ttl_seconds": 600,
+    "startup_quiet_seconds": 60
+  },
+  "queue": {
+    "max_size": 1000,
+    "shutdown_drain_seconds": 2.0
+  },
+  "transport": {
+    "api_base": "https://api.telegram.org",
+    "timeout_seconds": 8.0,
+    "max_retries": 2,
+    "backoff_seconds": 1.0,
+    "parse_mode": "HTML",
+    "alert_after_consecutive_failures": 5
+  },
+  "position_update": {
+    "interval_minutes": 15,
+    "skip_when_flat": true
+  }
+}

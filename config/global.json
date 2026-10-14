@@ -1,0 +1,207 @@
+{
+  "_options": {
+    "_note": "Allowed values per field — JSON has no // comments, so this self-doc block is ignored by the loader (config is read via explicit .get() keys).",
+    "system.master_switch": "true => trading enabled; false => CRM gate G0 BLOCKS every trade (kill switch)",
+    "system.autonomy_mode": {
+      "manual": "CRM gate G10 BLOCKS every trade — each entry needs explicit human approval",
+      "assisted": "G10 passes; trades execute, but ask_mode (when enabled) surfaces them for review first — intended human-oversight mode",
+      "autonomous": "G10 passes; trades execute fully automatically with no human in the loop"
+    },
+    "system.paper_mode": "true => simulated paper_engine fills (no real orders); false => live broker orders (real money). Honors operator.json account.paper_mode_locked. GLOBAL ONLY — not yet segment-scoped.",
+    "system.shadow_mode": "true => evaluate/log signals without placing any order (observe-only); false => normal",
+    "system.log_level": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    "system.log_retention_days": "Days to keep before deleting: service_stdout_stderr (NSSM-rotated service_std{out,err}-<timestamp>.log snapshots, one new file per restart, ops/service_setup.ps1) and audit (audit-YYYY-MM-DD.log, one new file per day). Per-component logs (src/infrastructure/logger.py _COMPONENTS) are NOT here -- those already self-cap via RotatingFileHandler (10MB x 5 backups). Cleanup runs once at every process start (src.infrastructure.logger.cleanup_old_logs) plus once/day via supervisor's retention loop for long uptimes.",
+    "system.segments": "Per-segment override for master_switch/autonomy_mode/shadow_mode/paper_mode, keyed by intraday (MIS) / swing (CNC) / options. A segment's master_switch is AND-ed with the top-level system.master_switch (top-level OFF always wins, whole-system kill switch). autonomy_mode/shadow_mode/paper_mode fall back to the top-level system.* value when a segment isn't listed here. paper_mode is per-segment and TRUE CONCURRENT: some segments can trade live while others trade paper in the same running process. operator.json account.paper_mode_locked still force-overrides every segment to paper regardless of this config.",
+    "broker.name": ["kite", "angel_one", "paper"],
+    "llm.trade_gate / llm.background / llm.discretionary": "Ordered provider chain, first available wins (skips any cloud provider missing its API key). Gemini/Groq are free-tier, Ollama is local/free, Anthropic/OpenAI are the only paid hops.",
+    "llm._model_roles": "DELIBERATE SPLIT (2026-09-22) — one job per model, so nothing ever grades its own homework. (1) ORIGINATION, the only place an LLM invents a trade from scratch (symbol/direction/entry/SL/target) for llm_swing_agent + llm_intraday_agent = llm.discretionary = ANTHROPIC-first: hardest, lowest-frequency, alpha-determining call, so the paid frontier tier costs little and the capability gap matters most. (2) REVIEW of those anthropic-invented ideas = llm.swing_g9 / llm.intraday_g9, with anthropic deliberately EXCLUDED — a model reviewing its own idea agrees with itself, which is not a check. (3) REVIEW of rule/math-generated candidates no LLM originated = llm.trade_gate (DSL strategies) and llm.options_g9 (options desk, pure Greeks/probability entry logic) — no independence constraint there either way. PROVIDER ORDER WITHIN THE REVIEW CHAINS IS SET BY MEASURED HEALTH, NOT PREFERENCE: as of the 2026-09-22 checks (8 consecutive DEGRADED) gemini had 2 of 3 models failing and its then-primary burned 15.8s before a 504, while groq answered in 792ms and cloudflare in 2375ms — so groq leads every review chain and gemini sits behind it as fallback. trade_gate additionally carries the tightest budget in the system (trade_gate_timeout_seconds wraps the WHOLE chain, not per provider), and at that cap gemini cannot answer at all (4461ms best case when healthy) — another reason groq leads it. ANTHROPIC IS DELIBERATELY ABSENT from trade_gate (guarded by tests/unit/llm/test_providers.py::test_make_trade_llm_client_excludes_anthropic_even_with_key): it is the highest-volume path so a paid hop there bills per signal, and it could not answer inside the cap anyway (anthropic tries sonnet first, 7117ms measured), where slot 2 needs the next-FASTEST provider — cloudflare at 2375ms — or the remaining budget is burned before any fallback is reached. Re-read logs/llm_model_health.json before reordering any of this; the ordering is an empirical claim with a date on it, not a vendor preference. INVARIANT to preserve regardless of health: whatever originates must never appear in the chain that reviews it.",
+    "llm_swing.enabled": "true => src/strategies/llm_swing/ runs its once-daily reasoning pass and can originate trade ideas (still gated by strategies_registry.json's own enabled flag AND execution_mode); false => the module never runs (default).",
+    "fundamentals.enabled": "true => daily yfinance fetch runs and shadow-attaches fundamentals_shadow to signal.meta for logging (log-only, never read by CRM/G9 until a backtest validates it); false => the fetcher never runs, not even imported (default)."
+  },
+  "system": {
+    "name": "ASHWAX",
+    "version": "3.0",
+    "master_switch": true,
+    "autonomy_mode": "autonomous",
+    "paper_mode": true,
+    "shadow_mode": false,
+    "log_level": "DEBUG",
+    "log_retention_days": { "service_stdout_stderr": 14, "audit": 30, "master": 30 },
+    "_log_retention_days_note": "2026-09-23: added 'master' for trading-YYYY-MM-DD.log (the all-components daily log). Per-component files (api.log, risk.log, swing.log, intraday.log, ...) are no longer size-rotated across days -- they hold only the current IST day and reset at midnight, so they have no retention key here; that day's full record lives in the dated master log instead.",
+    "segments": {
+      "intraday": { "master_switch": true, "autonomy_mode": "autonomous", "shadow_mode": false, "paper_mode": true },
+      "swing": { "master_switch": true, "autonomy_mode": "autonomous", "shadow_mode": false, "paper_mode": true },
+      "options": { "master_switch": true, "autonomy_mode": "autonomous", "shadow_mode": false, "paper_mode": true }
+    }
+  },
+  "broker": {
+    "_note": "name: \"kite\" (Zerodha Kite Connect) | \"angel_one\" (Angel One SmartAPI) | \"paper\". Only one active at a time — see README.md Broker setup for credential setup per broker.",
+    "name": "kite",
+    "exchange": "NSE",
+    "currency": "INR",
+    "timezone": "Asia/Kolkata"
+  },
+  "llm": {
+    "trade_gate": ["anthropic", "cloudflare", "groq", "gemini"],
+    "background": ["cloudflare", "groq"],
+    "_background_note": "2026-09-23: cloudflare moved to primary (was groq-first). News classification runs 24/7 (not market-hours gated) and was exhausting the SAME groq quota that swing_g9/intraday_g9/trade_gate fall back to -- news starving a live trade decision is the real risk, not news itself being paid (it never was; groq/cloudflare are both free). Moving its primary load off groq protects the gates. ollama was considered (make_background_llm_client's own code default is groq->ollama) but is NOT currently running (no process, no service, port 11434 silent) -- see llm.ollama.news_model for the switch-over path once it is. anthropic can never appear in this chain regardless of this list -- enforced in code (make_background_llm_client), not just by convention.",
+    "discretionary": ["anthropic", "groq", "cloudflare"],
+    "swing_g9": {
+      "providers": ["gemini", "cloudflare", "groq"],
+      "chain_timeout_seconds": 60,
+      "_note": "G9 reviewer chain for the SWING/CNC path (real money — segments.swing.paper_mode is false). WHICH strategies must pass it is set per strategy by strategies_registry.json llm_gate_required (llm_originated strategies are always gated) — a gated strategy with no verdict does not trade, paper or live. 'providers' deliberately EXCLUDES anthropic because llm_swing_agent ORIGINATES its ideas on the anthropic-first 'discretionary' chain — the same model reviewing its own idea is not independent; neither groq nor gemini is used in origination, so both are genuinely independent reviewers here. Order is by MEASURED health (2026-09-22: groq 792ms OK; gemini 2-of-3 models failing, then-primary 15.8s to a 504) — groq leads, gemini is the fallback. Re-check logs/llm_model_health.json before reordering. chain_timeout_seconds is the budget for the WHOLE chain (a slow/rate-limited first provider fails over to the next inside it; a missing verdict is re-checked once before the trade is skipped)."
+    },
+    "intraday_g9": {
+      "providers": ["gemini", "cloudflare", "groq"],
+      "chain_timeout_seconds": 60,
+      "_note": "G9 reviewer chain for LLM-ORIGINATED intraday (MIS) strategies (registry llm_originated, e.g. llm_intraday_agent) — anthropic-free for the same independence reason as swing_g9 (llm_intraday_agent originates on the anthropic-first 'discretionary' chain). Other gated intraday strategies use llm.trade_gate (separate, much tighter 3s path — NOT this one). WHICH strategies are gated is registry llm_gate_required. chain_timeout_seconds (60s) covers the whole chain, which matters here because a sick gemini can spend 15s+ per model before failing over. Note ollama (70-90s) cannot fit, so the fallback in practice is groq -> cloudflare. 2026-09-22: swapped anthropic<->gemini roles (see swing_g9's note for the rationale) — this gate is the once-per-idea review before order placement, not the per-tick DSL scan."
+    },
+    "options_g9": {
+      "providers": ["anthropic", "cloudflare", "gemini", "groq"],
+      "chain_timeout_seconds": 60,
+      "_note": "G9 reviewer chain for the options seller desk. Whether options_seller_desk_v3 must pass it is registry llm_gate_required (true = no verdict, no trade — paper or live). options_seller_desk_v3 doesn't originate via any LLM chain (pure DSL/math, see its own registry note), so no independence conflict exists here either way — anthropic is kept out for consistency with swing_g9/intraday_g9, and groq leads on measured health (see llm._model_roles). chain_timeout_seconds (60s) covers the whole provider chain."
+    },
+    "token_budgets": {
+      "enabled": true,
+      "daily_tokens": {
+        "news_classify": 30000,
+        "swing": 80000,
+        "intraday": 80000,
+        "options": 20000,
+        "background": 20000
+      },
+      "provider_daily_quota": { "groq": 200000 },
+      "_note": "Reserved LLM tokens PER DAY for each purpose (IST day; counts persist in Redis when available). HARD-capped purposes (news_classify, background) that spend their share are refused until tomorrow, BEFORE any provider is tried; trade-path purposes listed in llm.usage_guard.soft_budget_purposes (swing, intraday, options) are SOFT: going over alerts but never blocks the agent's calls. Hard rule (original): a hard purpose that spends its share is refused until tomorrow — it never borrows another's, so news/learning can no longer starve the trade gates (2026-09-15: news burned Groq's whole 200k/day). Edit a number to raise/lower a share; changes apply on the next call, no restart. null/absent = unmetered, 0 = that purpose may not call the LLM. Purposes: news_classify = news classifier; swing = llm_swing_agent daily pass + swing G9; intraday = llm_intraday_agent passes + intraday G9 (llm_intraday_g9 and the trade_gate G9); options = seller-desk G9; background = learning/causal analysis. Sized from measured call sizes: a G9 review is ~0.5-1k tokens, an origination pass ~5-6k. Keep the sum <= provider_daily_quota.groq (a startup warning fires if not); ollama (local) is not counted."
+    },
+    "openai_compat": {
+      "_note": "Free OpenAI-compatible tiers for the failover chains (Cloudflare Workers AI: 10,000 free Neurons/day, needs API token + account id). Model IDs change often - make one real call after adding keys. A provider is skipped automatically when its key_env / account_env is unset.",
+      "cloudflare": { "base_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1", "key_env": "CLOUDFLARE_API_TOKEN", "account_env": "CLOUDFLARE_ACCOUNT_ID", "model": "@cf/openai/gpt-oss-120b", "timeout_seconds": 20 }
+    },
+    "gemini": { "model": "gemini-3-flash-preview", "models": ["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-flash-latest"], "model_timeout_seconds": 12, "timeout_seconds": 40, "_note": "models[0] is the ONLY one measured healthy (2026-09-22 health checks, 8 consecutive DEGRADED): gemini-3.5-flash-lite burned 15845ms before a 504 DEADLINE_EXCEEDED and gemini-flash-latest 503d, while gemini-3-flash-preview answered in 4461ms. The broken model used to be first, so every gemini call paid that 15.8s timeout before reaching a working one. Re-check llm_model_health.json before reordering." },
+    "groq": { "model": "openai/gpt-oss-20b", "timeout_seconds": 20 },
+    "ollama": { "model": "qwen2.5:7b", "base_url": "http://localhost:11434" },
+    "_ollama_note": "2026-09-23: ollama is configured here but NOT currently running (checked -- no process, no service, port 11434 silent), so it is not in any active chain yet. Placeholder for when it is stood up: 'news_model' below (currently unset/commented) lets news classification use a smaller/faster model than the general 'model' above without a code change -- once ollama is live, add \"news_model\": \"<model>\" here and put \"ollama\" first in llm.background.",
+    "_ollama_news_model_placeholder": "unset -- add a real model name here once ollama is confirmed running, then reference it from llm.background ordering",
+    "anthropic": { "model": "claude-sonnet-5", "models": ["claude-sonnet-5", "claude-opus-5", "claude-fable-5-1", "claude-haiku-4-5-20251001"], "model_timeout_seconds": 60, "timeout_seconds": 75, "_note": "Anthropic is used ONLY for origination (llm.discretionary) -- it is in no review chain, so these generous caps cannot slow any latency-sensitive gate. Sized to the origination caller's own budget (llm_swing.llm_timeout_secs 90): one frontier-model attempt gets a real 60s to think (cutting a reasoning model off mid-thought is what produced the truncated-JSON trade-day losses), and the 75s provider cap still leaves headroom for a groq fallback inside the caller's 90s if anthropic hangs outright. Genuine failures (quota / API errors) fail fast and hit the next model in `models` without consuming these caps." },
+    "chain_models": {
+      "_note": "Per-chain MODEL override (src/llm/providers.py chain_models). Provider model lists are global, but chains differ in budget and job, so one list cannot serve both: measured 2026-09-22, anthropic leads with claude-sonnet-5 at 6074ms (right for a 90s origination call, impossible inside a 3s gate) while its own claude-haiku-4-5 answered in 763ms -- the fastest model in the whole stack. Overriding per chain lets the SAME provider bring its frontier model to origination and its fastest model to a tight gate. Omit a provider (or the whole chain) to use its normal llm.<provider>.models list. Re-check logs/llm_model_health.json before tuning these.",
+      "trade_gate": { "anthropic": ["claude-haiku-4-5-20251001"] },
+      "options_g9": { "anthropic": ["claude-haiku-4-5-20251001", "claude-opus-5"] }
+    },
+    "trade_gate_timeout_seconds": 3,
+    "health_probe": {
+      "startup_min_interval_minutes": 240,
+      "_note": "LLM provider availability probe (pings every configured provider/model). Scheduled: morning + evening slots (market_hours.json schedules.llm_health_morning / _evening). Boot probe: skipped if ANY probe already completed within this many minutes, so restarts do not each re-ping every provider (it ran 32 times on 2026-09-24). There is no periodic 5-minute probe."
+    },
+    "usage_guard": {
+      "alert_purposes": ["swing", "intraday", "options"],
+      "soft_budget_purposes": ["swing", "intraday", "options"],
+      "max_prompt_chars": {"swing": 40000, "intraday": 30000, "options": 12000, "default": 0},
+      "duplicate_window_seconds": 900,
+      "reuse_duplicates": true,
+      "duplicate_retry_grace_seconds": 120,
+      "_reuse_duplicates_note": "2026-10-06: an IDENTICAL prompt (same purpose+system+prompt) re-sent within duplicate_window_seconds is answered from the earlier reply with NO LLM call (Redis-cached, survives restarts). A repeat inside duplicate_retry_grace_seconds is a deliberate retry of a malformed/missing reply and still goes out. Found: the options desk re-asked the same ~454-token review every 5 min. false = old behaviour (alert only).",
+      "failover_alert_dedupe_minutes": 10,
+      "_note": "Guardrails on LLM spend for the TRADE-PATH purposes (the agents' whole reason to exist - they are never blocked by a counter). alert_purposes: a provider/model failure, a failover, a total outage, an oversized prompt or a duplicate call for these purposes raises a CRITICAL/ALERT on the dashboard Alerts tab AND Telegram (news_classify/background are excluded: too noisy). soft_budget_purposes: going over token_budgets.daily_tokens for these purposes raises an alert but the call still goes out; every OTHER purpose (news_classify, background) stays HARD-capped and is refused before any provider is tried. max_prompt_chars: per-purpose ceiling on system+prompt characters (~4 chars/token); exceeding it alerts (the call is not blocked) - on 2026-09-24 a swing prompt carried 150,000 chars of unused fundamentals (~42k tokens per call). duplicate_window_seconds: an IDENTICAL prompt re-sent inside this window is logged + alerted (detected, not suppressed, because callers legitimately retry a malformed reply). 0 disables. failover_alert_dedupe_minutes: one alert per provider/purpose per this many minutes."
+    },
+    "gate_transient_retries": 3,
+    "origination_transient_retries": 5,
+    "background_transient_retries": 1,
+    "_retries_note": "Times ONE provider is re-attempted on a TRANSIENT failure (5xx / network blip / non-JSON reply) before the chain fails over to the next provider. Deliberately NOT applied to two shapes: quota/payment-required (retrying cannot help) and TimeoutError (a hung provider just hangs again and burns the chain budget that failover needs) -- see _dispatch_with_retry. Separate counts because the paths have different value and different risk: origination (5) is the highest-value call in the system, fires only a few times a day, and has a 90s budget to spend, so losing it to one flaky reply costs a whole day of ideas; gate (3) is the per-signal review, cheap to retry since transient failures return in ms; background (1) is the 24/7 news/learning loop where aggressive retries burn free-tier quota -- 2026-09-15 news alone burned Groq's entire 200k/day. 429 rate-limits and truncated replies have their own separate handling (exponential backoff / escalated token budget, 2 retries each)."
+  },
+  "equity": {
+    "screener": {
+      "cache_universe": "NIFTY500",
+      "universe": "NIFTY500",
+      "ohlcv_history_years": 5,
+      "max_concurrent_fetches": 9
+    }
+  },
+  "agent_intelligence": {
+    "strategy_creation_mode": "suggest_only",
+    "can_create_strategies": true,
+    "max_active_agent_strategies": 3,
+    "paper_trial_days_before_live": 10
+  },
+  "llm_swing": {
+    "enabled": true,
+    "llm_timeout_secs": 90,
+    "memory_lookback_days": 14,
+    "max_calls_per_day": 2,
+    "reentry_cooldown_days": 10,
+    "block_regimes": ["STRONG_BEAR"],
+    "_block_regimes_2026_10_06_note": "STRONG_BEAR removed 2026-10-06 by operator decision (applies paper AND live): the gate audit found the agent's only record -- 7 paper trades, all in STRONG_BEAR -- was +Rs4,134, PF 1.91 (carried by 2 wins, one a manual exit). RESTORED 2026-10-08 after AEGISLOG (long, STRONG_BEAR, G9 confidence 0.65 flagging 'counter-regime positioning', backtest-failed size cut to 50%) stopped out -5.2%/-Rs1,043 -- the thin 7-trade sample did not hold up on the next live instance. Do not remove again without a larger, out-of-sample-validated record.",
+    "_block_regimes_note": "Market regimes in which llm_swing_agent may NOT open new positions (2026-09-28). Swing entries here are delivery longs; in STRONG_BEAR the agent proposed longs every day regardless of its own prompt. While the current regime is listed the LLM is not called at all (no tokens, no cap slot, re-checked every 5 min) and CRM G4 blocks any entry that still arrives. Exits and open positions are never affected. Empty list = no block. Regimes: STRONG_BULL | BULL | NEUTRAL | BEAR | STRONG_BEAR.",
+    "_reentry_cooldown_days_note": "A stock we EXITED (live or paper, any strategy) in the last N calendar days is removed from the swing agent's candidate list before the LLM sees it, so a leader we just booked profit on is not bought again the next morning just because it is still a relative-strength leader (LAURUSLABS: exited +Rs3,624 on 24 Sep, re-bought 28 Sep). 0 disables.",
+    "_max_calls_per_day_note": "HARD CAP on how many times llm_swing_agent may ASK the LLM per IST day. Counts every call actually SENT (from DB table llm_call_log, written before the call), including calls that fail or are killed mid-flight, and survives restarts. A successful pass also latches the day (one good pass = done), so 2 means: one call, plus at most one retry if the first fails. If the count cannot be read, no call is made.",
+    "max_candidates_per_day": 3,
+    "max_proposals": 8,
+    "_note": "max_proposals is how many ideas the LLM may PROPOSE; max_candidates_per_day is how many survive ranking and reach the CRM gates. They are deliberately different: the code used to truncate with candidates[:3] in EMISSION order, so on a day the model produced more ideas than the cap the best one could be discarded for being listed fourth, with nothing recorded that it ever existed. Ranking is by the model's own confidence (its probability estimate); a crude mechanical score (R:R + strength vs NIFTY + an RSI sanity band) is logged beside it as swing_candidate_ranked so the two can be compared over time before either is trusted."
+  },
+  "llm_intraday": {
+    "enabled": true,
+    "universe_size": 10,
+    "min_adv_crores": 50,
+    "_menu_note": "Which stocks the LLM is shown each pass (2026-09-28). universe_size = the MOST it sees (was 25); min_adv_crores = minimum average DAILY traded value in Rs crore (20-day) -- thin stocks (BIKAJI ~23cr, SAREGAMA ~19cr, SIGNATURE ~20cr) used to dominate the menu because volume-ratio spikes easily on them; 0 disables the floor; unknown liquidity is excluded. A stock shown in the last trigger.re_offer_minutes is not shown again, so the same names cannot fill every pass; if nothing new qualifies the pass is skipped and no LLM call is made.",
+    "max_ideas_per_llm_call": 2,
+    "_max_ideas_per_llm_call_note": "NOT a call count. Inside ONE LLM call, the model may return at most this many trade ideas (symbols); extras are dropped. How many CALLS are made per day is trigger.max_passes_per_day. Renamed 2026-09-24 from max_ideas_per_pass (still honoured if present) because 'pass' read like a count of calls.",
+    "trigger": {
+      "min_setup_score": 30,
+      "min_gap_minutes": 30,
+      "max_passes_per_day": 8,
+      "_max_passes_8_note": "2026-10-06: 3 -> 8 (operator-approved): 15 calls in two weeks produced only 8 ideas -- too few to judge the agent. min_gap_minutes/min_setup_score still pace it (~4-6/day typical).",
+      "_max_passes_per_day_note": "HARD CAP on how many times llm_intraday_agent may ASK the LLM per IST day (one 'pass' = one LLM call, which returns up to max_ideas_per_llm_call ideas). Counted from DB table llm_call_log (written before each call), so restarts cannot reset it and a call killed mid-flight still counts. The first call of the day is the baseline pass at schedules.llm_intraday_first_pass. If the count cannot be read, no call is made. Was 8 (and ignored across restarts: 13 passes ran on 09-22 and 09-23).",
+      "re_offer_minutes": 60,
+      "features_max_age_seconds": 900,
+      "_note": "When llm_intraday_agent asks the LLM for ideas (signal-driven, no fixed clock slots): a pass fires when the 5-min scan sees a symbol whose setup score |chg%| x vol_ratio20 >= min_setup_score that was not offered in the last re_offer_minutes, at least min_gap_minutes after the previous pass, at most max_passes_per_day, never before schedules.llm_intraday_first_pass (a baseline pass always runs then) nor after last_entry_by minus idea_ttl_minutes, and only while token budget and the daily trade cap remain. Sized on 40 sessions of 5-min data: score>=30 gives ~13 setups/day and ~4.5 passes/day at a 30-min gap (range 3-6, never zero); >=20 gives ~7 passes; >=50 is too rare (zero on 8 of 40 days)."
+    },
+    "max_trades_per_day": 3,
+    "idea_ttl_minutes": 15,
+    "entry_tolerance_pct": 0.4,
+    "max_entry_drift_pct": 0.5,
+    "min_stop_pct": 0.5,
+    "min_stop_atr_mult": 2.0,
+    "max_stop_pct": 2.5,
+    "min_reward_risk": 1.8,
+    "min_target_pct": 0.6,
+    "reach_mult": 0.0,
+    "allowed_directions": ["LONG", "SHORT"],
+    "_allowed_directions_note": "2026-10-06: set back to BOTH at the operator's explicit request -- direction now follows the market via the intraday regime gate (BEAR blocks LONG, BULL blocks SHORT, NEUTRAL allows both) plus block_counter_trend_shorts. Paper-locked. Watch the LONG bucket: the evidence below says it was losing. Previous setting, 2026-10-02 (SHORT only): ideas in other directions are rejected (reason direction_not_allowed) and the prompt says so. Replay of 51 distinct LLM ideas on 5m candles (09-15..10-01): the 35 LONGs lose at every target 0.5R-2R (-0.33R..-0.47R after ~0.07R cost), the 16 SHORTs are ~flat (-0.02R..+0.09R) -- too few to call an edge, so a shorts-only subset needs its own fresh >=40 trades. Rollback: [\"LONG\",\"SHORT\"] or delete this key (missing = both).",
+    "block_counter_trend_shorts": true,
+    "direction_gates_enabled": false,
+    "_direction_gates_enabled_note": "2026-10-06 operator decision (applies paper AND live): the intraday regime + breadth direction gates are OFF for llm_intraday_agent. 2-week replay: 6 gate-blocked ideas +2.8R vs 3 taken -3.0R (tiny n). block_counter_trend_shorts (409-trade evidence, PF 0.03) still applies. true = gates back on.",
+    "_block_counter_trend_shorts_note": "2026-09-22: llm_intraday_agent SHORTs on a stock above its own 50 AND 200 DMA are rejected (previously halved). 409 closed MIS trades: counter-trend shorts n=67 -1.27R/trade, 10% win, PF 0.03; counter-trend longs n=62 -0.38R (best bucket) so longs stay halved only. HOMEFIRST and AEGISLOG were both such shorts.",
+    "_reach_mult_note": "Target reachability check (target_pct <= reach_mult x 5-min ATR% x sqrt(minutes_to_flat/5)); 0 = off. Kept OFF 2026-09-22: replay of 409 closed MIS trades at x1.0 removed the BETTER trades (-0.16R removed vs -1.23R kept) because far targets pair with wider, less noise-prone stops. Re-test on llm_intraday_agent's own forward trades before enabling.",
+    "memory_trades": 20,
+    "llm_timeout_secs": 90,
+    "_note": "LLM intraday agent (src/strategies/llm_intraday/, registry llm_intraday_agent, paper-locked). pass timing (llm_intraday.trigger + market_hours.json schedules.llm_intraday_first_pass): after the 15-min open block settles, then any time until market_hours.json last_entry_by minus idea_ttl_minutes (no midday restriction: entries follow the trading window only), last slot + idea_ttl_minutes ends before market_hours.json last_entry_by. universe_size: top-N 'in play' names (|chg%| x relative volume) offered to the LLM. Validation limits (all % of entry): max_entry_drift_pct = how far the LLM's entry may sit from ltp; stop must be >= max(min_stop_pct, min_stop_atr_mult x 5m ATR%) -- orb_intraday_smart's 0.95% stop sat inside noise and only 4/221 trades ever hit target -- and <= max_stop_pct; target >= min_target_pct (6x the ~0.10% round-trip cost) and >= min_reward_risk x stop. entry_tolerance_pct: at signal time the latest close must still be this close to the idea's entry, and the idea is re-validated at that price. max_trades_per_day caps this agent's paper fills regardless of CRM's own caps."
+  },
+  "exit_defaults": {
+    "enabled": true,
+    "_note": "GLOBAL exit management (2026-09-21): fills any exit_conditions field a strategy spec leaves unset (None) so no strategy runs with a static stop. Explicit spec values always win. LAURUSLABS (llm_swing_agent) sat at +1.5R with the original -1R stop because its spec had no breakeven/partial/trail. Values are unvalidated and deliberately conservative; enabled=false restores per-spec-only behaviour.",
+    "swing": {
+      "breakeven_at_r": 1.0,
+      "partial_book_r": 1.5,
+      "trail_activation_r": 1.0,
+      "trailing_stop": {"method": "chandelier", "chandelier_period": 22, "chandelier_multiplier": 2.5}
+    },
+    "intraday": {
+      "breakeven_at_r": 1.0,
+      "partial_book_r": 1.0,
+      "trail_activation_r": 1.5,
+      "trailing_stop": {"method": "atr_trail", "atr_period": 14, "atr_multiplier": 2.0}
+    }
+  },
+  "fundamentals": {
+    "enabled": true,
+    "source": "yfinance",
+    "refresh_hour_ist": 8
+  },
+  "ask_mode": {
+    "enabled": false,
+    "timeout_minutes": 30,
+    "auto_reject_on_timeout": true,
+    "min_rank_to_surface": 2,
+    "show_full_reasoning": true
+  }
+}

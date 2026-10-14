@@ -1,0 +1,48 @@
+{
+  "_options": {
+    "_note": "Hypothesis B (docs/hypotheses/B_nifty_weekly_condor_simple.md). Registry shim ONLY -- the real logic is SellerDesk.run_weekly_condor_cycle() (src/options/seller_desk.py), driven by orchestrator._weekly_condor_step inside _seller_desk_loop, with its rules in config/options_settings.json options_trading.weekly_condor_simple. entry_conditions are deliberately impossible (RSI > 1000) so this spec can never fire through the per-bar USS scan -- same shim pattern as options_seller_desk_v3.json. direction MUST stay LONG (see that file's note: BOTH would mirror RSI>1000 into an always-true SHORT condition). Unlike the desk's own registry entry, 'enabled' here IS a live switch (checked by _weekly_condor_step), and this name is what CRM's G9 llm_gate_required lookup uses for B's trades."
+  },
+  "meta": {
+    "name": "nifty_weekly_condor_simple",
+    "display_name": "NIFTY Weekly Condor (B)",
+    "version": "1.0",
+    "product": "NRML",
+    "direction": "LONG",
+    "timeframe": "5MIN"
+  },
+  "universe_filter": {
+    "min_price": 0,
+    "min_adv_crores": 0,
+    "exchanges": ["NFO"],
+    "index_filter": null
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 8.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 3.0
+  },
+  "intraday": {
+    "range_window": "0915-0920",
+    "entry_window": "0920-1500",
+    "exit_window": "1510-1516",
+    "timezone": "Asia/Kolkata"
+  }
+}

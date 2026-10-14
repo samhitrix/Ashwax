@@ -1,0 +1,248 @@
+{
+  "_comment": "Seller-first INDEX options engine (NIFTY/BANKNIFTY/FINNIFTY), living in src/options/ alongside the buyer-first structures (config/execution.json:options_execution) — not a separate tree. When this master switch is false, no seller-desk loop initializes (zero overhead, equity engine untouched). European index options only; stock options deferred. Full decision+execution pipeline is wired (seller_desk.py) and runs every 5 minutes. Only strategies marked enabled BELOW *and* implemented in structure_builder.py are ever traded — currently 10 types: the 8 verticals/straddles/strangles (bull_put_spread/bear_call_spread/bull_call_spread/bear_put_spread/iron_condor/iron_butterfly/long_straddle/long_strangle) plus calendar_spread/diagonal_spread, which ARE fully built (ChainFetcher.fetch_tier2 multi-expiry support exists, seller_desk.run_cycle already calls them on backwardation, tests pass) and enabled 2026-09-04 after verifying the earlier 'no multi-expiry chain support' note here was stale. protective_put/collar have no builder and stay disabled — that trigger (existing CNC equity position + earnings proximity) is already handled by the buyer-first src/options/structure_selector.py, not duplicated here.",
+  "options_trading": {
+    "enabled": true,
+    "options_capital_rupees": 1500000,
+    "_capital_note": "RING-FENCED fixed rupee sleeve, isolated from equity buying power. ALL Greeks budgets and position sizing key off this number. Must be > 0 before enabling (boot validation enforces when enabled=true). Spec example uses 400000.",
+    "universe": {
+      "indices": ["NIFTY", "BANKNIFTY"],
+      "_indices_note": "FINNIFTY removed 2026-09-28. Measured on the live Oct-27 chain: OTM bid-ask spreads 67-195% and OI 0 at every target-delta strike (BANKNIFTY same expiry: ~1%, OI in the thousands), so the liquidity gate rejected every structure 1,100+ times and any paper fill would have been a fantasy at mid. Re-add only if its chain shows two-sided quotes within the 5% spread rule at the 0.25/0.10 delta strikes.",
+      "stocks": [],
+      "_stocks_note": "Empty and non-configurable in this phase. Stock options deferred."
+    },
+    "operator_actions": {
+      "_note": "close_position_ids: option position ids to close at the next sweep (~5 min), reason OPERATOR_CLOSE, audited by a seller_desk_operator_close log line. Read from disk every sweep -- no restart needed. One-shot per id (a closed id is simply ignored), so leftovers are harmless; clear the list when done. Added 2026-09-28: OPT-1A3EA0F8F43C (BANKNIFTY bear_put_spread, 14:03) and OPT-CE9F88DB0501 (NIFTY bull_call_spread, 14:12) were both sized on the false pop=0.75 (real ~0.40) before the debit-POP fix was live; they filled both underlyings and the one-position-per-underlying rule then blocked every new entry. Added 2026-10-07: OPT-6B8A1261541E (NIFTY bull_put_spread, opened Oct 5, Rs19,331 margin) -- operator request, to free shared-risk-ceiling room for the weekly condor.",
+      "close_position_ids": ["OPT-1A3EA0F8F43C", "OPT-CE9F88DB0501", "OPT-6B8A1261541E"]
+    },
+    "strategies": {
+      "bull_put_spread":   { "enabled": true },
+      "bear_call_spread":  { "enabled": true },
+      "iron_condor":       { "enabled": true },
+      "iron_butterfly":    { "enabled": true },
+      "long_straddle":     { "enabled": false },
+      "long_strangle":     { "enabled": false },
+      "bull_call_spread":  { "enabled": true },
+      "bear_put_spread":   { "enabled": true },
+      "calendar_spread":   { "enabled": true },
+      "diagonal_spread":   { "enabled": true },
+      "protective_put":    { "enabled": false },
+      "collar":            { "enabled": false }
+    },
+    "_strategy_order_note": "Credit spreads (bull_put_spread / bear_call_spread) are brought up FIRST per operator decision — 2-leg, smaller naked-exposure surface than the 4-leg Iron Condor.",
+    "iv_thresholds": {
+      "_note": "Read by strategy_selector.py's _menu()/_reduced_size_ivr_band() -- previously loaded into orchestrator.py's _seller_iv_cfg and never used at all (dead config, found+fixed 2026-09-04); the OLD keys here (sell_min_ivr/buy_max_ivr/iron_butterfly_min_ivr:65) disagreed with the actual hardcoded enforcement (iron_condor:55/iron_butterfly:70/reduced-band 25-55) -- these are now the real, single source of truth. iron_condor_min_ivr/iron_butterfly_min_ivr are the full-size IVR floor for range-bound structures; reduced_size_min_ivr/reduced_size_max_ivr is the [lo,hi) band where single-sided credit spreads (bull_put_spread/bear_call_spread) fire at half size instead of not at all.",
+      "iron_condor_min_ivr": 55.0,
+      "iron_butterfly_min_ivr": 70.0,
+      "reduced_size_min_ivr": 25.0,
+      "reduced_size_max_ivr": 55.0
+    },
+    "strike_deltas": {
+      "_note": "Target deltas for strike selection (structure_builder.py). credit_short/credit_long are the spec's own bull_put_spread numbers (options_spec.md §4); atm/strangle_otm are NOT spec-given, documented reasonable defaults (see structure_builder.py module docstring). Defaults here match what was previously hardcoded -- changing these is a real trading-behavior change, not a config-extraction no-op.",
+      "credit_short": 0.25,
+      "credit_long": 0.10,
+      "atm": 0.50,
+      "strangle_otm": 0.30
+    },
+    "dte_ranges": {
+      "_note": "Optimal (min_dte, max_dte) per strategy type (options_spec.md §6 table), read by expiry_selector.py. Types not listed here get the (0, 999) no-restriction fallback. Defaults match what was previously hardcoded.",
+      "iron_condor": [30, 45],
+      "iron_butterfly": [14, 21],
+      "long_straddle": [7, 21],
+      "long_strangle": [7, 21],
+      "bull_put_spread": [21, 45],
+      "bear_call_spread": [21, 45],
+      "bull_call_spread": [21, 45],
+      "bear_put_spread": [21, 45]
+    },
+    "low_ivr_mode": {
+      "_note": "OFF BY DEFAULT (enabled:false) -- opt-in alternative delta/DTE profile for bull_put_spread/bear_call_spread on days where sizing_multiplier's reduced-size band already applies (ivr below reduced_size_max_ivr). Data-informed 2026-09-04 via scripts/backtest_options_seller_regime.py --backfill against ~5.3 years (1330 real trading days) of NIFTY/BANKNIFTY/FINNIFTY: tight_deltas (35/15) collected ~55-70% more premium than the default 25/10 wide profile with a real but modest 5-8pp lower win rate, consistently across all 3 underlyings; short_dte (14) similarly collected more premium-per-day-of-risk (~35-55% more) than the current 21-45 band's ~30-day midpoint, also with a modest win-rate tradeoff -- both real, quantified, not-obviously-bad tradeoffs, but changing default live behavior on them without a paper trial is exactly what this project's validation rule prohibits, hence off by default. A DIRECTIONAL CREDIT-SIDE TILT (bias bull_put vs bear_call selection by trend direction instead of by which collects more premium) was ALSO tested via the same backtest and explicitly REJECTED: it underperformed the current abs-premium selection on all 3 underlyings (e.g. NIFTY avg_pnl -19.70 vs -3.05, BANKNIFTY -77.26 vs +16.67) -- not implemented anywhere, do not re-add without new contrary evidence. See the low-IV redesign plan for the full Phase 2 findings.",
+      "enabled": true,
+      "_enabled_note": "Turned on 2026-09-04 at the operator's explicit request, in paper mode (config/global.json system.segments.options.paper_mode is still true) -- start the paper_trial_days_before_live clock from here.",
+      "ivr_threshold": 25.0,
+      "strike_deltas": { "credit_short": 0.35, "credit_long": 0.15 },
+      "dte_range": [10, 18],
+      "candidacy_min_ivr": 3.0,
+      "candidacy_size_multiplier": 0.25,
+      "override_deltas": false,
+      "_override_deltas_note": "Set false 2026-09-08 -- found live: NIFTY generated real bull_put_spread/bear_call_spread candidates all day (regime=LOW_VOL_TRENDING, ivr 8.4-8.6%, correctly cleared the candidacy_min_ivr floor above) but every single one (121/121) was rejected at evaluate_and_size()'s EV gate with reason=negative_ev. Root cause: the EV gate's pop=1-delta touch-probability proxy algebraically requires pop>0.75 (avg_win=0.5x premium, avg_loss=1.5x premium, tied to profit_and_stop's 50%/150%) -- a bar low_ivr_mode's own 0.35 tight delta (proxy pop=0.65) can never clear, AND a fresh no-lookahead backtest (2026-09-08, n=1300/underlying, BANKNIFTY+NIFTY) shows the tight delta's REAL win rate (71.6% avg) is also genuinely lower than the default 0.25 delta's (77.5% avg) -- not just a bad proxy, an actual EV-negative tradeoff under this exit-management scheme. See pop_calibration below: with the proxy now recalibrated to real backtested numbers, the tight delta still fails the EV gate (0.716 pop, needs >0.75) while the default 0.25 delta clears it (0.775 pop). So low_ivr_mode now keeps DTE-shortening + the candidacy floor + reduced sizing (none of which showed a win-rate penalty in the same backtest) but no longer overrides strike_deltas -- letting the default wide profile apply is what actually produces trades.",
+      "_candidacy_note": "Added 2026-09-07 -- found live: on a real day (BANKNIFTY regime correctly classified LOW_VOL_RANGE_BOUND, ivr 4.1-6.8%), candidates=[] every single cycle because strategy_selector._menu()'s OWN floor (iv_thresholds.reduced_size_min_ivr, 25 by default) gates candidacy for bull_put_spread/bear_call_spread BEFORE low_ivr_mode's strike_deltas/dte_range ever get consulted -- the tighter-profile code above was unreachable dead code without this. candidacy_min_ivr now REPLACES that floor (down to 3.0, chosen to cover the observed 4-7% range with margin) when low_ivr_mode is enabled; candidacy_size_multiplier (0.25, smaller than the 25-55 band's 0.5) sizes these trades down further, per the 'scale down, don't force it' playbook item -- operator's explicit instruction 2026-09-07: 'option trade to happen as per IV, create strategy as per IV', prioritized over further backtest validation of this specific sub-25 IVR band (the Phase 2 backtest validated the delta/DTE choice broadly, not this exact floor).",
+      "paper_trial_days_before_live": 10,
+      "_paper_trial_note": "Mirrors config/global.json agent_intelligence.paper_trial_days_before_live's convention. options_positions.realized_pnl is now populated at close (fixed 2026-09-04, seller_desk._close_position -> OptionsRepository.close_position) -- but it's an LTP-captured-before-the-close-order APPROXIMATION, not a confirmed fill (no fill-polling exists on this path), and NULL (not 0) whenever a leg's LTP fetch failed at close. Promotion decisions should still be a manual review of options_positions rows (WHERE strategy_type IN ('bull_put_spread','bear_call_spread') AND opened_at >= this-date), not an automated gate -- no promotion-checker script exists yet, and realized_pnl's fill-price approximation isn't precise enough on its own to auto-decide real-money promotion.",
+      "_paper_mode_pointer": "The real paper/live switch stays config/global.json system.segments.options.paper_mode -- flip that to false when ready, same as every other options change. paper_trial_days_before_live above is a minimum HOLD before considering that, not a separate switch."
+    },
+    "direction_shadow": {
+      "_note": "Research only (2026-10-13). Logs an LLM BULL/BEAR/RANGE expiry forecast + market context to data/research/options_direction_shadow.jsonl for every opened bull_put/bear_call spread; it NEVER gates or delays a trade. Rule 'sell credit spreads WITH the trend' was back-tested and LOST (against-trend PF 1.4-3.5 vs with-trend 0.8-0.9), so direction is only promoted to a veto if these forecasts later beat that baseline when scored against the real expiry close. Rollback: set enabled false.",
+      "enabled": true
+    },
+    "pop_calibration": {
+      "_note": "Replaces the EV gate's crude pop=1-sum(|short_delta|) touch-probability proxy for bull_put_spread/bear_call_spread ONLY -- the two types scripts/backtest_options_seller_regime.py has actually backtested. Found live 2026-09-08: NIFTY generated 121 real candidates all day, 121/121 rejected reason=negative_ev. The proxy's implicit intercept (100% win rate at 0 delta) is provably wrong -- a no-lookahead walk-forward backtest (n=1300 single-sided credit-spread trials/underlying, 2020-2026) measured REAL win rates of 78.3% (BANKNIFTY) / 76.8% (NIFTY) at the default 0.25 delta (avg 77.5%, vs the proxy's 0.75) and 73.0% (BANKNIFTY) / 70.2% (NIFTY) at low_ivr_mode's 0.35 delta (avg 71.6%, vs the proxy's 0.65). This linearly interpolates/extrapolates between those two measured anchor points (src/options/strategy_selector.py calibrated_pop()) instead of assuming a slope of exactly 1.0. Every other strategy type (iron_condor, iron_butterfly, debit spreads, calendar/diagonal) is NOT covered by this backtest and keeps using the original crude proxy unchanged -- do not extend anchor values to untested types without new evidence.",
+      "enabled": true,
+      "_enabled_note": "Turned on 2026-09-08 at the operator's explicit, repeated request ('option trade to happen as per IV') after this was identified as the deepest root cause of zero trades all session -- candidacy/regime gates were already fixed, this EV-gate miscalibration was the last blocker. Paper mode only (config/global.json system.segments.options.paper_mode still true).",
+      "anchor_low_delta": 0.25,
+      "anchor_low_delta_pop": 0.775,
+      "anchor_high_delta": 0.35,
+      "anchor_high_delta_pop": 0.716
+    },
+    "ev_calibration": {
+      "_note": "Per-structure-type theoretical win_rate/avg_win/avg_loss, replacing seller_desk.py's/structure_selector.py's universal 0.5x/0.6x/1.5x heuristic EV multiplier where a populated entry exists for that structure_type -- gated by config/learning.json options_ev_calibration.mode (off/shadow/live), same three-state convention as the equity learning-engine work. Produced by scripts/backtest_options_seller_regime.py --all-structures --backfill --json-out <file> (a THEORETICAL Black-Scholes walk-forward reconstruction, same caveats as pop_calibration above -- this system has no real per-strike options chain history). NOT YET POPULATED: run that script against real NIFTY/BANKNIFTY/FINNIFTY history, review the output for sanity (n>=200/type/underlying, e.g. iron_condor's win rate should clearly beat long_straddle's), then hand-fill each structure_type block below from the reviewed numbers -- never auto-write this file from the script's own output. avg_win/avg_loss are stored as multiples of the structure's own premium/max_loss (not absolute rupees), matching the live formula's own 0.5x/1.5x shape, so one entry applies regardless of position size.",
+      "enabled": false,
+      "_enabled_note": "Off until populated with reviewed backtest numbers (see _note). This is a second, config-file-level kill switch alongside config/learning.json's options_ev_calibration.mode, mirroring pop_calibration's own 'enabled' field -- both must allow it before seller_desk.py/structure_selector.py substitute these numbers for the heuristic.",
+      "bull_put_spread": null,
+      "bear_call_spread": null,
+      "iron_condor": null,
+      "iron_butterfly": null,
+      "long_straddle": null,
+      "long_strangle": null,
+      "bull_call_spread": null,
+      "bear_put_spread": null,
+      "long_call": null,
+      "protective_put": null
+    },
+    "greeks_budget": {
+      "vega_pct_of_capital": 10,
+      "delta_pct_of_capital": 5,
+      "theta_pct_of_capital_per_day": 0.5,
+      "gamma_pct_of_capital": 30,
+      "_gamma_note": "Raised 8 -> 30 on 2026-10-06 at the operator's explicit request, so ONE lot of the weekly condor (hypothesis B, ~Rs 2-2.5L rupee-gamma = gamma x spot^2/100 at ~6 DTE) fits alongside the desk's 21-45 DTE spreads; two weekly lots still do not. Desk-wide: this also loosens the gamma check for every desk structure. Checked at ENTRY only (entry-time Greeks) -- gamma grows as expiry nears, and the expiry guardian's DTE<=3 exit is what caps that. Rollback: 8."
+    },
+    "_position_limits_removed_note": "2026-10-07 Phase 4: position_limits (max_open_strategies/max_strategies_per_index/max_same_direction_strategies/max_premium_at_risk/max_margin_for_selling/max_daily_loss_rupees) removed -- every one of those is now read from config/capital.json (src/risk/budget.py: options.max_open_strategies, .max_open_strategies_per_index, .max_open_same_direction_spreads, .max_structure_loss_per_strategy, .max_loss_per_day_per_strategy, .max_loss_per_day_all_strategies), confirmed zero remaining Python readers of this block before removal. Edit config/capital.json instead.",
+    "expiry_rules": {
+      "hard_exit_dte": 3,
+      "min_entry_dte": 4
+    },
+    "liquidity": {
+      "min_oi": 500,
+      "min_volume": 200,
+      "max_spread_pct": 5
+    },
+    "execution": {
+      "partial_fill_naked_exposure_max_seconds": 60,
+      "basket_fill_timeout_seconds": 30
+    },
+    "margin": {
+      "margin_cushion_minimum_pct": 20
+    },
+    "chain_fetch": {
+      "tier1_interval_seconds": 30,
+      "tier2_interval_seconds": 300,
+      "tier3_interval_seconds": 900
+    },
+    "iv_bootstrap": {
+      "phase1_days": 90,
+      "phase1_non_nifty_days": 120,
+      "phase2_days": 252,
+      "banknifty_vix_scaling": 1.25,
+      "finnifty_vix_scaling": 1.15
+    },
+    "_sizing_removed_note": "2026-10-07 Phase 4: sizing (risk_per_trade_pct/min_lots) removed -- the desk's per-trade budget is now derived at boot from config/capital.json options.max_structure_loss_per_strategy x live equity (src/orchestrator.py _seller_risk_per_trade_pct), so it auto-scales with capital instead of being a fixed % of the options_capital_rupees sleeve below. Confirmed zero remaining readers of this block before removal.",
+    "adjustments": {
+      "_note": "execute_rolls is the master switch for actually placing roll orders (close/open the untested income leg) when a delta breach fires. Enabled 2026-09-15 after 4 days of paper-mode delta-breach observation with no roll ever executed.",
+      "delta_breach_threshold": 0.35,
+      "single_sided_tested_delta": 0.35,
+      "delta_breach_blackout": 0.25,
+      "max_adjustments_per_position": 2,
+      "cost_benefit_max_pct": 30,
+      "adjustment_block_below_dte": 7,
+      "execute_rolls": true
+    },
+    "profit_and_stop": {
+      "_note": "2026-09-28: debit_stop_loss_pct was 100 = 'stop at TOTAL loss' = no stop; a NIFTY bull_call_spread bled to -55..-70% of its debit with no exit. 50 = cut a broken directional thesis at half the debit (max loss is already capped, so the goal is to keep half, not to widen). debit_breakeven_lock_arm_pct: once a debit spread has been up this % of the debit, exit if P&L returns to zero -- a winner must not become a loser.",
+      "credit_profit_target_pct": 50,
+      "credit_profit_target_blackout_pct": 35,
+      "credit_stop_loss_pct": 150,
+      "debit_profit_target_pct": 60,
+      "debit_stop_loss_pct": 50,
+      "debit_breakeven_lock_arm_pct": 35,
+      "iv_crush_early_exit_pct": 25
+    },
+    "options_expiry_day": {
+      "_note": "Hypothesis F2 (docs/hypotheses/F_nifty_expiry_day_condor.md), added 2026-10-06, PAPER ONLY. On each NIFTY expiry day: iron butterfly at the ATM strike (short ATM CE + PE, long wings +/- wing_points), entered inside entry_window, closed at profit_target_pct of the credit, at a loss of stop_loss_credit_multiple x credit, or at exit_by (15:00 since 2026-10-06 at operator request; model re-run: +30.0%/+40.1% vs +29.2%/+40.8% at 14:45; the guardian's stage-1 close is also 15:00; well before 15:30 settlement -- no STT-on-ITM risk). Model (2021-26): +30%/+42% of max loss per trade, positive every year; most sensitive structure to the IV assumption, so every entry logs REAL credit vs MODEL (India VIX) credit. Runs inside SellerDesk with all its controls EXCEPT two deliberate, strategy-only exceptions: (1) the expiry guardian lets it hold on expiry day until exit_by; (2) skip_greeks_budget: an ATM expiry-day option has ~Rs 1 crore rupee-gamma per lot, which no multi-day Greeks budget can hold, while this structure's risk is capped by its wings (max loss = wing - credit, ~Rs 3k/lot) and held under 5 hours -- sized by risk budget + margin instead. Counts as one of max_open_strategies. Switches: this enabled AND registry options_expiry_day enabled.",
+      "enabled": true,
+      "registry_name": "options_expiry_day",
+      "underlying": "NIFTY",
+      "structure": "strangle",
+      "_note_strangle": "2026-10-13: structure 'strangle' REPLACES the butterfly (set 'butterfly' to bring it back; its keys below are kept for that). NIFTY expiry-day short strangle, PAPER, run by src/options/short_premium.py (own 10s loop, per-leg stops): sell ATM+ce_offset CALL and ATM+pe_offset PUT at entry_time on today's expiry only, each leg stopped alone at premium x (1 + sl_pct/100), rest closed at exit_time. Frozen to the StockMock run 'Expiry Day Strategy_StockMock (4)' (NIFTY +/-100, 10:00 -> 15:10, put SL 50 / call SL 60, 1 lot; 197 expiries Jan-2023..Oct-2026: +Rs50.3k gross, +Rs29.6k after Kite charges, net MDD -Rs12.7k, 2024 negative, edge disappears at ~0.84 pt extra slippage per order). NAKED by operator decision (strangle_wing_points 0 + allow_naked). 1 lot fixed so paper measures what was backtested. Go-live bar: >= 15 paper expiries, real net slippage < ~0.3 pt/order, real P&L near the backtest. Keys: structure, entry_time, entry_grace_minutes, exit_time, ce_offset_points, pe_offset_points, sl_pct_ce, sl_pct_pe, target_pct (0 = off), lots, max_lots, strangle_wing_points, allow_naked. The butterfly keys (entry_window, wing_points, exit_by, profit_target_pct, stop_loss_credit_multiple, skip_greeks_budget) are ignored while structure is 'strangle'. Read at process start: edit + restart.",
+      "entry_time": "10:00",
+      "entry_grace_minutes": 20,
+      "exit_time": "15:10",
+      "ce_offset_points": 100,
+      "pe_offset_points": -100,
+      "sl_pct_ce": 60,
+      "sl_pct_pe": 50,
+      "target_pct": 0,
+      "lots": 1,
+      "strangle_wing_points": 0,
+      "allow_naked": true,
+      "entry_window": ["10:00", "10:20"],
+      "wing_points": 150,
+      "exit_by": "15:00",
+      "profit_target_pct": 50,
+      "stop_loss_credit_multiple": 2.0,
+      "max_lots": 1,
+      "skip_greeks_budget": true
+    },
+    "options_intraday_short_premium": {
+      "_note": "options_intraday_short_premium (docs/hypotheses/I_options_intraday_short_premium.md), added 2026-10-12, PAPER first. NAME IS DELIBERATELY GENERIC: the same code is a short STRADDLE (offsets 0/0), a short STRANGLE (default +150/-150) or an iron fly/condor (wing_points > 0). target_pct (0 = off, as tested): when TOTAL profit (open legs + legs already stopped) reaches target_pct % of the net credit, every remaining leg is closed. EVERYTHING HERE IS A PERCENTAGE, never a rupee amount. LOTS: lots 0 = AUTO-SIZED from the percentage budget -- the all-legs-stopped loss of N lots must fit risk_fraction_of_daily_cap (0.8) x capital.json options.max_loss_per_day_per_strategy (a % of live equity), so lots grow with equity automatically; lots > 0 forces a fixed count; max_lots is a sanity ceiling. Daily NIFTY weekly short strangle: SELL the ATM+ce_offset_points CALL and ATM+pe_offset_points PUT at entry_time (retried every poll for entry_grace_minutes, max 2 attempts), each leg stopped alone when its price reaches entry premium x (1 + sl_pct/100) (sl_pct_ce / sl_pct_pe override per side), whatever is left closed at exit_time. No rolls/adjustments. Defaults = the user's StockMock run: ce +150 / pe -150 (0/0 = straddle), 10:30 -> 15:01, 23%, Wednesday skipped. EVERY value is read fresh each tick (no restart). Runs inside SellerDesk but is exempt from open-position / trades-per-day / exposure / shared-risk caps; still obeys entry breakers (daily-loss, margin cushion), its own per-strategy daily-loss cap (capital.json), the CRM gates, and G9 when registry llm_gate_required is true. wing_points 0 = naked shorts, allowed ONLY with allow_naked true (operator decision 2026-10-12); wing_points > 0 buys protective wings that many points beyond each short. exit_time must be <= 15:10 (guardian backstop stage is 15:15). llm_shadow: when the LLM gate is off, still log a NON-blocking LLM verdict per trade so on/off can be compared. Switches: this 'enabled' AND registry options_intraday_short_premium 'enabled'; paper/live = registry execution_mode.",
+      "enabled": true,
+      "registry_name": "options_intraday_short_premium",
+      "underlying": "NIFTY",
+      "entry_time": "10:30",
+      "entry_grace_minutes": 60,
+      "exit_time": "15:01",
+      "skip_weekdays": ["Wed"],
+      "ce_offset_points": 150,
+      "pe_offset_points": -150,
+      "sl_pct": 23,
+      "target_pct": 50,
+      "lots": 0,
+      "max_lots": 5,
+      "risk_fraction_of_daily_cap": 0.8,
+      "wing_points": 0,
+      "allow_naked": true,
+      "min_leg_premium": 0,
+      "min_oi": 500,
+      "min_volume": 200,
+      "max_spread_pct": 15,
+      "max_spread_points": 0.3,
+      "poll_seconds": 10,
+      "respect_event_blackout": false,
+      "llm_shadow": true
+    },
+    "weekly_condor_simple": {
+      "_note": "Hypothesis B (docs/hypotheses/B_nifty_weekly_condor_simple.md), added 2026-10-05 as PAPER-ONLY forward data collection (user override of an IN-BETWEEN model verdict). Runs inside SellerDesk (run_weekly_condor_cycle) so it shares EVERY desk risk control: CRM G0-G10 + G9 LLM (registry name below, llm_gate_required), expiry guardian (forces exit at DTE<=3 -- so the tested 'hold to expiry-eve 15:00' becomes 'exit Monday open'), daily-loss halt, margin/greeks budget via size_position, event calendar (major-event blackout), protection-first executor. Own rules: one condor per weekly expiry, entered any day from the first trading day of the cycle through min_entry_dte (2026-10-07: widened from first-day-only so a missed day/restart/holiday doesn't lose the whole week) inside entry_window; shorts at ~short_delta, long wings wing_points beyond; TP at profit_target_pct of credit, SL when loss reaches stop_loss_credit_multiple x credit; NO rolls/adjustments. Not subject to the desk's IVR/DTE/EV selection gates (those choose the desk's own structures; B's edge was evaluated separately). Has its own one-per-underlying slot (does not block or get deleted by the desk's NIFTY position). Switches: this 'enabled' AND the registry entry 'enabled'.",
+      "enabled": true,
+      "registry_name": "nifty_weekly_condor_simple",
+      "underlying": "NIFTY",
+      "short_delta": 0.15,
+      "wing_points": 200,
+      "_entry_window_note": "2026-10-07: widened from a 30min morning-only slot to the full session (minus the first 5min open volatility and last 30min illiquidity, same convention as strategies/builtin/*.json's own 0920-1500). Operator correction: this is a weekly/monthly structure, not an intraday one -- there was never a real reason to gate it to one narrow window; the desk's own regular spreads already evaluate all day with no such restriction.",
+      "entry_window": ["09:20", "15:00"],
+      "max_lots": 1,
+      "profit_target_pct": 50,
+      "stop_loss_credit_multiple": 2.0
+    },
+    "portfolio_risk": {
+      "_note": "daily_loss_halt_pct REMOVED 2026-10-07 (Phase 4) -- superseded by config/capital.json options.max_loss_per_day_all_strategies x live equity (src/options/seller_settings.max_options_daily_loss_all_strategies_rupees()), confirmed zero remaining readers of the old key. Edit config/capital.json instead. gap_risk_enforce (the only key still read here): run the 5-scenario gap stress test every sweep and always LOG the worst 5%/10% loss; only when true does a breach also block new entries. Left false until the stress-test units (entry-time Greeks, vega scaling) are validated against live paper positions.",
+      "gap_risk_enforce": false
+    },
+    "rom": {
+      "min_annualized_pct": 24
+    },
+    "crm_adapter": {
+      "_note": "Used by src/options/seller_crm_adapter.py to build the CRMSignal the seller desk now sends through src/risk/crm.py's G0-G10 pipeline before every entry. synthetic_stop_loss_pct/synthetic_target_pct carry NO real economic meaning for a credit spread -- they exist only to clear G1's R:R-ratio floor and G8's stop_loss_pct>0 guard. Real risk sizing flows through risk_rupees (the structure's actual max_loss) via G8's risk_rupees/qty branch. default_strategy_health is a placeholder until per-structure-type win-rate tracking exists for this desk (see project memory).",
+      "synthetic_stop_loss_pct": 0.01,
+      "synthetic_target_pct": 0.02,
+      "default_strategy_health": "HEALTHY"
+    },
+    "events": {
+      "selling_blackout_days_major": 7,
+      "selling_blackout_days_ic": 21,
+      "earnings_blackout_days": 5,
+      "dynamic_blackout_hours": 72,
+      "straddle_min_event_occurrences": 6
+    },
+    "nse_position_limit_block_at_pct": 80,
+    "_nse_limit_note": "NSE enforces client-level OI limits. A 4-leg Iron Condor counts as 4x notional. Breach = ENTIRE F&O account frozen. total_oi = sum(lots x lot_size x futures_price) across ALL legs ALL positions. Check runs atomically with margin + Greeks budget as 3-way gate.",
+    "stock_options_enabled": false
+  }
+}

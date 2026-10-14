@@ -1,0 +1,53 @@
+{
+  "_what_this_means": "The ONLY place money limits live. ONE shared pool: every % is of TOTAL account equity (live from the broker). Nothing is reserved per segment; segments share one risk budget, each with a maximum share. Raise equity and every rupee limit and every lot/qty size grows with it. Non-money settings (stop-loss %, R:R, Greeks budget, liquidity, time windows, strategy rules) stay in their existing config files -- this file is rupees and counts only.",
+  "account": {
+    "equity_comes_from": "broker_equity",
+    "fallback_equity_if_broker_unavailable": "₹20,00,000",
+    "max_loss_if_everything_open_hits_stop": "3%",
+    "_shared_risk_rule": "Sum of every open position's stop loss (equity) or defined max loss (options), across ALL segments. Any segment may use it, first come first served, up to its own max_share_of_shared_risk. Segment ceilings below sum to more than this on purpose, so segments compete for the shared room instead of each getting a locked-away slice.",
+    "stop_all_trading_if_equity_falls_below": "25%",
+    "drawdown_steps": [
+      { "drawdown_from_start": "3%", "position_size_becomes": "75%" },
+      { "drawdown_from_start": "5%", "position_size_becomes": "50%" },
+      { "drawdown_from_start": "8%", "position_size_becomes": "25%" },
+      { "drawdown_from_start": "10%", "position_size_becomes": "0%" }
+    ]
+  },
+  "options": {
+    "_what_this_means": "Index options strategies (spreads, condors, butterflies) run inside the seller desk. One STRATEGY = one registry entry (options_seller_desk_v3, nifty_weekly_condor_simple, options_expiry_day) = one structure, all legs and all lots -- never counted by legs.",
+    "max_structure_loss_per_strategy": "0.75%",
+    "_max_structure_loss_per_strategy_rule": "The structure's defined max loss (wing minus credit) x lots must fit under this. Lots = floor(this rupee amount / max-loss-per-lot), so lot count grows automatically with equity. If 0 lots fit, the trade is refused with 'capital too small for this structure' -- never silently resized.",
+    "max_loss_per_day_per_strategy": "0.25%",
+    "_max_loss_per_day_per_strategy_rule": "When ONE strategy's realized + open loss TODAY reaches this, close THAT strategy's open position(s) only, latch it off until the next trading day (survives a restart), and alert. Other strategies are untouched.",
+    "max_loss_per_day_all_options_strategies": "0.5%",
+    "_max_loss_per_day_all_options_strategies_rule": "Backstop across every options strategy combined. When reached: no NEW options entries today. Nothing is force-closed; each open position still keeps its own stop.",
+    "max_share_of_shared_risk": "3%",
+    "_max_share_of_shared_risk_rule": "Sum of the defined max loss of every open options structure, plus the candidate trade, must fit under this AND under account.max_loss_if_everything_open_hits_stop. Raised 1.5% -> 3% 2026-10-07: 3 desk structures (<=0.75% each = 2.25%) + the weekly condor + the expiry-day butterfly realistically need up to ~3% together -- the old 1.5% ceiling was tighter than just the desk's own max_open_strategies capacity, so new entries (the condor) were starved by the desk's own existing positions before this.",
+    "max_open_strategies": 3,
+    "max_open_strategies_per_index": 3,
+    "max_open_same_direction_spreads": 2
+  },
+  "swing": {
+    "_what_this_means": "Delivery (CNC) equity held overnight. Each trade lives by its own stop-loss and target -- no daily loss limit, by explicit decision.",
+    "max_loss_per_trade": "0.2%",
+    "_max_loss_per_trade_rule": "Quantity = floor(this rupee amount / (entry price minus stop price)). The stop distance IS the risk.",
+    "max_share_of_shared_risk": "1%",
+    "_max_share_of_shared_risk_rule": "Sum of (entry minus stop) x qty across every open swing trade, plus the candidate, must fit under this AND under account.max_loss_if_everything_open_hits_stop.",
+    "max_open_trades": 12,
+    "max_new_trades_per_day": 2,
+    "max_new_trades_per_day_per_strategy": 2,
+    "keep_unused_cash_buffer": "10%"
+  },
+  "intraday": {
+    "_what_this_means": "MIS equity, closed the same trading day.",
+    "max_loss_per_trade": "0.05%",
+    "_max_loss_per_trade_rule": "Quantity = floor(this rupee amount / (entry price minus stop price)).",
+    "max_share_of_shared_risk": "0.1%",
+    "max_loss_per_day": "0.15%",
+    "_max_loss_per_day_rule": "Realized + open MTM loss today, checked per mode (paper and live separately). When reached: close every open intraday position and stop new intraday entries until the next trading day.",
+    "close_all_positions_when_daily_loss_hit": true,
+    "max_open_trades": 6,
+    "max_new_trades_per_day": 6,
+    "max_new_trades_per_day_per_strategy": 3
+  }
+}

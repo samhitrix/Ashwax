@@ -1,0 +1,51 @@
+{
+  "kite": {
+    "gtt_native": true,
+    "bracket_order": true,
+    "cover_order": true,
+    "websocket_ticks": true,
+    "historical_api": true,
+    "margin_api": true,
+    "product_codes": { "INTRADAY": "MIS", "DELIVERY": "CNC", "MARGIN": "NRML" },
+    "exchanges": ["NSE", "BSE", "NFO", "MCX"],
+    "max_websocket_tokens": 3000,
+    "order_tag_support": true,
+    "totp_required": true,
+    "gtt_fallback": null
+  },
+  "angel_one": {
+    "gtt_native": false,
+    "bracket_order": false,
+    "cover_order": false,
+    "websocket_ticks": true,
+    "historical_api": true,
+    "margin_api": true,
+    "product_codes": { "INTRADAY": "INTRADAY", "DELIVERY": "DELIVERY", "MARGIN": "MARGIN" },
+    "exchanges": ["NSE", "BSE", "NFO", "MCX", "CDS"],
+    "order_tag_support": true,
+    "totp_required": true,
+    "gtt_fallback": "manual_sl_target_orders"
+  },
+  "upstox": {
+    "gtt_native": false,
+    "bracket_order": false,
+    "cover_order": false,
+    "websocket_ticks": true,
+    "historical_api": true,
+    "margin_api": true,
+    "product_codes": { "INTRADAY": "I", "DELIVERY": "D", "MARGIN": "M" },
+    "exchanges": ["NSE", "BSE", "NFO"],
+    "gtt_fallback": "manual_sl_target_orders"
+  },
+  "paper": {
+    "gtt_native": true,
+    "bracket_order": true,
+    "cover_order": true,
+    "websocket_ticks": false,
+    "historical_api": false,
+    "simulated": true,
+    "product_codes": { "INTRADAY": "INTRADAY", "DELIVERY": "DELIVERY", "MARGIN": "MARGIN" },
+    "exchanges": ["NSE", "BSE", "NFO"],
+    "gtt_fallback": null
+  }
+}
