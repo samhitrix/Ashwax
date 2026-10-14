@@ -122,7 +122,7 @@ to keep losses small, known in advance and survivable.
 |---|---|---|
 | **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs, so no order ever reaches a broker. Live **market data still comes from a Kite Connect API key** (see below). |
 | **Zerodha Kite Connect** | ✅ Primary broker — required, even for paper (paid data plan; static IP for live orders) | Supplies market data in paper mode and orders in live mode. Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
-| **Angel One, Upstox** | 🔲 Planned | Not supported yet. See the [roadmap](#roadmap). |
+| **Flattrade, Angel One, Upstox** | 🔲 Planned | Not supported yet. Flattrade and Angel One are next (Phase 2), Upstox after that. See the [roadmap](#roadmap). |
 
 Select the broker with `BROKER=paper | kite` in `.env` (unset = paper). Order execution goes
 through one `BrokerInterface` (`src/brokers/base.py`); some market-data and dashboard code still
@@ -201,6 +201,9 @@ LLM review, learning engine, 17-tab dashboard, Docker one-command setup.
 - **Make the app broker-independent.** Route the dashboard API, the data downloader, login and
   paper-mode prices through the broker interface instead of calling Kite directly. This is the
   prerequisite for supporting any other broker.
+- **More brokers: Flattrade and Angel One.** The next brokers to add after Zerodha, each validated
+  in paper-versus-broker runs, including how its stops and orders behave, before it is listed as
+  supported.
 - **Production-grade containers.** Separate API, orchestrator and dashboard containers, a built
   (not dev-server) dashboard, and a tested live-broker login path.
 - **Automatic Kite session refresh in Docker** without pasting a daily token.
@@ -221,8 +224,7 @@ fail are recorded and dropped, not tuned until they pass. Candidates under resea
 **Usability and reach.**
 - Guided setup in the dashboard (broker login, API keys, Telegram) instead of editing `.env`.
 - A strategy builder UI on top of the USS JSON spec.
-- **More brokers:** Angel One first, then Upstox, each validated in paper-versus-broker runs
-  before it is listed as supported.
+- **More brokers:** Upstox, validated the same way before it is listed as supported.
 - Hosted / multi-account mode with per-account risk limits.
 
 ### Phase 4 — better research and execution
