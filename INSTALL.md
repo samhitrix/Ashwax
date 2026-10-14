@@ -43,7 +43,7 @@ trading; the Windows-service step in §11 is Windows-only.
 ## 2. Get the code
 
 ```bash
-git clone <your-fork-url> AshwaX
+git clone https://github.com/samhitrix/Ashwax.git AshwaX
 cd AshwaX
 ```
 

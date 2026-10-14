@@ -283,7 +283,7 @@ Windows 11 is the tested platform. Full details are in [INSTALL.md](INSTALL.md).
 ## Quick start
 
 ```bash
-git clone <your-fork-url> AshwaX && cd AshwaX
+git clone https://github.com/samhitrix/Ashwax.git AshwaX && cd AshwaX
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 cp .env.example .env                                  # set DB_URL at minimum
