@@ -15,7 +15,7 @@ Risk Manager and an independent LLM second opinion before it reaches a broker.
 **Contents:** [How it works](#how-it-works) · [Supported brokers](#supported-brokers) ·
 [Phase 1](#phase-1--what-is-in-this-release) · [Roadmap](#roadmap) ·
 [Dashboard tour](#dashboard-tour) · [Quick start](#quick-start) ·
-[Configuration](#configuration-at-a-glance) · [Safety design](#safety-design) ·
+[Controlling the system](#controlling-the-system) · [Configuration](#configuration-at-a-glance) · [Safety design](#safety-design) ·
 [Project layout](#whats-inside)
 
 ---
@@ -132,6 +132,8 @@ LLM review, learning engine, 17-tab dashboard, Docker one-command setup.
 ### Phase 2 — safe to run live
 - **Broker-side protection for options.** Resting stop orders for option legs so a stop survives
   a crash or restart of this process.
+- **Real assisted mode.** An approve-each-trade queue in the dashboard (accept, reject or let it
+  time out) so `assisted` actually waits for you, replacing today's unused `ask_mode` settings.
 - **Promotion tooling.** One report per strategy that checks the written bar (trade count,
   profit factor, expectancy, slippage versus model) and refuses a switch to live until it is met.
 - **Validate Angel One** end to end: paper-versus-broker comparison runs, GTT fallback checks.
@@ -139,8 +141,8 @@ LLM review, learning engine, 17-tab dashboard, Docker one-command setup.
   (not dev-server) dashboard, and a tested live-broker login path.
 - **Automatic Kite session refresh in Docker** without pasting a daily token.
 
-### Phase 3 — more strategies, each one tested first
-New strategies are added only after they pass an out-of-sample test **after costs**; ideas that
+### Phase 3 — more strategies and wider reach
+**New strategies.** Added only after they pass an out-of-sample test **after costs**; ideas that
 fail are recorded and dropped, not tuned until they pass. Candidates under research in
 `scripts/research/`:
 - Pullback-in-trend and breakout variants for swing, with breadth and sector filters.
@@ -152,6 +154,12 @@ fail are recorded and dropped, not tuned until they pass. Candidates under resea
 - A strategy-selection layer that sizes each strategy by its recent health instead of
   switching strategies on and off by hand.
 
+**Usability and reach.**
+- Guided setup in the dashboard (broker login, API keys, Telegram) instead of editing `.env`.
+- A strategy builder UI on top of the USS JSON spec.
+- An Upstox adapter, using the capability profile already declared.
+- Hosted / multi-account mode with per-account risk limits.
+
 ### Phase 4 — better research and execution
 - Walk-forward and Monte-Carlo validation built into the backtester, with an out-of-sample
   report saved next to every strategy.
@@ -159,13 +167,6 @@ fail are recorded and dropped, not tuned until they pass. Candidates under resea
 - Portfolio-level risk: correlation and sector exposure limits across strategies.
 - Event-aware trading: earnings, RBI and index-rebalance calendars wired into entries and exits.
 - Replay mode: re-run any past day through the full pipeline to reproduce a decision.
-
-### Phase 5 — usability and reach
-- Guided setup in the dashboard (broker login, API keys, Telegram) instead of editing `.env`.
-- Strategy builder UI on top of the USS JSON spec.
-- Upstox adapter, using the capability profile already declared.
-- Mobile-friendly dashboard and push alerts for key events.
-- Hosted / multi-account mode with per-account risk limits.
 
 Have an idea? Open an issue — and see [CONTRIBUTING.md](CONTRIBUTING.md) for what a strategy
 proposal needs.
@@ -212,6 +213,75 @@ python launcher.py                                    # then open http://localho
 
 The full step-by-step guide, including broker login, LLM keys, Telegram, running as a Windows
 service and troubleshooting, is in **[INSTALL.md](INSTALL.md)**.
+
+---
+
+## Controlling the system
+
+Every control below is a plain setting in `config/*.json`. Change it in the dashboard
+(**Configuration** tab) or edit the file, then restart (`docker compose restart app`, or restart
+the launcher). The three safety switches act at different levels and **the strictest one wins**:
+
+| Level | Setting | If it says "stop" |
+|---|---|---|
+| Whole account | `operator.json` → `account.paper_mode_locked` | Everything is forced to paper, whatever the other files say |
+| Whole system / one segment | `global.json` → `system.master_switch` and `system.segments.<segment>.master_switch` | Gate G0 blocks every new trade (kill switch). The system-wide switch overrides a segment's |
+| One strategy | `strategies_registry.json` → `enabled`, `execution_mode` | That strategy produces nothing, or runs on paper only |
+
+`<segment>` is `intraday` (MIS), `swing` (CNC) or `options`.
+
+### Autonomy mode: manual, assisted, autonomous
+
+Set per segment in `global.json` → `system.segments.<segment>.autonomy_mode` (the system-wide
+`system.autonomy_mode` is the fallback). Gate G10 enforces it on every order.
+
+| Mode | What happens to a trade that passes all risk gates |
+|---|---|
+| `manual` | **Blocked.** Nothing is entered automatically. Use it to freeze new entries while open positions keep their stops and exits |
+| `assisted` | Currently behaves like `autonomous` (see the note below) |
+| `autonomous` | Entered automatically with no human in the loop |
+
+> **Honest note on `assisted`.** The mode and its `ask_mode` settings exist in the config, but
+> this release has **no approve-each-trade queue yet**: G10 lets an `assisted` trade through, and
+> the `ask_mode` block in `global.json` is not read by any code. The only "ask" behaviour today
+> is automatic: when a strategy's health turns *stressed*, new entries are skipped until it
+> recovers. If you want a human to approve every trade, use `manual` and place the trades
+> yourself. A real approval flow is on the [roadmap](#roadmap).
+
+### Paper, live and observe-only
+
+| Setting | Values | Effect |
+|---|---|---|
+| `segments.<segment>.paper_mode` | `true` / `false` | `true`: orders are simulated, nothing reaches the broker. `false`: real orders, real money. Segments can differ and run side by side |
+| `segments.<segment>.shadow_mode` | `true` / `false` | `true`: signals are evaluated and logged but **no order is placed**, not even a paper one. Good for watching a strategy without trading it |
+| `strategies_registry.json` → `execution_mode` | `paper` / `live` | Per-strategy lock. A strategy set to `paper` stays on paper even if its segment is live |
+| `strategies_registry.json` → `llm_gate_required` | `true` / `false` | `true`: the trade needs an LLM second-opinion verdict, and no verdict means no trade |
+| `strategies_registry.json` → `enabled` | `true` / `false` | Turns a strategy on or off |
+
+Going live needs all three layers to allow it: the account unlocked, the segment's
+`paper_mode` set to `false`, and the strategy's `execution_mode` set to `live`.
+
+### The main risk limits
+
+All in `config/capital.json`, as a **percentage of live account equity**, so every limit and every
+position size scales with your account. The values below are the shipped defaults.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `account.max_loss_if_everything_open_hits_stop` | 3% | Shared risk pool: the combined stop-loss distance of all open positions across all segments can't exceed this |
+| `account.stop_all_trading_if_equity_falls_below` | 25% | Absolute floor: below this the system stops trading |
+| `account.drawdown_steps` | 3% → 75%, 5% → 50%, 8% → 25%, 10% → 0% | As the account falls from its start, position size shrinks to the stated share, down to zero |
+| `swing.max_loss_per_trade` | 0.2% | Swing position size = this amount ÷ distance to the stop |
+| `swing.max_open_trades` / `max_new_trades_per_day` | 12 / 2 | Caps on open swing positions and new entries per day |
+| `swing.keep_unused_cash_buffer` | 10% | Cash a swing entry may never use |
+| `intraday.max_loss_per_trade` | 0.05% | Same sizing rule for intraday |
+| `intraday.max_loss_per_day` | 0.15% | When reached, every open intraday position is closed and no new entries are taken until tomorrow (`close_all_positions_when_daily_loss_hit`) |
+| `options.max_structure_loss_per_strategy` | 0.75% | Worst-case loss of one options structure; the number of lots is chosen to fit |
+| `options.max_loss_per_day_per_strategy` / `..._all_options_strategies` | 0.25% / 0.5% | Daily loss limits for one options strategy and for all of them together |
+| `options.max_open_strategies` | 3 | Maximum simultaneous options structures |
+
+Every key has a `_note` or `_rule` next to it in the file explaining it in detail, and the
+Configuration tab shows them as you edit.
 
 ---
 
