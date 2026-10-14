@@ -31,7 +31,11 @@ after that.
 | Node.js | 20.19+ or 22+ | dashboard only (Vite) |
 | Git | any | cloning |
 | Redis | 5+ | *optional* — news dedup and chain cache fall back to in-memory |
-| Zerodha Kite Connect app | — | *optional in paper mode* — live prices, option chains, live orders |
+| Zerodha account + **Kite Connect app (paid market-data plan)** | — | **required, even for paper trading** — live prices, option chains, history. See [section 6](#6-broker-connection-kite-connect--needed-even-for-paper-trading) |
+| **Registered static public IP address** | IPv4 | **required for LIVE trading only** — Zerodha rejects API orders from any other address. Not needed for paper trading |
+| At least one LLM API key | — | required for the AI second opinion and news tagging; free tiers work (Gemini, Groq, Cloudflare) |
+| Telegram bot | — | *optional* — mobile alerts |
+| Docker with Compose v2 | — | *optional* — replaces the Python, PostgreSQL, Redis and Node installs |
 
 AshwaX is developed and run on **Windows 11** (PowerShell). Linux and macOS work for paper
 trading; the Windows-service step in §11 is Windows-only.

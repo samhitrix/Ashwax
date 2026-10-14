@@ -9,13 +9,13 @@ Risk Manager and an independent LLM second opinion before it can reach a broker.
 > **Paper trading is the default and this repository ships paper-locked.** Nothing here is
 > financial advice. If you switch anything to live, you alone are responsible for the orders
 > it places. **Live orders also require a registered static IP address** (see
-> [Quick start](#quick-start)).
+> [Prerequisites](#prerequisites)).
 
 ![Dashboard overview (sample data)](assets/screenshots/overview.png)
 
 <sub>All screenshots in this README use made-up sample data, not a real account.</sub>
 
-**Contents:** [What "fully automatic" means](#what-fully-automatic-means-here) · [What makes it different](#what-makes-it-different) · [How it works](#how-it-works) · [Supported brokers](#supported-brokers) ·
+**Contents:** [Prerequisites](#prerequisites) · [What "fully automatic" means](#what-fully-automatic-means-here) · [What makes it different](#what-makes-it-different) · [How it works](#how-it-works) · [Supported brokers](#supported-brokers) ·
 [Phase 1](#phase-1--what-is-in-this-release) · [Roadmap](#roadmap) ·
 [Dashboard tour](#dashboard-tour) · [Quick start](#quick-start) ·
 [Controlling the system](#controlling-the-system) · [Configuration](#configuration-at-a-glance) · [Safety design](#safety-design) ·
@@ -267,18 +267,20 @@ Sample data throughout. Open `http://localhost:5173` after starting the system.
 
 ---
 
-## Quick start
+## Prerequisites
 
-> **Before you start you need a Zerodha Kite Connect developer app with the paid market-data
-> plan** — even paper trading takes live prices from Kite.
->
-> **LIVE TRADING WILL NOT WORK WITHOUT A REGISTERED STATIC IP ADDRESS.** Zerodha rejects every API
-> order that does not come from a static public IP registered in your Kite developer console, so
-> without one the system cannot place a single real order. Paper trading is not affected, because
-> it sends no orders to the broker.
->
-> Step-by-step setup, plans and the static-IP rules are in
-> [INSTALL.md section 6](INSTALL.md#6-broker-connection-kite-connect--needed-even-for-paper-trading).
+| You need | For | Notes |
+|---|---|---|
+| **Zerodha account + Kite Connect developer app with the paid market-data plan** | Everything, **including paper trading** | Paper mode simulates orders but takes live prices, option chains and history from Kite. Setup and plans: [INSTALL.md section 6](INSTALL.md#6-broker-connection-kite-connect--needed-even-for-paper-trading) |
+| **A registered static public IP address** | **Live trading only** | **LIVE TRADING WILL NOT WORK WITHOUT IT.** Zerodha rejects every API order that does not come from a static public IP registered in your Kite developer console. Paper trading is not affected, because it sends no orders to the broker |
+| Python 3.13+, PostgreSQL 14+, Node 20.19+ / 22+ | Running natively | Or use Docker instead (next row) |
+| Docker with Compose v2 | Running with one command | Replaces the Python, PostgreSQL, Redis and Node installs |
+| At least one LLM API key | AI second opinion, news tagging | Free tiers work (Gemini, Groq, Cloudflare) |
+| Telegram bot | Mobile alerts (optional) | |
+
+Windows 11 is the tested platform. Full details are in [INSTALL.md](INSTALL.md).
+
+## Quick start
 
 ```bash
 git clone <your-fork-url> AshwaX && cd AshwaX
