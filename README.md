@@ -121,7 +121,7 @@ to keep losses small, known in advance and survivable.
 | Broker | Status | Notes |
 |---|---|---|
 | **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs, so no order ever reaches a broker. Live **market data still comes from a Kite Connect API key** (see below). |
-| **Zerodha Kite Connect** | ✅ Primary broker — required, even for paper | Supplies market data in paper mode and orders in live mode. Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
+| **Zerodha Kite Connect** | ✅ Primary broker — required, even for paper (paid data plan; static IP for live orders) | Supplies market data in paper mode and orders in live mode. Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
 | **Angel One SmartAPI** | 🟡 Adapter implemented, not yet validated live | Quotes, history, option quotes, order placement / status. It has no native GTT, so stops use the manual SL / target-order fallback. Treat as experimental. |
 | **Upstox** | 🔲 Planned | Capability profile exists in `src/brokers/capability_matrix.json`; no adapter yet. |
 
@@ -262,6 +262,12 @@ Sample data throughout. Open `http://localhost:5173` after starting the system.
 ---
 
 ## Quick start
+
+> **Before you start you need a Zerodha Kite Connect developer app with the paid market-data
+> plan** — even paper trading takes live prices from Kite. **Live trading additionally needs a
+> registered static IP address**, because Zerodha rejects API orders from any other address.
+> Step-by-step setup, plans and the static-IP rules are in
+> [INSTALL.md section 6](INSTALL.md#6-broker-connection-kite-connect--needed-even-for-paper-trading).
 
 ```bash
 git clone <your-fork-url> AshwaX && cd AshwaX

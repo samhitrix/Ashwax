@@ -9,7 +9,7 @@ after that.
 - [3. Python environment](#3-python-environment)
 - [4. PostgreSQL](#4-postgresql)
 - [5. Environment file (.env)](#5-environment-file-env)
-- [6. Broker connection](#6-broker-connection-kite-connect--needed-even-for-paper-trading)
+- [6. Broker connection (Kite Connect, static IP)](#6-broker-connection-kite-connect--needed-even-for-paper-trading)
 - [7. LLM providers](#7-llm-providers)
 - [8. Telegram alerts (optional)](#8-telegram-alerts-optional)
 - [9. Dashboard](#9-dashboard)
@@ -97,27 +97,85 @@ Every other key in `.env.example` is optional and documented inline. `.env` is g
 
 ## 6. Broker connection (Kite Connect — needed even for paper trading)
 
-Paper mode simulates every order locally, so no order ever reaches a broker, but it takes live
-prices, option chains and history from **Zerodha Kite Connect**. Without `KITE_API_KEY` the
-orchestrator stops at startup. You need a Kite Connect developer app with the market-data (historical and live quotes)
-API enabled; check Zerodha's current plans and pricing. Connect it like this:
+AshwaX uses **Zerodha Kite Connect**. Paper mode simulates every order locally, so no order
+ever reaches a broker, but it still takes live prices, option chains and history from Kite.
+Without `KITE_API_KEY` the orchestrator stops at startup.
 
-1. Create an app at <https://developers.kite.trade> and note its API key and secret.
-2. On Windows, install the credential-store dependency used by the login helper:
-   `pip install pywin32` (not needed for paper mode).
-3. Put the API key, secret and user ID in `.env`:
+### 6.1 What you need from Zerodha
+
+| Goal | Plan you need | Static IP |
+|---|---|---|
+| **Paper trading** (market data only, no orders sent) | **Kite Connect paid plan** — the free Personal plan has no live or historical market data | Not needed |
+| **Live trading** (real orders) | Paid plan, plus a Zerodha account with API access | **Required** — see 6.3 |
+
+At the time of writing Zerodha lists the Personal plan as free (orders, GTT, portfolio, no market
+data) and the Connect plan as ₹500 per month per API key (adds live and historical data).
+Prices and terms change; confirm on Zerodha's
+[Kite Connect page](https://support.zerodha.com/category/trading-and-markets/general-kite/kite-api/articles/how-do-i-sign-up-for-kite-connect).
+
+### 6.2 Create the Kite Connect account and app
+
+1. You need a **Zerodha trading account** (client ID). The app form asks for it.
+2. Go to <https://developers.kite.trade/signup> and register with the email linked to your
+   Zerodha account (name, password, mobile number, state).
+3. Choose and pay for a plan (see 6.1). For AshwaX's market data you need the paid one.
+4. Open **My Apps → Create New App** and fill in:
+   - **App name:** anything, for example `AshwaX`
+   - **Zerodha client ID:** your own ID — a wrong one gives "User not enabled for the app"
+   - **Redirect URL:** `http://127.0.0.1:8000` works (Zerodha's own localhost example). The URL
+     is only used to receive the one-time login token.
+   - **Postback URL:** leave empty.
+5. After creating it you get an **API key** and an **API secret**. Keep the secret private.
+6. Turn on TOTP two-factor login for your Zerodha account if you want automated daily login (see
+   Zerodha's support pages), and keep the secret key shown when you set it up.
+
+### 6.3 Static IP (needed to place real orders)
+
+Under the retail algo-trading rules that apply to API trading in India, Zerodha only accepts API
+**order** requests from an **IP address you have registered**, and that address must be
+**static** — a fixed public IPv4 address that does not change. Facts from Zerodha's own
+documentation and staff forum replies:
+
+- It applies to **placing orders** only. Market data, positions and the order book work from any
+  IP. That is why **paper trading needs no static IP**.
+- Register it in the Developer Console at <https://developers.kite.trade> → your profile →
+  **IP Whitelist**. Zerodha allows one primary and one optional secondary IP, and the IP can be
+  changed about once a week.
+- Zerodha checks the IP the request **actually leaves from**. A home connection with a changing
+  IP, a mobile hotspot or a VPN that changes address will have orders **rejected**.
+- Order requests from an unregistered IP are rejected, so test with a small AMO order first.
+- One IP may be shared only within immediate family (spouse, dependent children, dependent
+  parents). Sharing beyond that can get the API keys suspended.
+- Other rules apply at the same time: at most **10 orders per second** per client account (above
+  that the strategy must be registered with the exchange), and market / SL-M orders need a
+  non-zero **market protection** value.
+
+How to get a static IP: ask your internet provider for one, or run AshwaX on a cloud server
+(VPS) that has a fixed public address and register that. Which of these is acceptable to the
+exchange for your situation is for you to confirm with Zerodha. Zerodha's pages do not name the
+exact SEBI circular, so check the current rules with your broker before trading live.
+
+### 6.4 Connect AshwaX to Kite
+
+1. On Windows, install the credential-store dependency used by the login helper:
+   `pip install pywin32` (not needed for paper mode or Docker).
+2. Put the API key, secret and user ID in `.env`:
    ```ini
    KITE_API_KEY=...
    KITE_SECRET=...
    KITE_USER_ID=...
    # KITE_ACCESS_TOKEN is written automatically each day; leave it blank
    ```
-4. For automated daily login (needs the `[autologin]` extra), store your password and TOTP
+3. For automated daily login (needs the `[autologin]` extra), store your password and TOTP
    secret once in the OS-protected machine store. They are never written to a file:
    ```bash
    python -m src.brokers.kite_auth --setup
    ```
    After that, `launcher.py` refreshes the session token on every start.
+
+Kite access tokens are valid for one trading day and expire the next morning before market open,
+and creating a new session invalidates the older token. This is why the system logs in again at
+each start.
 
 **Angel One SmartAPI** is a second, optional broker adapter. See the commented `ANGEL_ONE_*` and
 `BROKER=` lines in `.env.example`.
@@ -251,8 +309,8 @@ config.
 ### What you need
 
 - Docker with Compose v2 (Docker Desktop on Windows / macOS, or Docker Engine on Linux).
-- Kite Connect keys: the app cannot start without `KITE_API_KEY`, because paper trading takes
-  its market data from Kite (see [section 6](#6-broker-connection-kite-connect--needed-even-for-paper-trading)).
+- Kite Connect keys and the paid market-data plan: the app cannot start without `KITE_API_KEY`,
+  because paper trading takes its market data from Kite (see [section 6](#6-broker-connection-kite-connect--needed-even-for-paper-trading)).
 
 ### Start
 
