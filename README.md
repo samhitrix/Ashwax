@@ -121,18 +121,34 @@ to keep losses small, known in advance and survivable.
 
 | Broker | Status | Notes |
 |---|---|---|
-| **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs, so no order ever reaches a broker. Live **market data still comes from a Kite Connect API key** (see below). |
-| **Zerodha Kite Connect** | ✅ Primary broker — required, even for paper (paid data plan; static IP for live orders) | Supplies market data in paper mode and orders in live mode. Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. |
-| **Flattrade, Angel One, Upstox** | 🔲 Planned | Not supported yet. Flattrade and Angel One are next (Phase 2), Upstox after that. See the [roadmap](#roadmap). |
+| **Paper (built-in)** | ✅ Default, fully supported | Simulated fills, stops, GTT-style OCO and costs, so no order ever reaches a broker. Live **market data comes from any one configured broker** (Kite, Angel One or Flattrade), see below. |
+| **Zerodha Kite Connect** | ✅ The reference broker and the only one run end to end (paid data plan; static IP for live orders) | Quotes, option chains, historical data, margins, orders, native GTT for swing stops, automated daily TOTP login. **Optional**: the system starts and runs paper trading without it, but options paper trading still needs Kite's option chain. |
+| **Flattrade** | 🟡 Built, partly verified | Login, account funds, instruments, quotes and candles were checked against the live API **read-only** and match Kite. **Order placement is switched off** (`live_orders_verified: false`) until a 1-lot live test and Flattrade's approval for automated trading. Data is REST-only (200 calls/min, no tick feed), so it sits last in the data-provider order. Login is a manual daily browser step. |
+| **Angel One (SmartAPI)** | 🟡 Built, **not tested live** | Adapter, token refresh and equity market data are covered by unit tests only; no live call or order has been made through it. Index and options data and pre-trade margin are not supported yet. |
+| **Upstox** | 🔲 Planned | Not supported yet. See the [roadmap](#roadmap). |
 
-Select the broker with `BROKER=paper | kite` in `.env` (unset = paper). Order execution goes
-through one `BrokerInterface` (`src/brokers/base.py`); some market-data and dashboard code still
-calls Kite directly today, which is what stops other brokers from being added yet (see the
-[roadmap](#roadmap)). Per-broker differences — product codes, GTT support,
-bracket orders, websocket limits — are declared in `src/brokers/capability_matrix.json`.
+**Treat Flattrade and Angel One as experimental.** Do not route a live strategy to either
+until you have run the live-verification steps yourself.
+
+Any single broker can run on its own: put only that broker's credentials in `.env` and keep it
+in `market_data.providers` (`config/global.json`). A broker with no credentials is skipped at
+startup, and the system refuses to start only when no data provider at all is usable (it never
+falls back to mock data). `launcher.py` signs in each broker that has credentials, and the
+dashboard shows one connection card per broker.
+
+Orders are routed **per strategy**: each live entry in `config/strategies_registry.json` carries a
+`broker` field. There is no default broker, no failover and no paper fallback, so a live strategy
+with a missing or unconfigured broker has its signals rejected and logged. A position always exits
+on the broker that opened it. Per-broker risk gating on each broker's own equity exists behind
+`system.per_broker_equity` (off by default, because turning it on changes live sizing).
+`BROKER=paper | kite | angel_one` in `.env` still selects the legacy single broker (unset =
+paper). Orders go through one `BrokerInterface` (`src/brokers/base.py`); per-broker differences —
+product codes, GTT support, bracket orders, websocket limits — are declared in
+`src/brokers/capability_matrix.json`.
 
 Exchanges and instruments: NSE cash equities (CNC delivery and MIS intraday) and NSE index
-options on NIFTY / BANKNIFTY. Futures, commodities and currency are out of scope.
+options on NIFTY / BANKNIFTY, plus BSE SENSEX options for one paper strategy. Futures,
+commodities and currency are out of scope.
 
 ---
 
@@ -163,7 +179,7 @@ honest, after-cost forward results for each strategy before any real money is in
 | `llm_swing_agent` | Swing | Enabled, paper. LLM proposes ideas; CRM and G9 gate them. |
 | `llm_intraday_agent` | Intraday | Enabled, paper-locked. |
 | `options_seller_desk_v3` | Options | Enabled, paper. Defined-risk credit spreads on NIFTY / BANKNIFTY. |
-| `nifty_weekly_condor_simple` | Options | Enabled, paper. Weekly iron condor. |
+| `options_intraday_short_premium2` | Options | Enabled, paper only. SENSEX ATM short straddle: enters about 10:32, per-leg stop (25 %), exits 15:10, skips Wednesdays. Stop and times are config values. Forward data collection, **not a proven edge**: offline tests showed it failing once realistic stop slippage was applied. |
 | `options_expiry_day` | Options | Enabled, paper. NIFTY expiry-day short strangle with per-leg stops. |
 | `options_intraday_short_premium` | Options | Enabled, paper. Daily NIFTY strangle with per-leg stop. |
 | `minervini_vcp`, `oneil_canslim`, `news_catalyst_momentum` | Swing / intraday | **Disabled.** Kept as reference; `minervini_vcp` failed its hold-out test. |
@@ -178,8 +194,12 @@ unproven until it clears the promotion bar in [Going live](INSTALL.md#14-before-
   trading is tested.
 - Docker (`docker compose up -d --build`) is a single paper-only image with the dashboard's
   dev server; see [INSTALL.md](INSTALL.md#docker).
-- Only Zerodha Kite Connect is supported, and it is the only broker this has been run against.
+- Only Zerodha Kite Connect has been run end to end. Flattrade is verified read-only (orders
+  off) and Angel One is unit-tested only; neither has placed a live order. See
+  [Supported brokers](#supported-brokers).
 - Option stop-losses are enforced by the system, not by resting broker-side orders.
+- Paper stop-loss fills include modelled slippage (gap, spread and impact), but real fills can
+  still be worse, so paper P&L on option-selling strategies overstates what live would give.
 
 ---
 
@@ -199,12 +219,15 @@ LLM review, learning engine, 17-tab dashboard, Docker one-command setup.
   time out) so `assisted` actually waits for you, replacing today's unused `ask_mode` settings.
 - **Promotion tooling.** One report per strategy that checks the written bar (trade count,
   profit factor, expectancy, slippage versus model) and refuses a switch to live until it is met.
-- **Make the app broker-independent.** Route the dashboard API, the data downloader, login and
-  paper-mode prices through the broker interface instead of calling Kite directly. This is the
-  prerequisite for supporting any other broker.
-- **More brokers: Flattrade and Angel One.** The next brokers to add after Zerodha, each validated
-  in paper-versus-broker runs, including how its stops and orders behave, before it is listed as
-  supported.
+- **Broker independence — built, partly verified.** Done: market-data router with failover,
+  Kite-optional startup, per-broker sign-in, per-strategy order routing, per-broker risk and
+  reconciliation, per-broker dashboard cards. Still open: the options chain and previous-close
+  data (breadth, sectors) still need Kite.
+- **More brokers: Flattrade and Angel One — adapters built, live verification pending.**
+  Flattrade: read-only checks pass; next are a 1-lot live order test and the exchange approval
+  for automated trading, then switching `live_orders_verified` on. Angel One: needs its first
+  live data and order checks, index/options data and pre-trade margin verification. Neither is
+  listed as supported until it has passed those runs, including how its stops behave.
 - **Production-grade containers.** Separate API, orchestrator and dashboard containers, a built
   (not dev-server) dashboard, and a tested live-broker login path.
 - **Automatic Kite session refresh in Docker** without pasting a daily token.
@@ -271,8 +294,8 @@ Sample data throughout. Open `http://localhost:5173` after starting the system.
 
 | You need | For | Notes |
 |---|---|---|
-| **Zerodha account + Kite Connect developer app with the paid market-data plan** | Everything, **including paper trading** | Paper mode simulates orders but takes live prices, option chains and history from Kite. Setup and plans: [INSTALL.md section 6](INSTALL.md#6-broker-connection-kite-connect--needed-even-for-paper-trading) |
-| **A registered static public IP address** | **Live trading only** | **LIVE TRADING WILL NOT WORK WITHOUT IT.** Zerodha rejects every API order that does not come from a static public IP registered in your Kite developer console. Paper trading is not affected, because it sends no orders to the broker |
+| **An account with at least one supported broker** (Zerodha Kite Connect with the paid market-data plan, Angel One or Flattrade) | Everything, **including paper trading** (prices, candles and option chains come from a broker) | Paper mode simulates orders but takes live data from your broker. **Kite is optional**, but without it options paper trading and the market-breadth and sector panels are unavailable (see [Supported brokers](#supported-brokers)). Kite setup and plans: [INSTALL.md section 6](INSTALL.md#6-broker-connection-kite-connect-angel-one-flattrade) |
+| **A registered static public IP address** | **Live trading only** | **LIVE TRADING WILL NOT WORK WITHOUT IT.** Zerodha rejects every API order that does not come from a static public IP registered in your Kite developer console; check your other broker's API terms for the same rule. Paper trading is not affected, because it sends no orders to the broker |
 | Python 3.13+, PostgreSQL 14+, Node 20.19+ / 22+ | Running natively | Or use Docker instead (next row) |
 | Docker with Compose v2 | Running with one command | Replaces the Python, PostgreSQL, Redis and Node installs |
 | At least one LLM API key | AI second opinion, news tagging | Free tiers work (Gemini, Groq, Cloudflare) |

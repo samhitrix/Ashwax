@@ -9,7 +9,7 @@ after that.
 - [3. Python environment](#3-python-environment)
 - [4. PostgreSQL](#4-postgresql)
 - [5. Environment file (.env)](#5-environment-file-env)
-- [6. Broker connection (Kite Connect, static IP)](#6-broker-connection-kite-connect--needed-even-for-paper-trading)
+- [6. Broker connection (Kite Connect, static IP)](#6-broker-connection-kite-connect-angel-one-flattrade)
 - [7. LLM providers](#7-llm-providers)
 - [8. Telegram alerts (optional)](#8-telegram-alerts-optional)
 - [9. Dashboard](#9-dashboard)
@@ -31,7 +31,7 @@ after that.
 | Node.js | 20.19+ or 22+ | dashboard only (Vite) |
 | Git | any | cloning |
 | Redis | 5+ | *optional* — news dedup and chain cache fall back to in-memory |
-| Zerodha account + **Kite Connect app (paid market-data plan)** | — | **required, even for paper trading** — live prices, option chains, history. See [section 6](#6-broker-connection-kite-connect--needed-even-for-paper-trading) |
+| An account with **at least one supported broker**: Zerodha **Kite Connect app (paid market-data plan)**, Angel One or Flattrade | — | **required, even for paper trading** — live prices and history come from a broker. **Kite itself is optional**, but options paper trading and the breadth/sector panels still need it. See [section 6](#6-broker-connection-kite-connect-angel-one-flattrade) |
 | **Registered static public IP address** | IPv4 | **required for LIVE trading only** — Zerodha rejects API orders from any other address. Not needed for paper trading |
 | At least one LLM API key | — | required for the AI second opinion and news tagging; free tiers work (Gemini, Groq, Cloudflare) |
 | Telegram bot | — | *optional* — mobile alerts |
@@ -99,11 +99,17 @@ DB_URL=postgresql://postgres:<your-password>@localhost:5432/ashwax
 Every other key in `.env.example` is optional and documented inline. `.env` is git-ignored;
 **never commit it.**
 
-## 6. Broker connection (Kite Connect — needed even for paper trading)
+## 6. Broker connection (Kite Connect, Angel One, Flattrade)
 
-AshwaX uses **Zerodha Kite Connect**. Paper mode simulates every order locally, so no order
-ever reaches a broker, but it still takes live prices, option chains and history from Kite.
-Without `KITE_API_KEY` the orchestrator stops at startup.
+Paper mode simulates every order locally, so no order ever reaches a broker, but it still takes
+live prices and history from a broker. **You need credentials for at least one of Kite Connect,
+Angel One or Flattrade**; the system refuses to start only when no data provider is usable.
+**Kite is optional**, but it is the only broker run end to end and the only one that supplies
+option chains and previous-close data, so options paper trading and the market-breadth and
+sector panels need it. Flattrade is verified read-only (orders are switched off) and Angel One
+is unit-tested only, so treat both as experimental. Which broker serves data is set in
+`config/global.json` under `market_data.providers`; a broker with no credentials in `.env` is
+skipped at startup. The rest of this section covers Kite Connect, the reference broker.
 
 ### 6.1 What you need from Zerodha
 
@@ -314,7 +320,7 @@ config.
 
 - Docker with Compose v2 (Docker Desktop on Windows / macOS, or Docker Engine on Linux).
 - Kite Connect keys and the paid market-data plan: the app cannot start without `KITE_API_KEY`,
-  because paper trading takes its market data from Kite (see [section 6](#6-broker-connection-kite-connect--needed-even-for-paper-trading)).
+  because paper trading takes its market data from Kite (see [section 6](#6-broker-connection-kite-connect-angel-one-flattrade)).
 
 ### Start
 
