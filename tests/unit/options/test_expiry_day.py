@@ -11,11 +11,12 @@ import pytest
 from src.options import seller_desk as sd
 from src.options.nfo_chain import ChainStrike, OptionChain
 from src.options.seller_desk import EXPIRY_DAY_TYPE, OpenPosition, build_expiry_butterfly
+from src.options.short_premium import SHORT_PREMIUM2_TYPE, SHORT_PREMIUM_TYPE
 from src.options.structure_selector import OptionLeg
 
+from tests.unit.options.hosted_helpers import _q, _RecordingCRM, _Repo
 from tests.unit.options.test_seller_desk import _APPROVE_ALL_CRM, _FakeExecutor
 from tests.unit.options.test_seller_desk import _desk as _seller_desk
-from tests.unit.options.test_weekly_condor import _q, _RecordingCRM, _Repo
 
 _IST = ZoneInfo("Asia/Kolkata")
 _EXP = date(2026, 10, 13)
@@ -245,7 +246,10 @@ async def test_take_profit_and_stop(prices, closed, prefix, monkeypatch) -> None
     assert ex.rolled == []
 
 
-async def test_restore_keeps_other_mode_rows_only_for_hosted_strategies() -> None:
+async def test_restore_keeps_other_mode_rows_for_hosted_strategies_and_every_live_row() -> None:
+    # Phase 2 task 7: a LIVE desk-own row (B) is restored too, not dropped because the desk's
+    # default mode is paper -- but ON HOLD (monitoring only, never auto-exited: the old filter
+    # never audited such rows); paper rows keep the old rule.
     import json as _j
 
     def row(pid, stype, is_paper):  # type: ignore[no-untyped-def]
@@ -274,8 +278,15 @@ async def test_restore_keeps_other_mode_rows_only_for_hosted_strategies() -> Non
     repo.realized_pnl_closed_on = _realized
     desk, _ = _desk(_chain(), repo=repo)  # paper desk
     await desk.restore_positions()
-    assert set(desk.positions) == {"A", "C"}
-    assert desk.positions["C"].is_paper is False and desk.positions["A"].is_paper is None
+    # C (hosted, live) is restored in its own mode too; its _EXP is already past, so it comes
+    # back on hold as an expired live row (and this desk has no live executor anyway).
+    assert set(desk.positions) == {"A"} and set(desk.held_positions) == {"B", "C"}
+    assert desk.positions["A"].is_paper is None
+    held = desk.held_positions["B"]
+    assert held.is_paper is False and held.exec_broker == "kite"
+    assert held.hold_reason == "restored_unaudited_live_row"
+    assert desk.held_positions["C"].is_paper is False
+    assert desk.held_positions["C"].hold_reason == "expired_live_row"
 
 
 async def test_llm_not_called_when_a_deterministic_crm_gate_would_refuse() -> None:
@@ -367,7 +378,7 @@ async def test_opens_even_when_desk_already_fills_the_per_index_cap(monkeypatch)
     desk, executor = _desk(_chain(), repo=_Repo())
     _desk_spread(desk, "OPT-D1")
     _desk_spread(desk, "OPT-D2", "bear_call_spread")
-    _desk_spread(desk, "OPT-C", sd.WEEKLY_CONDOR_TYPE)
+    _desk_spread(desk, "OPT-C", "iron_condor")
     pos = await _run(desk)
     assert pos is not None and pos.strategy_type == EXPIRY_DAY_TYPE
     assert len(executor.executed) == 1
@@ -387,8 +398,8 @@ async def test_reconciler_never_deletes_hosted_strategy_rows() -> None:
     await desk.reconcile_duplicate_positions()
     assert set(desk._repo.dedupe_kwargs["exclude_strategy_types"]) == {
         EXPIRY_DAY_TYPE,
-        sd.WEEKLY_CONDOR_TYPE,
-        sd.SHORT_PREMIUM_TYPE,
+        SHORT_PREMIUM_TYPE,
+        SHORT_PREMIUM2_TYPE,
     }
 
 
@@ -447,3 +458,35 @@ def test_open_fly_does_not_eat_the_shared_risk_headroom_of_desk_spreads() -> Non
         assert desk.shared_risk_ceiling_reason(39_000.0) is None  # 20k + 39k <= 60k; fly ignored
     finally:
         budget_module._current_equity = None
+
+
+# ── R1: a LIVE strategy trades only through a usable broker route ─────────────
+
+
+async def test_live_expiry_fly_with_an_unusable_route_places_nothing(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    from src.brokers.routing import BrokerRoute
+
+    desk, paper_exec = _desk(_chain(), repo=_Repo())
+    live_exec = _FakeExecutor()
+    desk._alt_executor = live_exec
+    ctx = _ctx("live")
+    ctx.strategy_routes = {_NAME: BrokerRoute(None, "live strategy has no 'broker' field")}
+    with caplog.at_level(logging.WARNING, logger="options.seller_desk"):
+        assert await _run(desk, ctx=ctx) is None
+    assert live_exec.executed == [] and paper_exec.executed == []  # never demoted to paper
+    assert f"broker_route_rejected strategy={_NAME} segment=options" in caplog.text
+
+
+async def test_live_expiry_fly_with_a_usable_route_trades_as_today() -> None:
+    from src.brokers.routing import BrokerRoute
+
+    desk, paper_exec = _desk(_chain(), repo=_Repo())
+    live_exec = _FakeExecutor()
+    desk._alt_executor = live_exec
+    ctx = _ctx("live")
+    ctx.strategy_routes = {_NAME: BrokerRoute("kite", None)}
+    pos = await _run(desk, ctx=ctx)
+    assert pos is not None and pos.is_paper is False
+    assert live_exec.executed and not paper_exec.executed

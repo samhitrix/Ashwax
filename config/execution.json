@@ -28,6 +28,10 @@
     "max_retries": 2,
     "retry_delay_seconds": 1
   },
+  "flattrade": {
+    "_note": "RISK PARAMETER. Flattrade API orders are LMT / SL-LMT only (market orders are blocked for API orders, Phase 0 findings A1/C-4). The adapter sends MARKET as a marketable LIMIT at LTP*(1+band) for BUY (rounded UP to tick) / LTP*(1-band) for SELL (rounded DOWN), clamped inside the circuit limits, and SL-M as SL-LMT with limit = trigger*(1+band) BUY / trigger*(1-band) SELL. market_protection_band_pct is a FRACTION: 0.005 = 0.5%. It is the worst slippage accepted beyond LTP/trigger; wider fills more reliably in a fast market (a gap through the band leaves the stop UNFILLED as a resting limit), narrower limits slippage. Allowed range (0, 0.05]; anything else stops the adapter from starting.",
+    "market_protection_band_pct": 0.005
+  },
   "options_execution": {
     "enabled": true,
     "max_open_positions": 5,

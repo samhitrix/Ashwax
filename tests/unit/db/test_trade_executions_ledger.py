@@ -28,6 +28,9 @@ pytestmark = pytest.mark.skipif(not _DB, reason="no DB_URL available")
 _MIGRATION = (
     pathlib.Path(__file__).parents[3] / "migrations" / "083_trade_executions_ledger.sql"
 ).read_text(encoding="utf-8")
+_MIGRATION_089 = (
+    pathlib.Path(__file__).parents[3] / "migrations" / "089_exec_broker.sql"
+).read_text(encoding="utf-8")
 
 
 @asynccontextmanager
@@ -41,6 +44,12 @@ async def _tx():
         # Only apply if missing: re-running DDL locks live tables on an already-migrated database.
         if not await conn.fetchval("SELECT to_regclass('public.trade_executions')"):
             await conn.execute(_MIGRATION)
+        # 089 re-emits the ledger triggers with exec_broker; same only-if-missing rule.
+        if not await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='trade_executions' AND column_name='exec_broker'"
+        ):
+            await conn.execute(_MIGRATION_089)
         yield conn
     finally:
         await tx.rollback()
@@ -125,6 +134,70 @@ async def test_live_intraday_is_recorded_as_live_and_intraday() -> None:
         assert {r["segment"] for r in ev} == {"INTRADAY"} and {r["is_paper"] for r in ev} == {False}
         final = next(r for r in ev if r["event"] == "FINAL_EXIT")
         assert final["reason"] == "EOD" and final["pnl"] == 10  # the live table keeps a reason too
+
+
+@pytest.mark.asyncio
+async def test_exec_broker_lands_on_ledger_rows_for_trades_and_paper_trades() -> None:
+    async with _tx() as c:
+        await c.execute(
+            "INSERT INTO trades (agent_trade_id, symbol, exchange, product, direction, quantity, "
+            "order_state, intended_price, strategy_name, exec_broker) "
+            "VALUES ('LEDGER-EB1','TESTLIVE','NSE','CNC','long',10,'FILLED',50,'test','angel_one')"
+        )
+        await c.execute(
+            "INSERT INTO paper_trades (agent_trade_id, symbol, exchange, product, direction, "
+            "quantity, order_state, intended_price, strategy_name, is_paper, exec_broker) "
+            "VALUES ('LEDGER-EB2','TESTSYM','NSE','CNC','long',10,'FILLED',50,'test',true,'kite')"
+        )
+        await c.execute("UPDATE trades SET current_sl=45 WHERE agent_trade_id='LEDGER-EB1'")
+        for tid, broker in (("LEDGER-EB1", "angel_one"), ("LEDGER-EB2", "kite")):
+            rows = await c.fetch(
+                "SELECT event, exec_broker FROM trade_executions WHERE trade_id=$1", tid
+            )
+            assert {r["event"] for r in rows} >= {"ORDER_CREATED", "ENTRY_FILL"}
+            assert {r["exec_broker"] for r in rows} == {broker}
+        moves = await c.fetch(
+            "SELECT exec_broker FROM trade_executions WHERE trade_id='LEDGER-EB1' AND event='SL_MOVE'"
+        )
+        assert [r["exec_broker"] for r in moves] == ["angel_one"]  # UPDATE branch too
+
+
+@pytest.mark.asyncio
+async def test_exec_broker_lands_on_options_ledger_rows() -> None:
+    async with _tx() as c:
+        await c.execute(
+            "INSERT INTO options_positions (position_id, underlying, strategy_type, status, legs, "
+            "expiry, dte_at_entry, lot_size_at_entry, net_credit, max_loss, max_profit, entry_margin, "
+            "entry_delta, entry_gamma, entry_theta, entry_vega, adjustments_count, opened_at, "
+            "is_paper, exec_broker) "
+            "VALUES ('OPT-EB','NSE:NIFTY','iron_condor','OPEN','{\"income\":[]}',current_date,10,65,"
+            "1000,2000,1000,5000,0,0,0,0,0,now(),false,'angel_one')"
+        )
+        await c.execute(
+            "UPDATE options_positions SET status='CLOSED', closed_at=now(), realized_pnl=1, "
+            "exit_reason='TARGET' WHERE position_id='OPT-EB'"
+        )
+        rows = await c.fetch(
+            "SELECT event, exec_broker FROM trade_executions WHERE trade_id='OPT-EB'"
+        )
+        assert {"ENTRY_FILL", "FINAL_EXIT"} <= {r["event"] for r in rows}
+        assert {r["exec_broker"] for r in rows} == {"angel_one"}  # and no LEDGER_ERROR row
+
+
+@pytest.mark.asyncio
+async def test_exec_broker_backfill_writes_no_ledger_noise_and_a_null_stays_null() -> None:
+    async with _tx() as c:
+        await _new_paper_swing(c)  # paper row, exec_broker never set
+        count_sql = "SELECT count(*) FROM trade_executions WHERE trade_id='LEDGER-T1'"
+        before = await c.fetchval(count_sql)
+        await c.execute(
+            "UPDATE paper_trades SET exec_broker='kite' WHERE agent_trade_id='LEDGER-T1'"
+        )
+        assert await c.fetchval(count_sql) == before  # touching only exec_broker logs nothing
+        nulls = await c.fetchval(
+            "SELECT count(*) FROM trade_executions WHERE trade_id='LEDGER-T1' AND exec_broker IS NOT NULL"
+        )
+        assert nulls == 0  # rows written while it was NULL are not rewritten by triggers
 
 
 @pytest.mark.asyncio

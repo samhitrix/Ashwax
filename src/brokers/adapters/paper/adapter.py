@@ -14,7 +14,7 @@ from __future__ import annotations
 import itertools
 import time
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -43,12 +43,16 @@ from src.brokers.base import (
 from src.infrastructure.logger import get_logger
 from src.market import sessions
 
+if TYPE_CHECKING:
+    from src.market_data.router import MarketDataRouter
+
 # "src.brokers" -> brokers.log (logger.py _COMPONENTS); paper fills share that file
 # with the live Kite/Angel One adapters since it's the same broker-call surface.
 _log = get_logger("src.brokers.paper")
 _IST = ZoneInfo("Asia/Kolkata")
 _ORDER_ID_PREFIX = "PAPER"
 _COUNTER = itertools.count(1)
+_DERIV_PREFIXES = ("NFO:", "BFO:")  # derivative symbols whose recent prices are cached
 
 
 class PaperAdapter(BrokerInterface):
@@ -62,7 +66,7 @@ class PaperAdapter(BrokerInterface):
 
     def __init__(
         self,
-        market_data_broker: BrokerInterface,
+        market_data_broker: BrokerInterface | MarketDataRouter,
         initial_capital: float = 200_000.0,
         slippage_bps: float = 5.0,
         enforce_order_windows: bool = False,
@@ -83,7 +87,7 @@ class PaperAdapter(BrokerInterface):
         self._requests: dict[str, OrderRequest] = {}
         self._gtts: dict[str, GTTOrder] = {}
         self._positions: dict[str, Position] = {}  # keyed by f"{symbol}:{product}"
-        # Recent NFO prices ("NFO:SYM" -> (monotonic ts, price)). The option order path was queueing
+        # Recent NFO/BFO prices ("NFO:SYM" -> (monotonic ts, price)). The option order path was queueing
         # behind every other loop's Kite quote calls (1 req/s shared bucket): ~12 s PER price lookup,
         # ~80 s for one two-leg entry on 2026-10-12. Entry/stop code has just fetched these prices a
         # moment earlier, so reuse them for a few seconds. NFO only: equity paths are untouched.
@@ -104,7 +108,7 @@ class PaperAdapter(BrokerInterface):
     def _remember_nfo(self, prices: dict[str, float]) -> None:
         now = time.monotonic()
         for key, px in prices.items():
-            if key.startswith("NFO:") and px:
+            if key.startswith(_DERIV_PREFIXES) and px:
                 self._nfo_px[key] = (now, float(px))
 
     def _fresh_nfo(self, key: str) -> float | None:
@@ -212,7 +216,7 @@ class PaperAdapter(BrokerInterface):
 
     async def get_ltp(self, symbols: list[str]) -> dict[str, float]:
         if symbols and all(
-            s.startswith("NFO:") and self._fresh_nfo(s) is not None for s in symbols
+            s.startswith(_DERIV_PREFIXES) and self._fresh_nfo(s) is not None for s in symbols
         ):
             return {s: self._nfo_px[s][1] for s in symbols}
         prices = await self._market.get_ltp(symbols)
@@ -221,6 +225,15 @@ class PaperAdapter(BrokerInterface):
 
     async def get_ohlcv(self, symbol: str, interval: str, days: int) -> pd.DataFrame:
         return await self._market.get_ohlcv(symbol, interval, days)
+
+    async def get_ohlcv_with_source(
+        self, symbol: str, interval: str, days: int
+    ) -> tuple[pd.DataFrame, str | None]:
+        """Bars plus the provider that served them (None when the market source is untagged)."""
+        fn = getattr(self._market, "get_ohlcv_with_source", None)
+        if fn is not None:
+            return await fn(symbol, interval, days)  # type: ignore[no-any-return]
+        return await self._market.get_ohlcv(symbol, interval, days), None
 
     async def load_instrument_tokens(self, exchange: str = "NSE") -> int:
         # _refresh_intraday_ohlcv pre-warms the token cache via
@@ -245,6 +258,13 @@ class PaperAdapter(BrokerInterface):
     def set_access_token(self, token: str) -> None:
         """Paper orders are simulated, but market data still comes from the
         real broker underneath — refresh that one when the token rotates."""
+        # A router has no broadcast set_access_token (tokens are broker-specific). This is
+        # only ever called with a Kite token by the Kite refresh loop; Angel One has its
+        # own refresh path, so target the router's kite provider explicitly.
+        set_provider_token = getattr(self._market, "set_provider_token", None)
+        if set_provider_token is not None:
+            set_provider_token("kite", token)
+            return
         set_token = getattr(self._market, "set_access_token", None)
         if set_token is not None:
             set_token(token)

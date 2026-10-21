@@ -154,7 +154,7 @@ async def test_breakeven_and_pop_computed_for_calibrated_strategy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pop_uses_crude_proxy_for_uncalibrated_strategy(monkeypatch):
-    monkeypatch.setattr(server, "_db_pool", _FakePool([_row(strategy_type="weekly_condor_simple")]))
+    monkeypatch.setattr(server, "_db_pool", _FakePool([_row(strategy_type="iron_butterfly")]))
     monkeypatch.setattr(server, "_kite", lambda: _FakeKite({}))
 
     out = await server.get_options_positions()

@@ -14,6 +14,21 @@ interface Strategy {
   health: string;
   enabled: boolean;
   executionMode: 'paper' | 'live';
+  broker: string | null;
+  brokerReady: boolean | null;
+}
+
+// Live brokers the engine can route to — mirrors src/brokers/registry.py. The server is the
+// authority: it refuses an unregistered or unconfigured broker with a 400.
+const BROKER_OPTIONS = ['kite', 'angel_one'];
+
+async function errorDetail(res: Response): Promise<string> {
+  try {
+    const body = await res.json();
+    return typeof body?.detail === 'string' ? body.detail : `HTTP ${res.status}`;
+  } catch {
+    return `HTTP ${res.status}`;
+  }
 }
 
 interface RejectedEntry { name: string; reason: string; }
@@ -105,27 +120,75 @@ export function StrategyStudio() {
   const [enabledOverride, setEnabledOverride] = useState<Record<string, boolean>>({});
   const [modeOverride, setModeOverride] = useState<Record<string, 'paper' | 'live'>>({});
   const [pendingNames, setPendingNames] = useState<Set<string>>(new Set());
+  const [brokerOverride, setBrokerOverride] = useState<Record<string, string>>({});
+  // Live was chosen but no broker is set yet: nothing is sent until a broker is picked
+  // (the server refuses live without one), then the strategy goes live in one step.
+  const [needsBroker, setNeedsBroker] = useState<Record<string, boolean>>({});
+  const [rowError, setRowError] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (strategies) {
       setEnabledOverride({});
       setModeOverride({});
+      setBrokerOverride({});
+      setNeedsBroker({});
     }
   }, [strategies]);
 
   const handleSetExecutionMode = async (name: string, mode: 'paper' | 'live') => {
     const prevMode = modeOverride[name] ?? strategies?.find((s) => s.name === name)?.executionMode ?? 'paper';
+    setRowError((prev) => ({ ...prev, [name]: '' }));
+    setNeedsBroker((prev) => ({ ...prev, [name]: false }));
+    const broker = brokerOverride[name] ?? strategies?.find((s) => s.name === name)?.broker ?? null;
+    if (mode === 'live' && !broker) {
+      setModeOverride((prev) => ({ ...prev, [name]: mode }));
+      setNeedsBroker((prev) => ({ ...prev, [name]: true }));
+      return;
+    }
     setModeOverride((prev) => ({ ...prev, [name]: mode }));
     try {
       const res = await fetch(`/api/strategies/${name}/execution_mode`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ executionMode: mode }),
+        body: JSON.stringify(mode === 'live' ? { executionMode: mode, broker } : { executionMode: mode }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(await errorDetail(res));
     } catch (e) {
       console.error('[ashwax] failed to set strategy execution mode', name, e);
+      setRowError((prev) => ({ ...prev, [name]: e instanceof Error ? e.message : String(e) }));
       setModeOverride((prev) => ({ ...prev, [name]: prevMode }));
+    }
+  };
+
+  const handleSetBroker = async (name: string, broker: string) => {
+    if (!broker) return;
+    const prevBroker = brokerOverride[name] ?? strategies?.find((s) => s.name === name)?.broker ?? '';
+    setRowError((prev) => ({ ...prev, [name]: '' }));
+    setBrokerOverride((prev) => ({ ...prev, [name]: broker }));
+    try {
+      const res = await fetch(`/api/strategies/${name}/broker`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ broker }),
+      });
+      if (!res.ok) throw new Error(await errorDetail(res));
+      if (needsBroker[name]) {
+        const live = await fetch(`/api/strategies/${name}/execution_mode`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ executionMode: 'live', broker }),
+        });
+        if (!live.ok) throw new Error(await errorDetail(live));
+        setNeedsBroker((prev) => ({ ...prev, [name]: false }));
+      }
+    } catch (e) {
+      console.error('[ashwax] failed to set strategy broker', name, e);
+      setRowError((prev) => ({ ...prev, [name]: e instanceof Error ? e.message : String(e) }));
+      setBrokerOverride((prev) => ({ ...prev, [name]: prevBroker }));
+      if (needsBroker[name]) {
+        setNeedsBroker((prev) => ({ ...prev, [name]: false }));
+        setModeOverride((prev) => ({ ...prev, [name]: 'paper' }));
+      }
     }
   };
 
@@ -231,6 +294,35 @@ export function StrategyStudio() {
                     <option value="paper">Paper</option>
                     <option value="live">Live</option>
                   </select>
+                  {(modeOverride[s.name] ?? s.executionMode) === 'live' && (
+                    <select
+                      value={brokerOverride[s.name] ?? s.broker ?? ''}
+                      onChange={(e) => handleSetBroker(s.name, e.target.value)}
+                      title={
+                        rowError[s.name] ||
+                        (needsBroker[s.name]
+                          ? 'Pick the broker this strategy trades on to go live'
+                          : s.brokerReady === false
+                            ? 'This broker is not usable (not configured) — live signals are rejected'
+                            : 'Broker this strategy trades on (takes effect on engine restart)')
+                      }
+                      className={`text-xs px-2 py-1 rounded bg-gray-800 border text-gray-300 font-medium ${
+                        rowError[s.name] || needsBroker[s.name] || s.brokerReady === false
+                          ? 'border-red-500'
+                          : 'border-gray-700'
+                      }`}
+                    >
+                      <option value="">Select broker…</option>
+                      {BROKER_OPTIONS.map((b) => (
+                        <option key={b} value={b}>{b}</option>
+                      ))}
+                    </select>
+                  )}
+                  {rowError[s.name] && (
+                    <span className="text-xs text-red-400 max-w-xs truncate" title={rowError[s.name]}>
+                      {rowError[s.name]}
+                    </span>
+                  )}
                   <span className="text-xs px-2 py-1 rounded bg-gray-800 text-gray-300 font-medium">{s.direction}</span>
                   <span className={`text-xs px-2 py-1 rounded font-medium ${tfColor[s.timeframe] ?? 'text-gray-400 bg-gray-800'}`}>{s.timeframe}</span>
                   {s.target_rr != null && (

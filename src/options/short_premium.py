@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from src.notifications import EventKind, notify
 from src.notifications.events import Segment
 from src.options import seller_settings as _settings
+from src.options.nfo_chain import index_spot_quote_symbol
 from src.options.structure_builder import leg_from_chain_row
 
 if TYPE_CHECKING:
@@ -41,6 +42,11 @@ if TYPE_CHECKING:
     from src.options.structure_selector import OptionLeg
 
 SHORT_PREMIUM_TYPE = "options_intraday_short_premium"
+# Second instance of the same engine with its own config block, registry name and position family
+# (hypothesis P: SENSEX ATM straddle, per-leg SL). Everything is parameterised in its settings block.
+SHORT_PREMIUM2_TYPE = "options_intraday_short_premium2"
+# Types whose positions carry per-leg stops from the first tick and are managed by this engine.
+SHORT_PREMIUM_TYPES = frozenset({SHORT_PREMIUM_TYPE, SHORT_PREMIUM2_TYPE})
 # The expiry-day strangle (config options_expiry_day with structure="strangle") runs on THIS engine under the
 # strategy's own name; must equal seller_desk.EXPIRY_DAY_TYPE (seller_desk imports this module, so it cannot be imported here).
 EXPIRY_STRANGLE_TYPE = "options_expiry_day"
@@ -175,6 +181,30 @@ def load_cfg() -> ShortPremiumCfg | None:
     return cfg
 
 
+_last_cfg2_error: str | None = None
+
+
+def load_cfg2() -> ShortPremiumCfg | None:
+    """The second instance's config (``options_intraday_short_premium2`` block), or None when the block is
+    absent/disabled/invalid. Same validation as the first; every rule (SL, entry/exit time, offsets, weekdays,
+    underlying) is read from the block on each tick, so edits apply with no restart."""
+    global _last_cfg2_error
+    raw = _settings.short_premium2()
+    if not raw.get("enabled", False):
+        return None
+    try:
+        cfg = parse_cfg(raw, strategy_type=SHORT_PREMIUM2_TYPE)
+    except (ValueError, KeyError) as exc:
+        if str(exc) != _last_cfg2_error:
+            _LOG.error(
+                "options_intraday_short_premium2_config_invalid err=%s -- new entries disabled", exc
+            )
+            _last_cfg2_error = str(exc)
+        return None
+    _last_cfg2_error = None
+    return cfg
+
+
 _last_expiry_cfg_error: str | None = None
 
 
@@ -206,13 +236,19 @@ def is_strangle_position(pos: Any, strategy_type: str) -> bool:
     has no per-leg stops; only strangle rows carry the ``sl_pct`` meta frozen at entry."""
     if pos.strategy_type != strategy_type:
         return False
-    return strategy_type == SHORT_PREMIUM_TYPE or "sl_pct" in pos.meta
+    return strategy_type in SHORT_PREMIUM_TYPES or "sl_pct" in pos.meta
 
 
 def _state_attrs(cfg_type: str) -> tuple[str, str, str]:
     """Names of the desk's per-strategy (attempts, entered_day, missed_day) fields."""
     if cfg_type == SHORT_PREMIUM_TYPE:
         return "_short_premium_attempts", "_short_premium_entered_day", "_short_premium_missed_day"
+    if cfg_type == SHORT_PREMIUM2_TYPE:
+        return (
+            "_short_premium2_attempts",
+            "_short_premium2_entered_day",
+            "_short_premium2_missed_day",
+        )
     return (
         "_expiry_strangle_attempts",
         "_expiry_strangle_entered_day",
@@ -353,35 +389,70 @@ def _alert_kw(strategy_type: str) -> dict[str, str]:
     return {} if strategy_type == SHORT_PREMIUM_TYPE else {"strategy_type": strategy_type}
 
 
+_LAST_SKIP: dict[str, tuple[date, str]] = {}
+
+
+class _SkipRecorder(logging.Filter):
+    """Remember each strategy's latest '<strategy_type> ... skipped reason=...' line (they all share that
+    shape in run_entry) so the missed-entry alert can name the real reason instead of 'see logs'."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        head, sep, rest = record.getMessage().partition(" skipped reason=")
+        if sep:
+            _LAST_SKIP[head.split(" ")[0]] = (datetime.now(_IST).date(), rest)
+        return True
+
+
+_LOG.addFilter(_SkipRecorder())
+
+
 def _alert(
-    desk: SellerDesk, *, is_paper: bool, reason: str, strategy_type: str = SHORT_PREMIUM_TYPE
+    desk: SellerDesk,
+    *,
+    is_paper: bool,
+    reason: str,
+    strategy_type: str = SHORT_PREMIUM_TYPE,
+    title: str = "",
 ) -> None:
+    symbol = (
+        str(_settings.short_premium2().get("underlying", "SENSEX")).upper()
+        if strategy_type == SHORT_PREMIUM2_TYPE
+        else "NIFTY"
+    )
     try:
         notify(
             EventKind.STRATEGY_ERROR,
             is_paper=is_paper,
-            symbol="NIFTY",
+            symbol=symbol,
             segment=Segment.OPTIONS,
             strategy=strategy_type,
             reason=reason,
+            title=title,
         )
     except Exception:  # noqa: BLE001 -- notify() must never break the trade path
         pass
 
 
-def size_lots(cfg: ShortPremiumCfg, income_1lot: list[OptionLeg]) -> tuple[int, str]:
+def size_lots(
+    cfg: ShortPremiumCfg, income_1lot: list[OptionLeg], equity_key: str | None = None
+) -> tuple[int, str]:
     """Lots to trade, derived from the PERCENTAGE budget so it scales with equity -- no rupee constants.
 
     config/capital.json options.max_loss_per_day_per_strategy (% of live equity) is this strategy's own
     daily kill. The all-legs-stopped loss (sl_defined_max_loss) of ``lots`` lots must fit within
     ``risk_fraction_of_daily_cap`` of it, else a normal double stop would trip the kill and force-close the
     rest of the day. ``lots`` > 0 in the config overrides (fixed count, still capped by max_lots);
-    returns (0, reason) when not even one lot fits (refused, never silently resized)."""
+    returns (0, reason) when not even one lot fits (refused, never silently resized).
+    ``equity_key`` (system.per_broker_equity, a live entry): that broker's own equity; unknown
+    refuses the entry."""
     if cfg.lots > 0:
         return min(cfg.lots, cfg.max_lots), f"fixed lots={cfg.lots}"
     from src.risk.budget import get_budget, get_current_equity  # noqa: PLC0415
 
-    cap = get_budget().options.max_loss_per_day_per_strategy_rupees(get_current_equity())
+    equity = get_current_equity() if equity_key is None else get_current_equity(equity_key)
+    if equity_key is not None and equity <= 0:
+        return 0, f"broker equity unknown for {equity_key}"
+    cap = get_budget().options.max_loss_per_day_per_strategy_rupees(equity)
     if cap <= 0:
         return 1, "no per-strategy daily cap configured -> 1 lot"
     per_lot = sl_defined_max_loss(income_1lot, cfg) / max(income_1lot[0].lots, 1)
@@ -443,7 +514,10 @@ async def run_entry(
     if not in_entry_window(now, cfg):
         return None
     mode_paper = desk.strategy_is_paper(name, crm_ctx)
-    executor = desk._executor_for(mode_paper)
+    if not mode_paper and desk.live_route_rejection(name, crm_ctx):
+        return None
+    route_broker = desk.strategy_broker(name, mode_paper, crm_ctx)
+    executor = desk._executor_for(mode_paper, route_broker)
     if executor is None:
         _LOG.error(
             "%s skipped reason=mode_not_wired mode=%s", tag, "paper" if mode_paper else "live"
@@ -512,7 +586,7 @@ async def run_entry(
     if probe is None:
         _LOG.info("%s skipped reason=structure_build_failed detail=%s", tag, "; ".join(why) or "?")
         return None
-    lots, size_note = size_lots(cfg, probe[1])
+    lots, size_note = size_lots(cfg, probe[1], desk._equity_key(mode_paper, route_broker))
     if lots < 1:
         _LOG.warning("%s skipped reason=sizing_refused detail=%s", tag, size_note)
         return None
@@ -547,6 +621,32 @@ async def run_entry(
     except Exception as exc:  # noqa: BLE001 -- never size/enter on a fake margin number
         _LOG.error("%s skipped reason=margin_fetch_failed err=%s", tag, exc)
         return None
+    # Auto-sizing (lots=0) sizes from the loss budget only, so on a thin-margin day it can ask for more
+    # lots than the account can margin (2026-10-19: 5 lots = Rs12.6L vs Rs11.6L free -> refused, no trade).
+    # Step down to the largest count that fits instead. A fixed lots count is never silently resized.
+    sized_lots = lots
+    while margin.total_margin > available_margin and cfg.lots == 0 and lots > 1:
+        lots = max(1, min(lots - 1, int(lots * available_margin / margin.total_margin)))
+        built = _build(lots)
+        if built is None:
+            _LOG.info(
+                "%s skipped reason=structure_build_failed detail=%s", tag, "; ".join(why) or "?"
+            )
+            return None
+        protection, income = built
+        net_premium = _net_premium(protection, income)
+        max_loss = sl_defined_max_loss(income, cfg)
+        try:
+            margin = await executor.get_order_margin_for_structure(
+                protection, income, f"{signal_id}-SIZING"
+            )
+        except Exception as exc:  # noqa: BLE001 -- never size/enter on a fake margin number
+            _LOG.error("%s skipped reason=margin_fetch_failed err=%s", tag, exc)
+            return None
+    if lots != sized_lots:
+        size_note += (
+            f"; margin-fit {sized_lots}->{lots} lots (free margin Rs{available_margin:.0f})"
+        )
     if margin.total_margin <= 0.0 or margin.total_margin < max_loss:
         _LOG.error(
             "%s skipped reason=implausible_margin real=%.0f sl_max_loss=%.0f",
@@ -635,6 +735,7 @@ async def run_entry(
         now=now,
         is_paper=mode_paper,
         skip_shared_risk=True,
+        broker=route_broker,
     )
     if position is None:
         return None
@@ -928,10 +1029,11 @@ async def _ltp(broker: Any, symbols: list[str]) -> dict[str, float]:
 
 
 async def tick(shared: dict[str, Any], now: datetime) -> None:
-    """One loop iteration for each strategy this engine runs: the daily short premium and the expiry-day
-    strangle. One failing must not stop the other."""
+    """One loop iteration for each strategy this engine runs: the daily short premium, its second instance and
+    the expiry-day strangle. One failing must not stop the others."""
     for strategy_type, cfg in (
         (SHORT_PREMIUM_TYPE, load_cfg()),
+        (SHORT_PREMIUM2_TYPE, load_cfg2()),
         (EXPIRY_STRANGLE_TYPE, load_expiry_cfg()),
     ):
         try:
@@ -978,7 +1080,7 @@ async def _tick_one(
         return
     from src.orchestrator import _hosted_margin  # noqa: PLC0415
 
-    underlying = f"NSE:{cfg.underlying}"
+    underlying = f"{index_spot_quote_symbol(cfg.underlying).split(':')[0]}:{cfg.underlying}"
     vix_map = await _ltp(broker, ["NSE:INDIA VIX"])
     vix = next(iter(vix_map.values()), None) if vix_map else None
     margin = await _hosted_margin(
@@ -1043,9 +1145,12 @@ async def _maybe_report_missed(
         cfg.strategy_type,
         today,
     )
+    last = _LAST_SKIP.get(cfg.strategy_type)
+    why = last[1] if last and last[0] == today else "no entry attempt was logged (see logs)"
     _alert(
         desk,
         is_paper=True,
-        reason=f"no entry today inside {cfg.entry_time:%H:%M}+{cfg.entry_grace_minutes}m (see logs for the skip reason)",
+        reason=f"No entry today inside {cfg.entry_time:%H:%M}+{cfg.entry_grace_minutes}m. Last skip: {why}",
+        title="NO ENTRY",
         **_alert_kw(cfg.strategy_type),
     )

@@ -380,3 +380,31 @@ async def test_enforce_order_windows_mirrors_broker(hh: int, mm: int, ok: bool) 
         else:
             with pytest.raises(OrderWindowClosed):
                 await adapter.place_order(_order_req())
+
+
+# -- get_ohlcv_with_source: provider tag survives the paper wrapper ---------------------------
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_get_ohlcv_with_source_forwards_router_source() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"close": [1.0]})
+    market = _make_market()
+    market.get_ohlcv_with_source = AsyncMock(return_value=(df, "angel_one"))
+    adapter = PaperAdapter(market_data_broker=market, initial_capital=1000.0)
+    out, source = await adapter.get_ohlcv_with_source("NSE:INFY", "day", 5)
+    assert out is df and source == "angel_one"
+    market.get_ohlcv_with_source.assert_awaited_once_with("NSE:INFY", "day", 5)
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_get_ohlcv_with_source_plain_market_broker_has_no_source() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"close": [1.0]})
+    market = _make_market()
+    market.get_ohlcv = AsyncMock(return_value=df)
+    adapter = PaperAdapter(market_data_broker=market, initial_capital=1000.0)
+    out, source = await adapter.get_ohlcv_with_source("NSE:INFY", "day", 5)
+    assert out is df and source is None

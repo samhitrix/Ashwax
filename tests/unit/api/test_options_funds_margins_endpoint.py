@@ -18,6 +18,14 @@ class _FakePool:
         return {"total": self._total}
 
 
+class _FakeKite:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def margins(self) -> dict[str, Any]:
+        return self._payload
+
+
 _KITE_MARGINS = {
     "equity": {
         "net": 950_000.0,
@@ -33,7 +41,7 @@ async def test_paper_side_derives_from_options_capital_and_open_margin(monkeypat
     from src.options import seller_settings as _ss
 
     monkeypatch.setattr(_ss, "load_settings", lambda: {"options_capital_rupees": 1_000_000.0})
-    monkeypatch.setattr(server, "_broker_cached", lambda *a, **k: _KITE_MARGINS)
+    monkeypatch.setattr(server, "_kite", lambda: _FakeKite(_KITE_MARGINS))
 
     out = await server.get_options_funds_margins()
 
@@ -48,7 +56,7 @@ async def test_live_side_reads_from_broker_margins(monkeypatch):
     from src.options import seller_settings as _ss
 
     monkeypatch.setattr(_ss, "load_settings", lambda: {"options_capital_rupees": 1_000_000.0})
-    monkeypatch.setattr(server, "_broker_cached", lambda *a, **k: _KITE_MARGINS)
+    monkeypatch.setattr(server, "_kite", lambda: _FakeKite(_KITE_MARGINS))
 
     out = await server.get_options_funds_margins()
 
@@ -68,7 +76,7 @@ async def test_broker_failure_leaves_live_figures_at_zero_not_crashing(monkeypat
     def _raise(*a: Any, **k: Any) -> Any:
         raise RuntimeError("kite down")
 
-    monkeypatch.setattr(server, "_broker_cached", _raise)
+    monkeypatch.setattr(server, "_kite", _raise)
 
     out = await server.get_options_funds_margins()
 
@@ -84,7 +92,7 @@ async def test_no_pool_leaves_paper_margin_committed_at_zero(monkeypatch):
     from src.options import seller_settings as _ss
 
     monkeypatch.setattr(_ss, "load_settings", lambda: {"options_capital_rupees": 1_000_000.0})
-    monkeypatch.setattr(server, "_broker_cached", lambda *a, **k: _KITE_MARGINS)
+    monkeypatch.setattr(server, "_kite", lambda: _FakeKite(_KITE_MARGINS))
 
     out = await server.get_options_funds_margins()
 

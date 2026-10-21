@@ -44,8 +44,10 @@ class OHLCVRepository:
                 ),
             )
 
-    async def upsert_candles(self, symbol: str, timeframe: str, rows: list[dict[str, Any]]) -> int:
-        """Bulk-insert rows; update OHLCV on conflict. Returns row count."""
+    async def upsert_candles(
+        self, symbol: str, timeframe: str, rows: list[dict[str, Any]], source: str | None = None
+    ) -> int:
+        """Bulk-insert rows; update OHLCV (and provider ``source``) on conflict. Returns row count."""
         if not rows:
             return 0
         records = [
@@ -60,22 +62,33 @@ class OHLCVRepository:
                 float(row.get("low", 0)),
                 float(row.get("close", 0)),
                 int(row.get("volume", 0)),
+                source,
             )
             for row in rows
         ]
         async with self._pool.acquire() as conn:
             await conn.executemany(
                 """
-                INSERT INTO ohlcv_candles (symbol, timeframe, ts, open, high, low, close, volume)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                INSERT INTO ohlcv_candles (symbol, timeframe, ts, open, high, low, close, volume, source)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (symbol, timeframe, ts) DO UPDATE
                     SET open=EXCLUDED.open, high=EXCLUDED.high,
                         low=EXCLUDED.low, close=EXCLUDED.close,
-                        volume=EXCLUDED.volume
+                        volume=EXCLUDED.volume, source=EXCLUDED.source
                 """,
                 records,
             )
         return len(records)
+
+    async def latest_source(self, symbol: str, timeframe: str) -> str | None:
+        """Source tag of the newest stored candle (None if untagged/no rows)."""
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(  # type: ignore[no-any-return]
+                "SELECT source FROM ohlcv_candles WHERE symbol=$1 AND timeframe=$2 "
+                "ORDER BY ts DESC LIMIT 1",
+                symbol,
+                timeframe,
+            )
 
     async def adv_crores(self, days: int = 20) -> dict[str, float]:
         """Average DAILY traded value (close x volume) in Rs crore over each symbol's last `days`

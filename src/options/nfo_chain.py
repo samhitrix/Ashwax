@@ -47,6 +47,23 @@ def index_spot_symbol(root: str) -> str:
     return _INDEX_SPOT_SYMBOL.get(root.upper(), root.upper())
 
 
+# Index options that list on BSE's derivatives segment (Kite exchange "BFO") rather than NFO, with
+# the exchange-qualified spot symbol. Verified against Kite 2026-10-16: instruments("BFO") serves
+# SENSEX options (lot 20, strike step 100, weekly Thursday expiry) and ltp("BSE:SENSEX") the spot.
+_BFO_ROOTS: dict[str, str] = {"SENSEX": "BSE:SENSEX"}
+
+
+def option_exchange(root: str) -> str:
+    """Exchange whose instrument dump lists ``root``'s options: 'BFO' for BSE indices, else 'NFO'."""
+    return "BFO" if root.upper() in _BFO_ROOTS else "NFO"
+
+
+def index_spot_quote_symbol(root: str) -> str:
+    """Exchange-qualified spot/LTP symbol for an underlying root ('SENSEX' -> 'BSE:SENSEX',
+    'NIFTY' -> 'NSE:NIFTY 50'). Use this instead of prefixing ``NSE:`` onto index_spot_symbol()."""
+    return _BFO_ROOTS.get(root.upper()) or f"NSE:{index_spot_symbol(root)}"
+
+
 # Minimum daily ATM-IV samples before an IV percentile is trustworthy. Below
 # this, percentile is undefined (None) and IV-conditional options are blocked.
 IV_PERCENTILE_MIN_SAMPLES = 20
@@ -143,12 +160,12 @@ class NFOChainProvider:
     ) -> None:
         self._broker = broker
         self._r = risk_free_rate
-        self._instruments: list[Instrument] | None = None
+        self._instruments: dict[str, list[Instrument]] = {}
 
-    async def _load_instruments(self) -> list[Instrument]:
-        if self._instruments is None:
-            self._instruments = await self._broker.get_instruments("NFO")
-        return self._instruments
+    async def _load_instruments(self, exchange: str = "NFO") -> list[Instrument]:
+        if exchange not in self._instruments:
+            self._instruments[exchange] = await self._broker.get_instruments(exchange)
+        return self._instruments[exchange]
 
     @staticmethod
     def _root(underlying: str) -> str:
@@ -185,13 +202,18 @@ class NFOChainProvider:
         """
         root = self._root(underlying)
         now = now or datetime.now(_IST)
-        instruments = await self._load_instruments()
+        exchange = option_exchange(root)
+        instruments = await self._load_instruments(exchange)
         options = [
             i
             for i in instruments
             if i.instrument_type in ("CE", "PE")
             and i.strike is not None
-            and (i.name.upper() == root or i.symbol.upper().startswith(root))
+            and (
+                i.name.upper() == root
+                # BFO lists SENSEX50/BANKEX next to SENSEX; a prefix match would mix their strikes in.
+                or (exchange == "NFO" and i.symbol.upper().startswith(root))
+            )
         ]
         if not options:
             _LOG.info("no_nfo_options underlying=%s", root)
@@ -214,8 +236,7 @@ class NFOChainProvider:
         options = [i for i in options if i.expiry == expiry]
 
         if spot is None:
-            spot_symbol = index_spot_symbol(root)
-            ltp_map = await self._broker.get_ltp([f"NSE:{spot_symbol}"])
+            ltp_map = await self._broker.get_ltp([index_spot_quote_symbol(root)])
             spot = next(iter(ltp_map.values()), 0.0) if ltp_map else 0.0
         if spot <= 0.0:
             _LOG.warning("no_spot underlying=%s", root)
@@ -237,7 +258,7 @@ class NFOChainProvider:
         symbols: list[str] = []
         for legs in by_strike.values():
             for inst in legs.values():
-                symbols.append(f"NFO:{inst.symbol}")
+                symbols.append(f"{exchange}:{inst.symbol}")
         quotes = await self._broker.get_option_quotes(symbols)
 
         expiry_aware = expiry if expiry.tzinfo else expiry.replace(tzinfo=_IST)
@@ -262,7 +283,7 @@ class NFOChainProvider:
                 leg_inst = legs.get(kind)
                 if leg_inst is None:
                     continue
-                sym = f"NFO:{leg_inst.symbol}"
+                sym = f"{exchange}:{leg_inst.symbol}"
                 q = quotes.get(sym)
                 setattr(row, attr, q)
                 setattr(row, f"{attr}_symbol", sym)

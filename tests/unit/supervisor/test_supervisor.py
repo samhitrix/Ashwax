@@ -154,11 +154,11 @@ async def test_run_invariants_all_have_ids(tmp_path: Any) -> None:
 # ── INV_C10 stale-heartbeat / restart grace ───────────────────────────────────
 
 
-def _pin_market_hours(monkeypatch: Any) -> datetime:
-    """Freeze the supervisor's clock at a Monday 11:00 IST so INV_C10 is in-window."""
+def _pin_market_hours(monkeypatch: Any, hour: int = 11, minute: int = 0) -> datetime:
+    """Freeze the supervisor's clock at a Monday (11:00 IST default) so INV_C10 is in-window."""
     import src.supervisor.supervisor as sv
 
-    fixed = datetime(2026, 9, 21, 11, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    fixed = datetime(2026, 9, 21, hour, minute, tzinfo=ZoneInfo("Asia/Kolkata"))
 
     class _FrozenDT(datetime):
         @classmethod
@@ -192,6 +192,33 @@ async def test_inv_c10_stale_heartbeat_critical_after_grace(
     sup._boot_at = fixed.replace(hour=10, minute=0)  # up 60 min, well past grace
     stale = (fixed.replace(hour=10, minute=30)).isoformat()
     (tmp_path / "intraday_signals.json").write_text(json.dumps({"ts": stale}))
+    r = await sup._inv_c10_intraday_scan_alive()
+    assert r.severity == InvariantSeverity.CRITICAL
+
+
+async def test_inv_c10_previous_session_heartbeat_ok_just_after_open(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    fixed = _pin_market_hours(monkeypatch, 9, 17)
+    sup = _sup()
+    sup._logs_dir = tmp_path
+    sup._boot_at = fixed.replace(day=17, hour=9)  # up all weekend
+    friday = fixed.replace(day=18, hour=15, minute=18).isoformat()
+    (tmp_path / "intraday_signals.json").write_text(json.dumps({"ts": friday}))
+    r = await sup._inv_c10_intraday_scan_alive()
+    assert r.severity == InvariantSeverity.OK
+    assert "Awaiting first cycle" in r.message
+
+
+async def test_inv_c10_previous_session_heartbeat_critical_once_window_passes(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    fixed = _pin_market_hours(monkeypatch, 9, 40)  # 25 min after open > 15 min threshold
+    sup = _sup()
+    sup._logs_dir = tmp_path
+    sup._boot_at = fixed.replace(day=17, hour=9)
+    friday = fixed.replace(day=18, hour=15, minute=18).isoformat()
+    (tmp_path / "intraday_signals.json").write_text(json.dumps({"ts": friday}))
     r = await sup._inv_c10_intraday_scan_alive()
     assert r.severity == InvariantSeverity.CRITICAL
 

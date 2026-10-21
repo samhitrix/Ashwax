@@ -234,3 +234,71 @@ async def test_reseeded_entry_arms_gtt_protection_when_it_fills() -> None:
     assert gtt.quantity == 145
     assert gtt.gtt_type == "TWO_LEG"
     assert mgr._trades["TRD-E79CE1F16545"].gtt_sl_id == "GTT-771122"
+
+
+# ── Per-broker reseed (phase 2: exec_broker, NULL = legacy "kite") ──────────
+
+
+class _BrokerPool:
+    def __init__(self, rows, has_column=True):
+        self._rows = rows
+        self._has_column = has_column
+
+    async def fetch(self, query, *args):
+        if "exec_broker" not in query:
+            return self._rows
+        if not self._has_column:
+            import asyncpg
+
+            raise asyncpg.exceptions.UndefinedColumnError('column "exec_broker" does not exist')
+        own = args[0]
+        others = list(args[1]) if len(args) > 1 else None
+        return [
+            r
+            for r in self._rows
+            if (r.get("exec_broker") or "kite") == own
+            or (others is not None and (r.get("exec_broker") or "kite") not in others)
+        ]
+
+
+_MIXED = [
+    _row(agent_trade_id="T-KITE", exec_broker="kite"),
+    _row(agent_trade_id="T-ANGEL", exec_broker="angel_one"),
+    _row(agent_trade_id="T-NULL", exec_broker=None),
+]
+_STACKS = {"paper": object(), "live:kite": object(), "live:angel_one": object()}
+
+
+async def _pending(key, has_column=True, stacks=_STACKS, legacy="kite"):
+    from src import orchestrator
+
+    mgr = _mgr()
+    await orchestrator._reseed_pending_entries(
+        mgr,
+        _BrokerPool(_MIXED, has_column),
+        orchestrator.stack_is_paper(key),
+        _ORDER_TYPES,
+        **orchestrator._reseed_scope(key, stacks, legacy),
+    )
+    return sorted(mgr.pending_entry_ids())
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+@pytest.mark.parametrize("legacy", ["kite", "angel_one"])  # type: ignore[misc]
+async def test_pending_reseed_each_live_stack_only_its_own_rows(legacy) -> None:
+    assert await _pending("live:kite", legacy=legacy) == ["T-KITE", "T-NULL"]
+    assert await _pending("live:angel_one", legacy=legacy) == ["T-ANGEL"]
+    assert await _pending("paper") == ["T-ANGEL", "T-KITE", "T-NULL"]  # paper unfiltered
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_pending_reseed_missing_column_kite_stack_only() -> None:
+    assert await _pending("live:kite", has_column=False) == ["T-ANGEL", "T-KITE", "T-NULL"]
+    assert await _pending("live:angel_one", has_column=False) == []
+    # angel_one primary with no kite stack: never takes unstamped rows, column or not
+    angel_only = {"paper": object(), "live:angel_one": object()}
+    assert await _pending("live:angel_one", stacks=angel_only, legacy="angel_one") == ["T-ANGEL"]
+    assert (
+        await _pending("live:angel_one", has_column=False, stacks=angel_only, legacy="angel_one")
+        == []
+    )

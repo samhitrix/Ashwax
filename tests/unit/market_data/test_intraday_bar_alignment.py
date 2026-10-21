@@ -52,12 +52,16 @@ class _FakeRepo:
     def __init__(self, existing_ts: datetime | None) -> None:
         self._existing_ts = existing_ts
         self.upserted: list[dict] = []
+        self.sources: list[str | None] = []
 
     async def latest_ts(self, symbol: str, timeframe: str) -> datetime | None:
         return self._existing_ts
 
-    async def upsert_candles(self, symbol: str, timeframe: str, rows: list[dict]) -> int:
+    async def upsert_candles(
+        self, symbol: str, timeframe: str, rows: list[dict], source: str | None = None
+    ) -> int:
         self.upserted.extend(rows)
+        self.sources.append(source)
         return len(rows)
 
 
@@ -142,3 +146,34 @@ async def test_refresh_intraday_ohlcv_shares_fetch_semaphore_across_calls():
 
     await _refresh_intraday_ohlcv(broker, shared, [("10minute", "10m")], _at(9, 30, 8))
     assert shared.get("_ohlcv_fetch_sem") is first_sem
+
+
+class _SourcedBroker(_FakeBroker):
+    """A paper-over-router style broker that reports which provider served the bars."""
+
+    async def get_ohlcv_with_source(self, symbol: str, interval: str, days: int):
+        return self._df, "angel_one"
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_refresh_intraday_ohlcv_tags_candles_with_serving_provider():
+    df = pd.DataFrame(
+        [{"date": _at(9, 25, 0), "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10}]
+    )
+    repo = _FakeRepo(existing_ts=_at(9, 20, 0))
+    shared = {"ohlcv_repo": repo, "watchlist": ["TESTSTOCK"], "strategy_registry": None}
+
+    await _refresh_intraday_ohlcv(_SourcedBroker(df), shared, [("5minute", "5m")], _at(9, 30, 8))
+    assert repo.sources == ["angel_one"]
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_refresh_intraday_ohlcv_plain_broker_keeps_untagged_source():
+    df = pd.DataFrame(
+        [{"date": _at(9, 25, 0), "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10}]
+    )
+    repo = _FakeRepo(existing_ts=_at(9, 20, 0))
+    shared = {"ohlcv_repo": repo, "watchlist": ["TESTSTOCK"], "strategy_registry": None}
+
+    await _refresh_intraday_ohlcv(_FakeBroker(df), shared, [("5minute", "5m")], _at(9, 30, 8))
+    assert repo.sources == [None]

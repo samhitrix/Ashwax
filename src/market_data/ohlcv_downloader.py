@@ -131,6 +131,7 @@ def _load_global_config() -> dict[str, Any]:
 
 # Backward-compatible module constant; built once from config at import. Consumers
 # that must reflect a live config change call build_timeframes() directly instead.
+# Depth limits stay at Kite's (the tightest known); Phase 0 will replace them with per-provider capabilities.
 _TIMEFRAMES = build_timeframes()
 
 
@@ -277,7 +278,12 @@ async def _download_symbol_timeframe(
                 # Bootstrap: first run, fetch full history within Kite limits
                 candle_count = bootstrap_candles
 
-            df_new = await adapter.get_ohlcv(f"NSE:{symbol}", kite_interval, candle_count)  # type: ignore[attr-defined]
+            fetch = getattr(adapter, "get_ohlcv_with_source", None)
+            if fetch is not None:
+                df_new, source = await fetch(f"NSE:{symbol}", kite_interval, candle_count)
+            else:
+                df_new = await adapter.get_ohlcv(f"NSE:{symbol}", kite_interval, candle_count)  # type: ignore[attr-defined]
+                source = None
             if df_new is None or df_new.empty:
                 _log.warning("empty response %-20s %-4s", symbol, tf_key)
                 return False
@@ -288,7 +294,20 @@ async def _download_symbol_timeframe(
             if ohlcv_repo is not None:
                 rows = _df_to_rows(df_new)
                 if rows:
-                    n = await ohlcv_repo.upsert_candles(symbol, tf_key, rows)  # type: ignore[attr-defined]
+                    prev = await ohlcv_repo.latest_source(symbol, tf_key)  # type: ignore[attr-defined]
+                    if prev is None and last_ts is not None:
+                        # Untagged history predates tagging and was all Kite (migration 093);
+                        # without this the first provider switch per series would be silent.
+                        prev = "kite"
+                    if source and prev and prev != source:
+                        _log.warning(
+                            "ohlcv_source_changed symbol=%s tf=%s from=%s to=%s",
+                            symbol,
+                            tf_key,
+                            prev,
+                            source,
+                        )
+                    n = await ohlcv_repo.upsert_candles(symbol, tf_key, rows, source=source)  # type: ignore[attr-defined]
                     _log.info("db upsert %-20s %-4s %d rows", symbol, tf_key, n)
 
             _log.info("ok %-20s %-4s %d rows", symbol, tf_key, len(df_new))
@@ -299,22 +318,23 @@ async def _download_symbol_timeframe(
             return False
 
 
+def _refresh_credentials() -> None:
+    """Refresh tokens for the configured data providers that have credentials."""
+    from src.market_data.provider_config import parse_provider_config, refresh_provider_credentials
+
+    refresh_provider_credentials(parse_provider_config(_load_global_config()).providers, _ENV)
+
+
 async def _run(
     symbols: list[str],
     days: int,
     concurrency: int,
     db_pool: object | None = None,
 ) -> None:
-    from src.brokers.adapters.kite.adapter import KiteAdapter
-    from src.brokers.adapters.kite.auth import KiteAuth
-    from src.brokers.kite_auth import auto_refresh
+    from src.brokers.factory import get_market_data_router
 
-    try:
-        auto_refresh(_ENV)
-    except Exception as exc:
-        _log.warning("kite_auth: %s — using cached token", exc)
-
-    adapter = KiteAdapter(KiteAuth.from_env())
+    await asyncio.to_thread(_refresh_credentials)  # Angel's refresh calls asyncio.run()
+    adapter = get_market_data_router()
 
     # Reconcile the universe against the broker's live instrument master so
     # delisted/renamed symbols are never fetched (fails open if unavailable).

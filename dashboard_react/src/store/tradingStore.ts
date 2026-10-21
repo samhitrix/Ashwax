@@ -238,12 +238,24 @@ function _newToast(tier: ToastItem['tier'], message: string): ToastItem {
   return { id: `t${Date.now()}-${_toastSeq}`, ts: new Date().toLocaleTimeString('en-IN'), tier, message };
 }
 
+/** One broker's health card from /api/session `brokers` (real checks; null = not checked). */
+export interface BrokerCard {
+  broker: string;
+  label: string;
+  configured: boolean;
+  token_present: boolean;
+  token_valid: boolean | null;
+  rest_connected: boolean | null;
+  error: string | null;
+}
+
 interface TradingStore {
   positions: Position[];
   orders: Order[];
   pnlHistory: PnLPoint[];
   funds: Funds | null;
   kiteConnected: boolean;
+  brokerCards: BrokerCard[];
   alerts: OrderMonitoringAlert[];
   systemAlerts: AlertItem[];
   toasts: ToastItem[];
@@ -275,6 +287,7 @@ export const useTradingStore = create<TradingStore>((set) => ({
   pnlHistory: [],
   funds: null,
   kiteConnected: false,
+  brokerCards: [],
   alerts: [],
   systemAlerts: [],
   toasts: [],
@@ -394,6 +407,8 @@ export const useTradingStore = create<TradingStore>((set) => ({
           : null;
 
         const kiteConnected = sessionRes?.ok === true;
+        // Older API builds have no `brokers` list -> [] and the Kite-only card is shown.
+        const brokerCards: BrokerCard[] = Array.isArray(sessionRes?.brokers) ? sessionRes.brokers : [];
         _connFailStreak = 0; // all four endpoints resolved → healthy
         const nextOrders = rawOrders.map(mapOrder);
 
@@ -409,6 +424,7 @@ export const useTradingStore = create<TradingStore>((set) => ({
             orders: nextOrders,
             funds,
             kiteConnected,
+            brokerCards,
             pnlHistory: appendPnLPoint(state.pnlHistory, dailyPnL),
             toasts: orderToasts.length
               ? [...state.toasts, ...orderToasts].slice(-MAX_TOASTS)
@@ -432,7 +448,8 @@ export const useTradingStore = create<TradingStore>((set) => ({
         _connFailStreak += 1;
         set((state) => ({
           agentState: { ...state.agentState, lastHeartbeat: new Date() },
-          ...(_connFailStreak >= 2 ? { funds: null, kiteConnected: false } : {}),
+          // brokerCards cleared too, so no card keeps saying "Connected" on stale data.
+          ...(_connFailStreak >= 2 ? { funds: null, kiteConnected: false, brokerCards: [] } : {}),
         }));
       });
 

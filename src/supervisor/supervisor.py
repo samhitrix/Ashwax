@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 from src.infrastructure.alert_system import AlertManager, AlertTier
 from src.infrastructure.logger import cleanup_old_logs
 from src.market import sessions as _sessions
+from src.market.calendar import is_trading_day as _is_trading_day
 from src.supervisor.floor_check import supervisor_floor_check
 
 if TYPE_CHECKING:
@@ -524,7 +525,11 @@ class Supervisor:
         anything else, so that is the point past which staleness stops being
         merely slow and starts being a real trading-capability outage."""
         now = datetime.now(_IST)
-        if now.weekday() >= 5 or not _sessions.in_regular_minutes(now.hour * 60 + now.minute):
+        if (
+            now.weekday() >= 5
+            or not _is_trading_day(now.date())
+            or not _sessions.in_regular_minutes(now.hour * 60 + now.minute)
+        ):
             return InvariantResult(
                 "INV_C10", InvariantSeverity.OK, "Outside market hours — not checked"
             )
@@ -554,6 +559,22 @@ class Supervisor:
                 InvariantSeverity.OK,
                 f"Warming up after restart ({uptime_min:.1f}/{threshold_min:.0f} min) — "
                 f"heartbeat {age_min:.1f} min old",
+            )
+        # The loop writes nothing outside the session, so at the open the heartbeat is
+        # still the previous session's (a Monday open sees Friday's, ~66h old) and the
+        # first cycle only completes after the first 5m bar closes. Give the loop one
+        # threshold window from the open before a pre-open heartbeat counts as stale.
+        mins_since_open = now.hour * 60 + now.minute - _sessions.minutes(_sessions.regular_open())
+        if (
+            age_min > threshold_min
+            and last_ts.astimezone(_IST).date() < now.date()
+            and mins_since_open < threshold_min
+        ):
+            return InvariantResult(
+                "INV_C10",
+                InvariantSeverity.OK,
+                f"Awaiting first cycle of the session ({mins_since_open} min since open) — "
+                f"heartbeat is from {last_ts.astimezone(_IST):%Y-%m-%d %H:%M}",
             )
         if age_min > threshold_min:
             return InvariantResult(

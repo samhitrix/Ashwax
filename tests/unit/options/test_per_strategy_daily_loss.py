@@ -12,10 +12,10 @@ from src.options import seller_desk as sd
 from src.options.seller_desk import (
     DESK_OWN_STRATEGY_NAME,
     EXPIRY_DAY_TYPE,
-    WEEKLY_CONDOR_TYPE,
     OpenPosition,
     _registry_strategy_for,
 )
+from src.options.short_premium import SHORT_PREMIUM_TYPE
 from src.options.structure_selector import OptionLeg
 
 from tests.unit.options.test_seller_desk import _desk, _FakeRepo, _rich_chain
@@ -33,7 +33,7 @@ _TODAY = date(2026, 10, 7)
         ("bull_put_spread", DESK_OWN_STRATEGY_NAME),
         ("iron_condor", DESK_OWN_STRATEGY_NAME),
         ("calendar_spread", DESK_OWN_STRATEGY_NAME),
-        (WEEKLY_CONDOR_TYPE, WEEKLY_CONDOR_TYPE),
+        (SHORT_PREMIUM_TYPE, SHORT_PREMIUM_TYPE),
         (EXPIRY_DAY_TYPE, EXPIRY_DAY_TYPE),
     ],
 )
@@ -56,11 +56,11 @@ def test_add_realized_buckets_by_registry_strategy_and_resets_on_new_day(monkeyp
 
     monkeypatch.setattr(sd, "datetime", _FixedDT)
     desk._add_realized(-1000.0, "bull_put_spread")
-    desk._add_realized(-500.0, WEEKLY_CONDOR_TYPE)
+    desk._add_realized(-500.0, SHORT_PREMIUM_TYPE)
     desk._add_realized(200.0, "iron_condor")  # same bucket as bull_put_spread
     assert desk._realized_today_by_strategy == {
         DESK_OWN_STRATEGY_NAME: -800.0,
-        WEEKLY_CONDOR_TYPE: -500.0,
+        SHORT_PREMIUM_TYPE: -500.0,
     }
     assert desk._realized_today == -1300.0
 
@@ -111,14 +111,14 @@ async def test_sweep_closes_only_the_breached_strategy_others_keep_trading(monke
 
     monkeypatch.setattr(budget_module, "_current_equity", 2_000_000.0)  # cap = Rs 5,000
     desk.positions["A1"] = _pos("A1", "bull_put_spread")
-    desk.positions["B1"] = _pos("B1", WEEKLY_CONDOR_TYPE)
+    desk.positions["B1"] = _pos("B1", SHORT_PREMIUM_TYPE)
     desk._realized_today_by_strategy = {DESK_OWN_STRATEGY_NAME: -6_000.0}  # breached
     desk._realized_today = -6_000.0
     await desk.sweep_strategy_daily_loss(_TODAY, current_prices={})
     assert "A1" not in desk.positions  # breached strategy's position closed
     assert "B1" in desk.positions  # unrelated strategy untouched
     assert desk._strategy_halted_day[DESK_OWN_STRATEGY_NAME] == _TODAY
-    assert WEEKLY_CONDOR_TYPE not in desk._strategy_halted_day
+    assert SHORT_PREMIUM_TYPE not in desk._strategy_halted_day
     assert executor.closed  # real close path ran, not a silent drop
 
 
@@ -171,7 +171,7 @@ def test_strategy_halted_reason_is_scoped_to_one_strategy() -> None:
     desk, _ = _desk(_rich_chain())
     desk._strategy_halted_day[DESK_OWN_STRATEGY_NAME] = _TODAY
     assert desk.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, _TODAY) == "strategy_daily_loss_cap"
-    assert desk.strategy_halted_reason(WEEKLY_CONDOR_TYPE, _TODAY) is None
+    assert desk.strategy_halted_reason(SHORT_PREMIUM_TYPE, _TODAY) is None
     assert desk.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, date(2026, 10, 8)) is None  # new day
 
 
@@ -189,7 +189,7 @@ class _SeedRepo(_FakeRepo):
 
 async def test_seed_restores_per_strategy_totals_and_halts_if_already_breached() -> None:
     desk, _ = _desk(
-        _rich_chain(), repo=_SeedRepo({"bull_put_spread": -6_000.0, WEEKLY_CONDOR_TYPE: -500.0})
+        _rich_chain(), repo=_SeedRepo({"bull_put_spread": -6_000.0, SHORT_PREMIUM_TYPE: -500.0})
     )
     from src.risk import budget as budget_module
 
@@ -198,10 +198,10 @@ async def test_seed_restores_per_strategy_totals_and_halts_if_already_breached()
         await desk._seed_strategy_daily_loss(_TODAY)
         assert desk._realized_today_by_strategy == {
             DESK_OWN_STRATEGY_NAME: -6_000.0,
-            WEEKLY_CONDOR_TYPE: -500.0,
+            SHORT_PREMIUM_TYPE: -500.0,
         }
         assert desk._strategy_halted_day.get(DESK_OWN_STRATEGY_NAME) == _TODAY
-        assert WEEKLY_CONDOR_TYPE not in desk._strategy_halted_day
+        assert SHORT_PREMIUM_TYPE not in desk._strategy_halted_day
     finally:
         budget_module._current_equity = None
 

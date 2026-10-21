@@ -1695,33 +1695,29 @@ async def test_defer_protection_strips_exchange_prefix_from_symbol() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gtt_protection_refused_when_broker_cannot_do_gtt() -> None:
-    """A broker without GTT support must fail loudly, never leave the fill naked."""
+@pytest.mark.parametrize("defer_protection", [True, False])
+async def test_gtt_protection_refused_when_broker_cannot_do_gtt(defer_protection: bool) -> None:
+    """A broker without GTT support must refuse the ENTRY (nothing placed), never
+    fill first and leave the position naked (adapters review I4)."""
     mgr, broker = _make_pending_broker()
     broker.place_order = AsyncMock(side_effect=["BRK001"])
     broker.supports_gtt = MagicMock(return_value=False)
-    broker.get_order_status = AsyncMock(return_value=_make_broker_order("FILLED"))
-    broker.get_trades = AsyncMock(
-        return_value=[
-            Fill(order_id="BRK001", trade_id="T1", quantity=10, price=1500.0, exchange_time=_NOW)
-        ]
-    )
 
-    rec = await mgr.place_entry_protection_and_poll(
-        signal_id="SIG1",
-        symbol="INFY",
-        direction="BUY",
-        qty=10,
-        entry_price=1500.0,
-        sl_price=1450.0,
-        target_price=1600.0,
-        product="CNC",
-        defer_protection=True,
-    )
+    with pytest.raises(RuntimeError, match="entry refused.*supports_gtt"):
+        await mgr.place_entry_protection_and_poll(
+            signal_id="SIG1",
+            symbol="INFY",
+            direction="BUY",
+            qty=10,
+            entry_price=1500.0,
+            sl_price=1450.0,
+            target_price=1600.0,
+            product="CNC",
+            defer_protection=defer_protection,
+        )
 
-    # _arm_deferred_protection swallows and screams rather than orphaning the fill.
-    assert rec.gtt_sl_id == ""
-    assert rec.sl_order_id == ""
+    broker.place_order.assert_not_awaited()
+    broker.place_gtt.assert_not_awaited()
 
 
 # ── RejectionHandler wired into SL/target leg placement ─────────────────────────

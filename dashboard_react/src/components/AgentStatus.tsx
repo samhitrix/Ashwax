@@ -15,7 +15,7 @@ import {
   XCircle,
   Zap,
 } from 'lucide-react';
-import { useTradingStore } from '../store/tradingStore';
+import { useTradingStore, type BrokerCard } from '../store/tradingStore';
 import { useApi } from '../hooks/useApi';
 import { cn } from '../utils/cn';
 import { formatDistanceToNow, format, isValid } from 'date-fns';
@@ -57,8 +57,83 @@ interface ComponentInfo {
 
 const API_BASE = '';
 
+/** One broker's connection card (same layout as the original single Kite card). A broker
+ * with no credentials is shown as not configured, never as connected. */
+function BrokerHealthCard({ card }: { card: BrokerCard }) {
+  const healthy = card.configured && card.rest_connected === true;
+  const tone = healthy ? 'green' : card.configured ? 'red' : 'gray';
+  return (
+    <div className="bg-[#161b22] rounded-xl border border-gray-800 p-4">
+      <div className="flex items-center gap-3 mb-4">
+        <div
+          className={cn(
+            'w-10 h-10 rounded-lg flex items-center justify-center',
+            tone === 'green' ? 'bg-green-500/20' : tone === 'red' ? 'bg-red-500/20' : 'bg-gray-700/40'
+          )}
+        >
+          <Globe
+            className={cn(
+              'w-5 h-5',
+              tone === 'green' ? 'text-green-400' : tone === 'red' ? 'text-red-400' : 'text-gray-500'
+            )}
+          />
+        </div>
+        <div>
+          <h4 className="font-semibold text-white">{card.label}</h4>
+          <p className="text-xs text-gray-400">Broker API</p>
+        </div>
+      </div>
+      <div className="space-y-2">
+        <div className="flex justify-between text-sm">
+          <span className="text-gray-400">Configured</span>
+          <span className={card.configured ? 'text-green-400' : 'text-gray-500'}>
+            {card.configured ? 'Yes' : 'No credentials'}
+          </span>
+        </div>
+        <div className="flex justify-between text-sm">
+          <span className="text-gray-400">REST API</span>
+          {!card.configured ? (
+            <span className="text-gray-500">—</span>
+          ) : card.rest_connected ? (
+            <span className="text-green-400 flex items-center gap-1">
+              <CheckCircle2 className="w-4 h-4" />
+              Connected
+            </span>
+          ) : (
+            <span className="text-red-400 flex items-center gap-1">
+              <XCircle className="w-4 h-4" />
+              Not connected
+            </span>
+          )}
+        </div>
+        <div className="flex justify-between text-sm">
+          <span className="text-gray-400">Access token</span>
+          <span
+            className={
+              !card.configured ? 'text-gray-500' : card.token_valid ? 'text-green-400' : 'text-red-400'
+            }
+          >
+            {!card.configured
+              ? '—'
+              : card.token_valid
+                ? 'Valid'
+                : card.token_present
+                  ? 'Invalid'
+                  : 'Missing'}
+          </span>
+        </div>
+        {card.configured && card.error && (
+          <div className="text-xs text-red-400 truncate" title={card.error}>
+            {card.error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function AgentStatus() {
-  const { agentState, kiteConnected } = useTradingStore();
+  const { agentState, kiteConnected, brokerCards } = useTradingStore();
   const { data: dbStatus } = useApi<DbStatus>('/api/db_status', 5000);
   const { data: llmSanity } = useApi<LlmSanity>('/api/llm_sanity', 5000);
   // Same endpoint SystemHealth.tsx's "LLM Models" table reads (src/llm/model_health.py,
@@ -349,8 +424,12 @@ export function AgentStatus() {
         )}
       </div>
 
-      {/* Connections Status */}
+      {/* Connections Status -- one card per broker (Kite / Angel One / Flattrade); the
+          single Kite card remains for an API build that does not send `brokers` yet. */}
       <div className="grid grid-cols-3 gap-4">
+        {brokerCards.length > 0 ? (
+          brokerCards.map((card) => <BrokerHealthCard key={card.broker} card={card} />)
+        ) : (
         <div className="bg-[#161b22] rounded-xl border border-gray-800 p-4">
           <div className="flex items-center gap-3 mb-4">
             <div className="w-10 h-10 rounded-lg bg-green-500/20 flex items-center justify-center">
@@ -384,6 +463,7 @@ export function AgentStatus() {
             </div>
           </div>
         </div>
+        )}
 
         <div className="bg-[#161b22] rounded-xl border border-gray-800 p-4">
           <div className="flex items-center gap-3 mb-4">

@@ -240,13 +240,6 @@ def crm_adapter_settings(settings: dict[str, Any] | None = None) -> dict[str, An
     return dict(s.get("crm_adapter", {}))
 
 
-def weekly_condor(settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``weekly_condor_simple`` block (hypothesis B). Empty dict = not configured,
-    which SellerDesk.run_weekly_condor_cycle treats as disabled."""
-    s = settings if settings is not None else load_settings()
-    return dict(s.get("weekly_condor_simple", {}))
-
-
 def expiry_day(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     """``options_expiry_day`` block (hypothesis F2). Empty dict = not configured,
     which SellerDesk.run_expiry_day_cycle treats as disabled."""
@@ -254,32 +247,41 @@ def expiry_day(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     return dict(s.get("options_expiry_day", {}))
 
 
-_short_premium_cache: tuple[float, dict[str, Any]] | None = None
+_short_premium_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
-def short_premium(settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``options_intraday_short_premium`` block. Empty dict = not configured = disabled.
-
-    Unlike every other accessor here this one re-reads options_settings.json whenever the
-    file's mtime changes, so entry/exit times, SL %, leg offsets etc. can be edited from
-    the dashboard Configuration tab and apply on the next tick with no restart. An explicit
-    ``settings`` argument (tests) bypasses the file entirely."""
-    global _short_premium_cache
+def _live_block(name: str, settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Block ``name`` of options_trading, re-read whenever options_settings.json's mtime changes (so edits
+    from the dashboard Configuration tab apply on the next tick with no restart). An explicit ``settings``
+    argument (tests) bypasses the file entirely."""
     if settings is not None:
-        return dict(settings.get("options_intraday_short_premium", {}))
+        return dict(settings.get(name, {}))
     try:
         mtime = _SETTINGS_PATH.stat().st_mtime
     except OSError:
-        return dict(load_settings().get("options_intraday_short_premium", {}))
-    if _short_premium_cache is None or _short_premium_cache[0] != mtime:
+        return dict(load_settings().get(name, {}))
+    hit = _short_premium_cache.get(name)
+    if hit is None or hit[0] != mtime:
         raw = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
-        block = raw.get("options_trading", {}).get("options_intraday_short_premium", {})
-        _short_premium_cache = (mtime, dict(block))
-    return dict(_short_premium_cache[1])
+        hit = (mtime, dict(raw.get("options_trading", {}).get(name, {})))
+        _short_premium_cache[name] = hit
+    return dict(hit[1])
+
+
+def short_premium(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``options_intraday_short_premium`` block. Empty dict = not configured = disabled. Live-reloaded
+    (see ``_live_block``): entry/exit times, SL %, leg offsets etc. apply on the next tick."""
+    return _live_block("options_intraday_short_premium", settings)
+
+
+def short_premium2(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``options_intraday_short_premium2`` block (hypothesis P, SENSEX straddle). Same contract as
+    ``short_premium``: empty = not configured = disabled, live-reloaded."""
+    return _live_block("options_intraday_short_premium2", settings)
 
 
 def reload() -> None:
     """Clear the settings cache (re-read on next access)."""
-    global _settings_cache, _short_premium_cache
+    global _settings_cache
     _settings_cache = None
-    _short_premium_cache = None
+    _short_premium_cache.clear()

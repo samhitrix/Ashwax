@@ -20,11 +20,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import functools
 import json
 import signal
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
+from src.brokers.stack_keys import (
+    LEGACY_LIVE_BROKER,
+    live_stacks,
+    primary_live_key,
+    stack_broker,
+    stack_is_paper,
+    stack_key,
+)
 from src.infrastructure.logger import get_logger, setup_logging, strategy_logged
 from src.infrastructure.singleton import acquire_singleton_lock
 from src.market import sessions as _sessions
@@ -83,6 +94,181 @@ def _resolve_is_paper(
     if _override == "live":
         return False
     return bool(getattr(crm_ctx, "segment_paper_mode", {}).get(segment, paper_mode))
+
+
+def _resolve_broker(
+    shared: Mapping[str, Any], strategy_name: str, is_paper: bool
+) -> tuple[str | None, str | None]:
+    """(broker, reject_reason) for one signal whose paper/live mode _resolve_is_paper decided
+    (a paper_mode_locked account never gets here as live). Spec rule R1, owner decision:
+
+        paper                                    -> (None, None); routes are never consulted
+        live, route ok (shared["strategy_routes"]) -> (route.broker, None)
+        live, route not ok                       -> (None, reason): REJECT -- no default
+                                                    broker, no failover, no demotion to paper
+        live, no route entry (not in registry or -> (shared["legacy_live_broker"], None):
+          "inherit": the segment decides)           the legacy global.json broker, unchanged
+    """
+    if is_paper:
+        return None, None
+    from src.brokers.routing import route_rejection
+
+    routes = shared.get("strategy_routes") or {}
+    reason = route_rejection(routes, strategy_name)
+    if reason is not None:
+        return None, reason
+    route = routes.get(strategy_name)
+    if route is not None:
+        return route.broker, None
+    return shared.get("legacy_live_broker"), None
+
+
+def _held_symbols_unknown_for(
+    shared: Mapping[str, Any], is_paper: bool, stack: Mapping[str, Any] | None
+) -> bool:
+    """True when an entry must fail closed because the held-symbol guard cannot see what it
+    needs: before the first reconciliation (every entry, as before), or -- live only -- while
+    THIS live stack's broker books have never loaded (held_symbols_unloaded_keys). Paper and
+    other live brokers are not blocked by another broker that cannot be read."""
+    if not shared.get("held_symbols_loaded"):
+        return True
+    if is_paper or stack is None:
+        return False
+    stacks = shared.get("stacks") or {}
+    return any(stacks.get(k) is stack for k in shared.get("held_symbols_unloaded_keys") or ())
+
+
+def _unloaded_brokers_tracked_symbols(shared: Mapping[str, Any]) -> set[str]:
+    """Bare symbols the engine itself tracks (OrderMonitor) on live brokers whose books have
+    never loaded -- R3 (one live position per symbol across brokers) still sees them while
+    that broker cannot be read. Empty when every broker has loaded (the usual case)."""
+    stacks = shared.get("stacks") or {}
+    out: set[str] = set()
+    for k in shared.get("held_symbols_unloaded_keys") or ():
+        mon = (stacks.get(k) or {}).get("order_monitor")
+        if mon is not None:
+            out |= {p.symbol.split(":")[-1] for p in mon.get_monitored()}
+    return out
+
+
+def _live_stack_or_reject(
+    shared: dict[str, Any], strategy_name: str, segment: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The live stack a LIVE-resolved signal must use, or (None, reason) -- logged as
+    broker_route_rejected -- when its route is unusable or its broker has no stack (e.g. the
+    broker is configured but its stack failed to build). Never another broker's stack."""
+    broker, reason = _resolve_broker(shared, strategy_name, False)
+    stack = None
+    if reason is None:
+        stack = _pick_stack(shared, False, broker)
+        if stack is None:
+            reason = f"no live stack for broker {broker or '<primary>'}"
+    if reason is not None:
+        _log.warning(
+            "broker_route_rejected strategy=%s segment=%s reason=%s",
+            strategy_name,
+            segment,
+            reason,
+        )
+        return None, reason
+    return stack, None
+
+
+def _is_stack_key(key: Any) -> bool:
+    return isinstance(key, str) and (key in ("paper", "live") or key.startswith("live:"))
+
+
+def _pick_stack(
+    shared_or_stacks: dict[str, Any], is_paper: bool, broker: str | None = None
+) -> dict[str, Any] | None:
+    """The execution stack for paper, for `broker`'s live stack, or (live, broker=None)
+    the primary live stack -- the legacy (global.json) broker's, `shared["legacy_live_broker"]`,
+    when it exists. Accepts `shared` or the stacks dict itself (no legacy broker known then);
+    None when the stack does not exist (callers fall back to the legacy shared aliases)."""
+    d = shared_or_stacks or {}
+    is_stacks = all(_is_stack_key(k) for k in d)
+    stacks = d if is_stacks else (d.get("stacks") or {})
+    if is_paper:
+        key: str | None = stack_key(True)
+    elif broker is None:
+        key = primary_live_key(stacks, None if is_stacks else d.get("legacy_live_broker"))
+    else:
+        key = stack_key(False, broker)
+    return stacks.get(key) if key is not None else None
+
+
+def _known_live_brokers() -> list[str]:
+    """Registered non-paper broker names; any other exec_broker value is "unknown"."""
+    from src.brokers.registry import list_brokers
+
+    return sorted(set(list_brokers()) - {"paper"})
+
+
+def _reseed_scope(
+    key: str, stacks: Mapping[str, Any], legacy_broker: str | None = None
+) -> dict[str, Any]:
+    """Broker filter kwargs for _reseed_order_monitor / _reseed_pending_entries of stack `key`.
+
+    Paper: {} (paper_trades, unfiltered as before). A live stack reseeds only the `trades` rows
+    its own broker holds, so no real position is ever tracked -- and exited -- by two stacks or
+    by the wrong broker. Rows without a usable stamp belong to the KITE stack, never to
+    whichever stack is primary, because NULL means "kite" everywhere (every row written before
+    routing existed was placed through Kite):
+      * NULL and unknown values (not a registered broker -- consistent with
+        _ensure_live_broker_for_open_positions, which never builds a stack for those);
+      * on a DB without the exec_broker column (migration 089 not applied), every row: the
+        kite stack falls back to the unfiltered query, any other live stack reseeds nothing.
+    With no kite stack those rows are reseeded by NO stack (_report_orphaned_live_rows raises
+    a CRITICAL alert). `stacks` is unused except to keep call sites uniform; the legacy bare
+    "live" key (old fixtures) is the legacy broker's stack.
+    """
+    if stack_is_paper(key):
+        return {}
+    name = stack_broker(key) or legacy_broker or LEGACY_LIVE_BROKER
+    if name != LEGACY_LIVE_BROKER:
+        return {"broker_name": name}
+    return {
+        "broker_name": name,
+        "known_brokers": _known_live_brokers(),
+        "unfiltered_if_no_column": True,
+    }
+
+
+def _monitor_tracking(shared: Mapping[str, Any], tid: str) -> Any:
+    """The OrderMonitor (of any stack) that tracks `tid`, or None. Falls back to the legacy
+    primary alias shared["order_monitor"] when there are no stacks (callers/tests that are
+    not stack-aware). Never assume the primary monitor covers every open position."""
+    monitors = [
+        s.get("order_monitor")
+        for s in (shared.get("stacks") or {}).values()
+        if s.get("order_monitor") is not None
+    ] or [shared.get("order_monitor")]
+    return next((m for m in monitors if m is not None and m.get(tid) is not None), None)
+
+
+def mode_label(key: str) -> str:
+    """CRM `mode_*` dict key for a stack: "paper" or "live" (every live broker shares
+    the legacy "live" counters until per-broker CRM keys exist)."""
+    return "paper" if stack_is_paper(key) else "live"
+
+
+def needed_live_brokers(
+    routes: Mapping[str, Any],
+    seg_paper_mode: Mapping[str, bool],
+    legacy_name: str,
+    locked: bool,
+    any_seg_live: bool,
+) -> list[str]:
+    """Live brokers to build at boot: none when paper_mode_locked; the legacy (global.json)
+    broker when a segment is live or `any_seg_live` (the legacy path needs it); then every
+    usable routed broker in registry order. Deduped, legacy first."""
+    if locked:
+        return []
+    out = [legacy_name] if any_seg_live or not all(seg_paper_mode.values()) else []
+    for r in routes.values():
+        if r.ok and r.broker not in out:
+            out.append(r.broker)
+    return out
 
 
 setup_logging("orchestrator", log_dir=str(_LOGS))
@@ -860,7 +1046,11 @@ async def _refresh_intraday_ohlcv(
                     if _lts >= now - timedelta(minutes=4):
                         return
                 _call_t0 = _time_mod.time()
-                df = await broker.get_ohlcv(f"NSE:{sym}", kite_tf, 2)
+                _fetch = getattr(broker, "get_ohlcv_with_source", None)
+                if _fetch is not None:
+                    df, _src = await _fetch(f"NSE:{sym}", kite_tf, 2)
+                else:
+                    df, _src = await broker.get_ohlcv(f"NSE:{sym}", kite_tf, 2), None
                 _timing["kite_call_s"] += _time_mod.time() - _call_t0
                 _timing["calls"] += 1
                 if df is None or df.empty:
@@ -880,7 +1070,7 @@ async def _refresh_intraday_ohlcv(
                 if last_ts is not None:
                     rows = [r for r in rows if r["ts"] > last_ts]
                 if rows:
-                    await _repo.upsert_candles(sym, tf_key, rows)
+                    await _repo.upsert_candles(sym, tf_key, rows, source=_src)
             except Exception as exc:
                 # 2026-09-21: was a bare silent skip -- with per-symbol calls now
                 # timeout-bounded (see KiteAdapter.get_ohlcv), a failure here is
@@ -1541,20 +1731,28 @@ async def _execute_intraday_signal(
     # This function only ever handles the "intraday" segment, so its paper/live
     # mode is fixed for the whole call (unlike the combined scan loop, which
     # handles multiple segments and must resolve mode per-signal).
-    _stacks = shared.get("stacks", {})
     _is_paper = _resolve_is_paper(shared, crm_ctx, "intraday", strategy_name, paper_mode)
-    _stack = _stacks.get("paper" if _is_paper else "live")
-    # Fall back to the legacy singular shared["lifecycle"]/["order_monitor"] when
-    # shared["stacks"] isn't populated (e.g. callers/tests not yet stack-aware).
-    lifecycle = _stack["lifecycle"] if _stack else shared.get("lifecycle")
-    order_monitor = _stack["order_monitor"] if _stack else shared.get("order_monitor")
+    if _is_paper:
+        _stack = _pick_stack(shared, True)
+        # Fall back to the legacy singular shared["lifecycle"]/["order_monitor"] when
+        # shared["stacks"] isn't populated (e.g. callers/tests not yet stack-aware).
+        lifecycle = _stack["lifecycle"] if _stack else shared.get("lifecycle")
+        order_monitor = _stack["order_monitor"] if _stack else shared.get("order_monitor")
+    else:
+        # Live: only the strategy's own broker's stack (R1) -- never the primary alias.
+        _stack, _route_reject = _live_stack_or_reject(shared, strategy_name, "intraday")
+        if _stack is None:
+            _intraday_refusal(shared, sym, "broker_route_rejected", str(_route_reject))
+            return None
+        lifecycle = _stack["lifecycle"]
+        order_monitor = _stack["order_monitor"]
 
     # Fail CLOSED: never place an entry until the held-position set has been loaded
     # from the DB (paper) / broker (live) at least once. Right after a launcher restart
     # both order_monitor and held_symbols are empty, so we cannot tell whether this
     # symbol is already open — refuse rather than risk a duplicate (the restart-window
     # re-entry bug). The flag is set by the reconciliation loop on its first pass.
-    if not shared.get("held_symbols_loaded"):
+    if _held_symbols_unknown_for(shared, _is_paper, _stack):
         _log.warning("intraday_blocked_unreconciled sym=%s strategy=%s", sym, strategy_name)
         _intraday_refusal(shared, sym, "held_positions_not_loaded", "fail-closed after restart")
         return None
@@ -1576,6 +1774,8 @@ async def _execute_intraday_signal(
     _held_syms = shared.get(_held_key)
     if _held_syms is None:
         _held_syms = shared.get("held_symbols") or set()
+    if not _is_paper:
+        _held_syms = _held_syms | _unloaded_brokers_tracked_symbols(shared)
     if _norm_sym in _om_syms or _norm_sym in _held_syms:
         _intraday_refusal(shared, sym, "already_held_or_open_order")
         _log.info("intraday_blocked_already_held symbol=%s strategy=%s", sym, strategy_name)
@@ -1671,6 +1871,23 @@ async def _execute_intraday_signal(
         _refresh_options_risk_budget(crm_ctx)
         _risk_cap = intraday_risk_cap(crm_ctx)
         _avail_cash = float(shared.get("available_cash", crm_ctx.current_equity))
+        if not _is_paper and shared.get("per_broker_equity"):
+            # Per-broker risk: size on the routed broker's OWN cap and cash; unknown => no trade.
+            from src.risk.crm import broker_view
+
+            _bkey = _live_key_for(shared, strategy_name)
+            _funds = _broker_funds(shared, _bkey)
+            if _funds is None:
+                _log.warning(
+                    "intraday_blocked_broker_equity_unknown sym=%s strategy=%s key=%s",
+                    sym,
+                    strategy_name,
+                    _bkey,
+                )
+                _intraday_refusal(shared, sym, "broker_equity_unavailable", _bkey)
+                return None
+            _risk_cap = intraday_risk_cap(broker_view(crm_ctx, _bkey))
+            _avail_cash = _funds[1]
         _intended = intraday_position_size(entry, sl, _risk_cap, _avail_cash * crm_ctx.mis_leverage)
         # Per-stock daily-trend caution: shrink size when this intraday breakout fights
         # the stock's own 50/200 DMA. Soft (size cut), fail-open on missing daily data.
@@ -2249,12 +2466,24 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
         # Open risk is a risk budget, so it IS mode-split (paper never uses live's).
         try:
             _mor: dict[str, float] = {}
-            for _m, s in _stacks.items():
+            # Keyed by CRM mode label: every live stack sums into the legacy "live"
+            # budget (identical to today with one live stack; per-broker keys come later).
+            _pbe = bool(shared.get("per_broker_equity"))
+            for _k, s in _stacks.items():
+                _m = mode_label(_k)
+                # Per-broker risk also keeps each live stack's own bucket ("live:<broker>").
+                _labels = (_m, _k) if _pbe and _k.startswith("live:") else (_m,)
+                if _pbe and _k.startswith("live:"):
+                    # A broker with nothing open has 0 open risk -- never absent, which
+                    # broker_view would read as the COMBINED live bucket.
+                    for _key0 in (_k, f"{_k}:intraday", f"{_k}:swing"):
+                        _mor.setdefault(_key0, 0.0)
                 for p in s["order_monitor"].get_monitored():
                     _r = _position_open_risk(p)
                     _eng = "intraday" if str(p.product).upper() == "MIS" else "swing"
-                    _mor[_m] = _mor.get(_m, 0.0) + _r
-                    _mor[f"{_m}:{_eng}"] = _mor.get(f"{_m}:{_eng}", 0.0) + _r
+                    for _lb in _labels:
+                        _mor[_lb] = _mor.get(_lb, 0.0) + _r
+                        _mor[f"{_lb}:{_eng}"] = _mor.get(f"{_lb}:{_eng}", 0.0) + _r
             crm_ctx.mode_open_risk_rupees = _mor
         except Exception:
             pass
@@ -2287,7 +2516,10 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
             # only when some segment is actually live — never scan `trades` for an
             # all-paper deployment. Fully independent counters per mode (confirmed
             # with user): a paper loss must never trip a real-money circuit breaker.
-            _modes_to_fetch = ["paper"] + (["live"] if "live" in _stacks else [])
+            # Mode labels, not stack keys: the `trades` table holds every live broker's rows.
+            _modes_to_fetch = ["paper"] + (
+                ["live"] if any(not stack_is_paper(k) for k in _stacks) else []
+            )
             _llm_intraday_db_count = 0
             for _mode in _modes_to_fetch:
                 _table = "paper_trades" if _mode == "paper" else "trades"
@@ -2339,6 +2571,8 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
                     # own P&L). _enforce_intraday_daily_loss_breaker above replaces it
                     # for the main loop; the old function is kept for its own tests
                     # and as the legacy/"other"-segment mechanism.
+            if shared.get("per_broker_equity"):
+                await _refresh_per_broker_counters(shared, crm_ctx, pe, _stacks, _name_to_engine)
             # llm_intraday_agent's own max_trades_per_day counter was in-memory only,
             # so a mid-day restart reset it to 0 and the cap silently reopened -- the
             # identical failure this function exists to prevent for the CRM counters.
@@ -2358,6 +2592,56 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
     _om_fallback = shared.get("order_monitor")
     if _om_fallback is not None:
         crm_ctx.open_position_count = len(_om_fallback.get_monitored())
+
+
+async def _refresh_per_broker_counters(
+    shared: dict[str, Any],
+    crm_ctx: Any,
+    pe: Any,
+    stacks: Mapping[str, Any],
+    name_to_engine: dict[str, str],
+) -> None:
+    """Per-broker risk (system.per_broker_equity): the live counters of each live stack,
+    from the `trades` rows its broker holds, under "live:<broker>" (+ ":<engine>") keys, and
+    that broker's own intraday daily-loss breaker. A failed read drops the broker's keys, so
+    CRM falls back to the combined "live" counters (never to zero)."""
+    from src.risk.crm import resolve_engine_counts
+
+    for _key in live_stacks(stacks):
+        _broker = stack_broker(_key)
+        if not _broker:
+            continue
+        try:
+            c = await pe.daily_risk_counters(table="trades", exec_broker=_broker)
+            _ic = await pe.daily_risk_counters(table="trades", product="MIS", exec_broker=_broker)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("per_broker_counters_refresh_failed key=%s err=%s", _key, exc)
+            for _d in (
+                crm_ctx.mode_new_trades_today,
+                crm_ctx.mode_open_position_count,
+                crm_ctx.mode_daily_loss_so_far,
+                crm_ctx.mode_consecutive_losses,
+                crm_ctx.mode_intraday_daily_loss_so_far,
+            ):
+                _d.pop(_key, None)
+            for _eng in ("intraday", "swing"):
+                crm_ctx.mode_engine_trades_today.pop(f"{_key}:{_eng}", None)
+                crm_ctx.mode_engine_open_positions.pop(f"{_key}:{_eng}", None)
+            continue
+        crm_ctx.mode_new_trades_today[_key] = int(c["new_trades_today"])
+        crm_ctx.mode_open_position_count[_key] = int(c["open_position_count"])
+        crm_ctx.mode_daily_loss_so_far[_key] = float(c["daily_loss_so_far"])
+        crm_ctx.mode_consecutive_losses[_key] = int(c["consecutive_losses"])
+        crm_ctx.mode_intraday_daily_loss_so_far[_key] = float(_ic["daily_loss_so_far"])
+        _ps = {str(k): int(v) for k, v in c.get("per_strategy", {}).items()}
+        _ops = {str(k): int(v) for k, v in c.get("open_per_strategy", {}).items()}
+        _it, _st = resolve_engine_counts(_ps, name_to_engine)
+        _io, _so = resolve_engine_counts(_ops, name_to_engine)
+        crm_ctx.mode_engine_trades_today[f"{_key}:intraday"] = _it
+        crm_ctx.mode_engine_trades_today[f"{_key}:swing"] = _st
+        crm_ctx.mode_engine_open_positions[f"{_key}:intraday"] = _io
+        crm_ctx.mode_engine_open_positions[f"{_key}:swing"] = _so
+        await _enforce_intraday_daily_loss_breaker(shared, crm_ctx, _key, pe)
 
 
 def _held_symbols_from_holdings(holdings: Any) -> set[str]:
@@ -2409,7 +2693,17 @@ async def _enforce_intraday_daily_loss_breaker(
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
 
-    cap = float(getattr(crm_ctx, "max_intraday_daily_loss", 0.0) or 0.0)
+    _per_broker = mode.startswith("live:")  # only with system.per_broker_equity on
+    if _per_broker:
+        # That broker's own cap (its equity x capital.json %); none => equity unknown, and
+        # CRM G1 already blocks the broker's entries.
+        cap = float(
+            (getattr(crm_ctx, "mode_rupee_caps", {}) or {})
+            .get(mode, {})
+            .get("max_intraday_daily_loss", 0.0)
+        )
+    else:
+        cap = float(getattr(crm_ctx, "max_intraday_daily_loss", 0.0) or 0.0)
     loss = float(getattr(crm_ctx, "mode_intraday_daily_loss_so_far", {}).get(mode, 0.0))
     if cap <= 0 or loss < cap:
         return
@@ -2419,6 +2713,33 @@ async def _enforce_intraday_daily_loss_breaker(
         return  # already handled today — do not re-fire every cycle
     shared[_flag] = today
     _log = get_logger("orchestrator")
+    if _per_broker:
+        # Ruling (d): alert as before AND block new entries for THIS broker until the next
+        # trading day (CRM G1 reads the same dict). Never auto-flatten real positions here.
+        _broker = mode[len("live:") :]
+        shared.setdefault("entries_blocked_brokers", {})[_broker] = today
+        _log.error(
+            "intraday_daily_loss_cap_breached_LIVE broker=%s loss=%.0f cap=%.0f "
+            "-- new entries on this broker blocked until the next trading day",
+            _broker,
+            loss,
+            cap,
+        )
+        try:
+            from src.infrastructure.operator_alerts import raise_alert as _op_alert
+
+            _op_alert(
+                f"LIVE intraday daily-loss cap breached on broker {_broker}: loss "
+                f"Rs{loss:.0f} >= cap Rs{cap:.0f}. ALL new entries on {_broker} are blocked "
+                "until the next trading day (CRM G1), but its open LIVE positions were NOT "
+                "auto-closed -- review and close manually.",
+                source=f"intraday_daily_loss_live:{_broker}",
+                tier="CRITICAL",
+                dedupe_seconds=4 * 3600,
+            )
+        except Exception as exc:  # noqa: BLE001 — the ERROR log above already fired
+            _log.error("intraday_daily_loss_live_alert_failed err=%s", exc)
+        return
     if mode == "live":
         _log.error("intraday_daily_loss_cap_breached_LIVE loss=%.0f cap=%.0f", loss, cap)
         try:
@@ -2436,6 +2757,8 @@ async def _enforce_intraday_daily_loss_breaker(
         except Exception as exc:  # noqa: BLE001 — the ERROR log above already fired
             _log.error("intraday_daily_loss_live_alert_failed err=%s", exc)
         return
+    if mode != "paper":
+        return  # never let an unexpected label reach the paper flatten below
     if pe is None:
         return
     try:
@@ -2858,7 +3181,9 @@ async def _intraday_signal_scan_loop(
                         # backtest → live ride matches Pine (partial/BE/trail/reversal).
                         _ex = shared.get("intraday_exit_state", {}).get(sym)
                         if _ex is not None:
-                            _om = shared.get("order_monitor")
+                            # The stack whose monitor tracks the trade (any broker), not
+                            # the primary alias -- else a live position looks "closed".
+                            _om = _monitor_tracking(shared, _ex["tid"])
                             _tid2 = _ex["tid"]
                             if _om is None or _om.get(_tid2) is None:
                                 # Position already closed (SL/target via 2s monitor) — drop it.
@@ -5802,14 +6127,21 @@ async def _execute_swing_signal(
     crm_ctx = shared.get("crm_ctx")
     # This function only ever handles the "swing" segment, so its paper/live mode
     # is fixed for the whole call.
-    _stacks = shared.get("stacks", {})
     paper_mode = bool(shared.get("paper_mode", True))
     _is_paper = _resolve_is_paper(shared, crm_ctx, "swing", strategy_name, paper_mode)
-    _stack = _stacks.get("paper" if _is_paper else "live")
-    # Fall back to the legacy singular shared["lifecycle"]/["order_monitor"] when
-    # shared["stacks"] isn't populated (e.g. callers/tests not yet stack-aware).
-    lifecycle = _stack["lifecycle"] if _stack else shared.get("lifecycle")
-    order_monitor = _stack["order_monitor"] if _stack else shared.get("order_monitor")
+    if _is_paper:
+        _stack = _pick_stack(shared, True)
+        # Fall back to the legacy singular shared["lifecycle"]/["order_monitor"] when
+        # shared["stacks"] isn't populated (e.g. callers/tests not yet stack-aware).
+        lifecycle = _stack["lifecycle"] if _stack else shared.get("lifecycle")
+        order_monitor = _stack["order_monitor"] if _stack else shared.get("order_monitor")
+    else:
+        # Live: only the strategy's own broker's stack (R1) -- never the primary alias.
+        _stack, _route_reject = _live_stack_or_reject(shared, strategy_name, "swing")
+        if _stack is None:
+            return None, entry, sl, target, "broker_route_rejected", []
+        lifecycle = _stack["lifecycle"]
+        order_monitor = _stack["order_monitor"]
 
     if crm is None or crm_ctx is None or lifecycle is None:
         _swing_log.warning("swing_blocked_no_risk_engine sym=%s strategy=%s", sym, strategy_name)
@@ -5817,7 +6149,7 @@ async def _execute_swing_signal(
 
     # Fail CLOSED until the held-position set has been loaded once (first reconciliation).
     # Prevents restart-window duplicates when order_monitor/held_symbols are still empty.
-    if not shared.get("held_symbols_loaded"):
+    if _held_symbols_unknown_for(shared, _is_paper, _stack):
         _swing_log.warning("swing_blocked_unreconciled sym=%s strategy=%s", sym, strategy_name)
         return None, entry, sl, target, "unreconciled", []
     # Skip if already holding this symbol
@@ -5835,6 +6167,8 @@ async def _execute_swing_signal(
     _held_syms = shared.get(_held_key)
     if _held_syms is None:
         _held_syms = shared.get("held_symbols") or set()
+    if not _is_paper:
+        _held_syms = _held_syms | _unloaded_brokers_tracked_symbols(shared)
     if _norm_sym in _om_syms or _norm_sym in _held_syms:
         return None, entry, sl, target, "already_held", []
 
@@ -5862,7 +6196,27 @@ async def _execute_swing_signal(
     crm_ctx.current_equity = float(shared.get("current_equity", crm_ctx.current_equity))
     _refresh_options_risk_budget(crm_ctx)
     _avail_cash = float(shared.get("available_cash", crm_ctx.current_equity))
-    _intended = intraday_position_size(entry, sl, swing_risk_cap(_risk_pct, crm_ctx), _avail_cash)
+    _sizing_ctx = crm_ctx
+    _bkey: str | None = None
+    if not _is_paper and shared.get("per_broker_equity"):
+        # Per-broker risk: size on the routed broker's OWN cap and cash; unknown => no trade.
+        from src.risk.crm import broker_view
+
+        _bkey = _live_key_for(shared, strategy_name)
+        _funds = _broker_funds(shared, _bkey)
+        if _funds is None:
+            _swing_log.warning(
+                "swing_blocked_broker_equity_unknown sym=%s strategy=%s key=%s",
+                sym,
+                strategy_name,
+                _bkey,
+            )
+            return None, entry, sl, target, "broker_equity_unavailable", []
+        _sizing_ctx = broker_view(crm_ctx, _bkey)
+        _avail_cash = _funds[1]
+    _intended = intraday_position_size(
+        entry, sl, swing_risk_cap(_risk_pct, _sizing_ctx), _avail_cash
+    )
     if _intended <= 0:
         return None, entry, sl, target, "sizing_zero", []
 
@@ -5914,7 +6268,7 @@ async def _execute_swing_signal(
         shared.get("backtest_summary", {}).get(strategy_name, {}).get("passed", True)
     )
     # Post-fill cap must equal the cap this trade was sized with (see TradeRecord).
-    crm_signal.meta["max_risk_rupees"] = swing_risk_cap(_risk_pct, crm_ctx)
+    crm_signal.meta["max_risk_rupees"] = swing_risk_cap(_risk_pct, _sizing_ctx)
     crm_ctx.current_equity = float(shared.get("current_equity", crm_ctx.current_equity))
     _refresh_options_risk_budget(crm_ctx)
     if strategy_name == "llm_swing_agent":
@@ -6093,6 +6447,10 @@ async def _execute_swing_signal(
     _required = float(qty) * float(entry)
     _committed = float(shared.get("swing_cash_committed_today", 0.0))
     _free_cash = float(shared.get("available_cash", 0.0))
+    if _bkey is not None:
+        # Per-broker risk: the fallback (margin read fails below) is THIS broker's last cash,
+        # never the primary's; unknown => 0 (cannot fund => never a real order).
+        _free_cash = (_broker_funds(shared, _bkey) or (0.0, 0.0))[1]
     _broker_for_margin = getattr(lifecycle, "_broker", None)
     if _broker_for_margin is not None:
         try:
@@ -6133,7 +6491,7 @@ async def _execute_swing_signal(
         #
         # One-directional by construction: this only ever demotes live -> paper. There
         # is no path back, and a signal already resolved to paper just blocks as before.
-        _paper_stack = _stacks.get("paper")
+        _paper_stack = _pick_stack(shared, True)
         _paper_lifecycle = _paper_stack.get("lifecycle") if _paper_stack else None
         if not _is_paper and _paper_lifecycle is not None:
             _swing_log.warning(
@@ -8223,6 +8581,323 @@ async def _equity_loop(
         await asyncio.sleep(60.0)
 
 
+_EQUITY_FETCH_TIMEOUT_S = 10.0  # same bound as the swing delivery-cash margin read
+
+
+async def _fetch_live_stack_equity(shared: dict[str, Any], key: str, broker: Any) -> bool:
+    """Per-broker risk (system.per_broker_equity): one live stack's equity from ITS broker.
+
+    Success: shared["equity_by_key"][key] / ["cash_by_key"][key] are refreshed, the first
+    broker's baseline (["equity_baseline_by_key"]: the 25% floor and the drawdown staircase
+    measure from it) is loaded once from the DB, or stored there from this fetch when the
+    broker has none (_persisted_equity_baseline; restarts never reset it), and
+    src.risk.budget gets the per-key equity. Failure (raise, timeout, equity <= 0): the
+    key is REMOVED from both maps -- CRM G1 then blocks new entries for that broker until
+    a fetch succeeds (fail safe) -- and a CRITICAL operator alert is raised."""
+    from src.risk.budget import clear_current_equity, set_current_equity
+
+    eq_map = shared.setdefault("equity_by_key", {})
+    cash_map = shared.setdefault("cash_by_key", {})
+    base_map = shared.setdefault("equity_baseline_by_key", {})
+    try:
+        margin = await asyncio.wait_for(broker.get_margins(), timeout=_EQUITY_FETCH_TIMEOUT_S)
+        equity = float(margin.equity)
+        cash = float(margin.available_cash)
+        if not equity > 0:
+            raise ValueError(f"non-positive equity {equity}")
+    except Exception as exc:  # noqa: BLE001 -- fail safe: no equity => no entries
+        eq_map.pop(key, None)
+        cash_map.pop(key, None)
+        clear_current_equity(key)
+        _log.critical("broker_equity_fetch_failed key=%s err=%s -- new entries blocked", key, exc)
+        try:
+            from src.infrastructure import operator_alerts as _oa
+
+            _oa.raise_alert(
+                f"Equity fetch failed for live broker {stack_broker(key) or key}: NO new "
+                f"entries on it until a fetch succeeds ({str(exc)[:120]})",
+                source=f"broker_equity_fetch_failed:{key}",
+                tier="CRITICAL",
+                dedupe_seconds=3600,
+            )
+        except Exception as _ae:  # noqa: BLE001 -- the CRITICAL log already fired
+            _log.error("broker_equity_alert_failed key=%s err=%s", key, _ae)
+        return False
+    eq_map[key] = equity
+    cash_map[key] = cash
+    if key not in base_map:
+        baseline = await _persisted_equity_baseline(shared.get("db_pool"), key, equity)
+        if baseline is not None:
+            base_map[key] = baseline
+    set_current_equity(equity, key=key)
+    return True
+
+
+async def _persisted_equity_baseline(pool: Any, key: str, equity: float) -> float | None:
+    """The broker's drawdown baseline (migration 092): the stored row, else `equity` stored
+    now as the first-ever baseline. A restart therefore never resets a broker's drawdown;
+    only an operator does (delete/update the row, restart). No DB pool: the in-process
+    first fetch (no persistence -- logged). DB error: None -- the key stays without a
+    baseline, CRM G1 blocks that broker's entries and the next fetch retries (fail safe)."""
+    if pool is None:
+        _log.warning("broker_equity_baseline_not_persisted key=%s -- no DB pool", key)
+        return equity
+    try:
+        stored = await pool.fetchval(
+            "WITH ins AS (INSERT INTO broker_equity_baseline (stack_key, baseline_equity) "
+            "VALUES ($1, $2) ON CONFLICT (stack_key) DO NOTHING RETURNING baseline_equity) "
+            "SELECT baseline_equity FROM ins UNION ALL "
+            "SELECT baseline_equity FROM broker_equity_baseline WHERE stack_key = $1 LIMIT 1",
+            key,
+            round(equity, 2),
+        )
+        if stored is None or not float(stored) > 0:
+            raise ValueError(f"no usable stored baseline ({stored!r})")
+        return float(stored)
+    except Exception as exc:  # noqa: BLE001 -- fail safe: no baseline => no entries
+        _log.critical(
+            "broker_equity_baseline_unavailable key=%s err=%s -- new entries blocked", key, exc
+        )
+        try:
+            from src.infrastructure import operator_alerts as _oa
+
+            _oa.raise_alert(
+                f"Drawdown baseline unavailable for live broker {stack_broker(key) or key}: NO "
+                f"new entries on it until it loads ({str(exc)[:120]})",
+                source=f"broker_equity_baseline_unavailable:{key}",
+                tier="CRITICAL",
+                dedupe_seconds=3600,
+            )
+        except Exception as _ae:  # noqa: BLE001 -- the CRITICAL log already fired
+            _log.error("broker_equity_baseline_alert_failed key=%s err=%s", key, _ae)
+        return None
+
+
+def _broker_funds(shared: Mapping[str, Any], key: str) -> tuple[float, float] | None:
+    """(equity, available_cash) of live stack `key` from the last successful per-broker
+    fetch, or None when either is unknown (callers fail closed)."""
+    eq = (shared.get("equity_by_key") or {}).get(key)
+    cash = (shared.get("cash_by_key") or {}).get(key)
+    if eq is None or cash is None:
+        return None
+    return float(eq), float(cash)
+
+
+async def _per_broker_equity_loop(shared: dict[str, Any], stop: asyncio.Event) -> None:
+    """Every 60 s (the primary _equity_loop's cadence), each live stack's own equity."""
+    while not stop.is_set():
+        await asyncio.sleep(60.0)
+        for _key, _stack in live_stacks(shared.get("stacks") or {}).items():
+            await _fetch_live_stack_equity(shared, _key, _stack["broker"])
+
+
+def _live_key_for(shared: Mapping[str, Any], strategy_name: str) -> str:
+    """Stack key of the live broker a LIVE-resolved strategy routes to (R1, legacy broker
+    when unrouted) -- the per-broker risk key CRM's mode_of() yields for it."""
+    broker, _reason = _resolve_broker(shared, strategy_name, False)
+    return stack_key(False, broker)
+
+
+def _reconcile_targets(
+    shared: Mapping[str, Any], stacks: Mapping[str, Any], fallback_broker: Any
+) -> list[tuple[str | None, Any, Any]]:
+    """[(stack key, broker, order_monitor)] to reconcile `trades` against: every live stack,
+    the primary (legacy broker's) first. With no live stack: [(None, fallback_broker, None)],
+    exactly the legacy single-broker behaviour (unfiltered rows, no monitor)."""
+    live = live_stacks(stacks)
+    if not live:
+        return [(None, fallback_broker, None)]
+    primary = primary_live_key(stacks, shared.get("legacy_live_broker"))
+    keys = [primary] + [k for k in live if k != primary] if primary else list(live)
+    return [(k, live[k]["broker"], live[k].get("order_monitor")) for k in keys]
+
+
+def _reconciler_for(key: str | None, broker: Any, pool: Any) -> Any:
+    """A Reconciler restricted to the `trades` rows `key`'s broker holds (exec_broker; NULL and
+    unregistered values belong to kite, as for the reseed). None/bare "live" = unfiltered."""
+    from src.supervisor.reconciler import Reconciler
+
+    name = stack_broker(key) if key else None
+    known = _known_live_brokers() if name == LEGACY_LIVE_BROKER else None
+    return Reconciler(broker, pool, broker_name=name, known_brokers=known)
+
+
+async def _reconcile_live_brokers(
+    shared: dict[str, Any],
+    stacks: Mapping[str, Any],
+    fallback_broker: Any,
+    pool: Any,
+    trade_repo: Any,
+    alert_manager: Any,
+    *,
+    call_timeout: float,
+    fetch_timeout: float | None = None,
+    ghost_timeout: float | None = None,
+    suppress_ghost_errors: bool = True,
+) -> list[dict[str, Any]]:
+    """One reconcile per live broker (Phase 2 task 9): its own rows vs its own positions and
+    holdings, ghosts auto-closed through ITS broker and monitor only. Returns one dict per
+    broker reconciled ({key, broker, db_open, result, auto_closed}), primary first. A failure
+    of the PRIMARY raises (the caller skips the cycle, as before); another broker's failure
+    is logged ERROR and that broker is skipped this cycle (stale ghost alerts then stay)."""
+    out: list[dict[str, Any]] = []
+    failed = False
+    for i, (key, brk, monitor) in enumerate(_reconcile_targets(shared, stacks, fallback_broker)):
+        rec = _reconciler_for(key, brk, pool)
+        try:
+            if fetch_timeout is None:
+                db_open = await rec._fetch_db_open_trades()
+            else:
+                db_open = await asyncio.wait_for(rec._fetch_db_open_trades(), timeout=fetch_timeout)
+            res = await asyncio.wait_for(rec.reconcile(db_open), timeout=call_timeout)
+        except Exception as exc:
+            if i == 0:
+                raise
+            failed = True
+            _log.error("reconciliation_broker_failed key=%s err=%s -- skipped this cycle", key, exc)
+            continue
+        out.append(
+            {"key": key, "broker": brk, "monitor": monitor, "db_open": db_open, "result": res}
+        )
+    all_ghosts = {
+        g.agent_trade_id
+        for r in out
+        for g in r["result"].gaps
+        if g.kind == "GHOST_DB_TRADE" and g.agent_trade_id
+    }
+    for r in out:
+        r["auto_closed"] = 0
+        coro = _auto_close_ghost_trades(
+            r["result"],
+            r["broker"],
+            trade_repo,
+            r.pop("monitor"),
+            alert_manager=alert_manager,
+            current_ghost_ids=all_ghosts,
+            resolve_stale=not failed,
+        )
+        if suppress_ghost_errors:
+            with contextlib.suppress(Exception):
+                r["auto_closed"] = await coro
+        elif ghost_timeout is None:
+            r["auto_closed"] = await coro
+        else:
+            r["auto_closed"] = await asyncio.wait_for(coro, timeout=ghost_timeout)
+    return out
+
+
+def _held_from_positions(raw: Any) -> set[str]:
+    """Bare symbols with a nonzero position in a broker's day book (get_positions(): a
+    list[Position], or a raw {"net": [...]} dict tolerated defensively)."""
+    net: list[Any] = (raw.get("net", []) or []) if isinstance(raw, dict) else list(raw or [])
+    out: set[str] = set()
+    for p in net:
+        s = getattr(p, "symbol", None) or (p.get("tradingsymbol") if isinstance(p, dict) else None)
+        q = getattr(p, "quantity", None)
+        if q is None and isinstance(p, dict):
+            q = p.get("quantity") or p.get("net_quantity")
+        if s and float(q or 0) != 0:
+            out.add(s.split(":")[-1])
+    return out
+
+
+async def _held_symbols_live_union(
+    shared: dict[str, Any], targets: list[tuple[str | None, Any, Any]], *, call_timeout: float
+) -> tuple[set[str], set[str], bool]:
+    """(union of every live broker's held symbols, the primary's own set, all_loaded).
+
+    R3: the same symbol must never be held by two live strategies at once, across brokers,
+    so the entry guard's live set is the UNION over brokers. Each broker: day positions plus
+    delivery holdings; a holdings failure keeps that broker's last known set (never shrink the
+    guard). A PRIMARY positions failure raises (the cycle is skipped, as before); another
+    broker's keeps its last known set and `all_loaded` is False until it has loaded once, so
+    the caller keeps entries fail-closed until every live broker's books were read."""
+    last: dict[Any, set[str]] = shared.setdefault("held_symbols_live_by_key", {})
+    union: set[str] = set()
+    primary: set[str] = set()
+    all_loaded = True
+    unloaded: set[Any] = set()
+    for i, (key, brk, _mon) in enumerate(targets):
+        try:
+            held = _held_from_positions(await asyncio.wait_for(brk.get_positions(), call_timeout))
+        except Exception as exc:
+            if i == 0:
+                raise
+            _log.error("live_positions_fetch_err key=%s %s", key, str(exc)[:80])
+            if key not in last:
+                all_loaded = False
+                unloaded.add(key)
+                _alert_held_symbols_not_loaded(key, exc)
+            union |= last.get(key, set())
+            continue
+        try:
+            held |= _held_symbols_from_holdings(
+                await asyncio.wait_for(brk.get_holdings(), call_timeout)
+            )
+        except Exception as _he:
+            held |= last.get(key, set())
+            _log.error("live_holdings_fetch_err %s", str(_he)[:80])
+        last[key] = held
+        union |= held
+        if i == 0:
+            primary = held
+    # Live entries on these brokers stay fail-closed (_held_symbols_unknown_for); paper and
+    # the brokers that did load trade normally.
+    shared["held_symbols_unloaded_keys"] = unloaded
+    return union, primary, all_loaded
+
+
+def _alert_held_symbols_not_loaded(key: Any, exc: BaseException) -> None:
+    """One CRITICAL operator alert per broker per hour while its books have never loaded."""
+    try:
+        from src.infrastructure import operator_alerts as _oa
+
+        _oa.raise_alert(
+            f"Live broker {stack_broker(key) or key}: positions could not be read since "
+            f"start -- NO new live entries on it until they load (paper and other brokers "
+            f"unaffected). Check its session/login ({str(exc)[:120]})",
+            source=f"held_symbols_not_loaded:{key}",
+            tier="CRITICAL",
+            dedupe_seconds=3600,
+        )
+    except Exception as _ae:  # noqa: BLE001 -- the ERROR log already fired
+        _log.error("held_symbols_alert_failed key=%s err=%s", key, _ae)
+
+
+def _reconciliation_log_fields(
+    runs: list[dict[str, Any]], held_primary: set[str], held_paper: set[str]
+) -> tuple[int, int, int, str, str]:
+    """reconciliation_log values: (db_positions, broker_positions, matched, gaps JSON,
+    by_broker JSON). The top-level counts are the PRIMARY broker's, as before (dashboard
+    compatible); `gaps` is the primary's list unchanged followed by every other broker's gaps
+    tagged with "broker" (so a second broker's ghost is still visible on the dashboard);
+    `by_broker` maps each broker to its own counts and gaps."""
+    import json as _json
+
+    def _gap(g: Any) -> dict[str, Any]:
+        return {"kind": g.kind, "symbol": g.symbol, "broker_qty": g.broker_qty, "db_qty": g.db_qty}
+
+    primary = runs[0]
+    gaps = [_gap(g) for g in primary["result"].gaps]
+    by_broker: dict[str, Any] = {}
+    for r in runs:
+        name = stack_broker(r["key"]) if r["key"] else None
+        label = name or "legacy"
+        if r is not primary:
+            gaps += [{**_gap(g), "broker": label} for g in r["result"].gaps]
+        n_db = len(r["db_open"])
+        by_broker[label] = {
+            "db_positions": n_db,
+            "matched": max(n_db - len(r["result"].gaps), 0),
+            "auto_closed": r.get("auto_closed", 0),
+            "gaps": [_gap(g) for g in r["result"].gaps],
+        }
+    dn = len(primary["db_open"])
+    bn = len(held_primary) + len(held_paper)
+    matched = max(dn - len(primary["result"].gaps), 0)
+    return dn, bn, matched, _json.dumps(gaps), _json.dumps(by_broker)
+
+
 async def _price_truth_phase2_sweep(
     price_truth: Any,
     positions: list[Any],
@@ -8274,10 +8949,17 @@ async def _auto_close_ghost_trades(
     trade_repo: Any,
     order_monitor: Any,
     alert_manager: Any = None,
+    current_ghost_ids: set[str] | None = None,
+    resolve_stale: bool = True,
 ) -> int:
     """Close any live DB trade the broker has already fully exited outside the
     bot (GHOST_DB_TRADE), using the broker's own order history as the exit —
     never guessed, never left silently open.
+
+    Per-broker reconciliation calls this once per live broker with THAT broker and its
+    stack's monitor; `current_ghost_ids` is then every broker's ghost ids, so one broker's
+    run never resolves another broker's still-active ghost alert, and `resolve_stale` is
+    False when some broker could not be reconciled this cycle (its ghosts are unknown).
 
     Runs once, blocking, before the main loop starts, and every reconciliation
     cycle after that (see call sites) — a stale-open live position is a risk
@@ -8301,8 +8983,12 @@ async def _auto_close_ghost_trades(
         # (found 2026-09-08: CGCL's ghost alerts from before the reconciliation
         # fix stayed active forever once the fix landed and it stopped being
         # flagged as a gap at all — nothing ever told the alert to clear).
-        _current_ghost_ids = {g.agent_trade_id for g in ghosts}
-        for _a in list(alert_manager.active()):
+        _current_ghost_ids = (
+            current_ghost_ids
+            if current_ghost_ids is not None
+            else {g.agent_trade_id for g in ghosts}
+        )
+        for _a in list(alert_manager.active()) if resolve_stale else []:
             if (
                 _a.source.startswith("ghost:")
                 and _a.source[len("ghost:") :] not in _current_ghost_ids
@@ -8806,56 +9492,209 @@ def _load_closed_trades_log() -> list[dict[str, Any]]:
 
 
 async def _ensure_live_broker_for_open_positions(
-    broker_live: Any, db_pool: Any, create: Any
-) -> tuple[Any, list[str]]:
+    live_brokers: dict[str, Any], db_pool: Any, create: Any, legacy_name: str
+) -> dict[str, list[str]]:
     """A position outlives the switch that opened it.
 
-    `broker_live` is decided at boot from TODAY's paper/live switches, but a real position stays
-    open across restarts and config edits. Flip the swing agent to "paper" the day after it took a
-    live trade and there was no live broker at all: no OrderMonitor, no lifecycle, and the
+    The live brokers are decided at boot from TODAY's paper/live switches, but a real position
+    stays open across restarts and config edits. Flip the swing agent to "paper" the day after it
+    took a live trade and there was no live broker at all: no OrderMonitor, no lifecycle, and the
     reconciler compared the real holding to the PAPER adapter and shouted GHOST_DB_TRADE
     (2026-09-28, LAURUSLABS: 14 real shares, GTT active, nothing watching). The config switch only
     governs NEW entries (_resolve_is_paper); anything still open in `trades` -- the live table --
-    must be monitored by a live broker regardless.
+    must be monitored by its own live broker regardless (`exec_broker`, NULL = "kite").
 
-    Returns (broker_live, [agent_trade_id, ...] of the open live trades that forced it).
-    If the DB cannot be read we cannot prove there is nothing to protect, so build it anyway.
+    Adds `create(name)` to `live_brokers` (in place) for every broker that holds open live trades
+    but was not built, and returns {name: [agent_trade_id, ...]} of the trades that forced each.
+    NULL `exec_broker` (and an older DB without the column) means "kite": every row written
+    before the column existed was placed through Kite. A value that is not a registered live
+    broker is never built (CRITICAL log + alert); like NULL, those trades force "kite" -- the
+    stack that reseeds unstamped/unknown rows (_reseed_scope) -- so they are still tracked. If the DB cannot be read we cannot prove there is nothing to
+    protect, so the legacy broker is built anyway.
     """
-    if broker_live is not None:
-        return broker_live, []
-    open_ids: list[str] = []
+    from src.brokers.registry import list_brokers
+
+    _valid = set(list_brokers()) - {"paper"}
+    _open_sql = "FROM trades WHERE order_state NOT IN ('CLOSED','REJECTED','CANCELLED','TIMED_OUT')"
+    by_broker: dict[str, list[str]] = {}
     if db_pool is not None:
         try:
             async with db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT agent_trade_id FROM trades "
-                    "WHERE order_state NOT IN ('CLOSED','REJECTED','CANCELLED','TIMED_OUT')"
-                )
-            open_ids = [str(r["agent_trade_id"]) for r in rows]
+                try:
+                    rows = await conn.fetch(f"SELECT agent_trade_id, exec_broker {_open_sql}")
+                    pairs = [(str(r["agent_trade_id"]), r.get("exec_broker")) for r in rows]
+                except Exception as exc:  # noqa: BLE001 -- e.g. column not migrated yet
+                    _log.warning("live_position_check_exec_broker_unavailable err=%s", exc)
+                    rows = await conn.fetch(f"SELECT agent_trade_id {_open_sql}")
+                    pairs = [(str(r["agent_trade_id"]), None) for r in rows]
+            for tid, raw in pairs:
+                _b = str(raw or "kite")  # NULL = historical Kite row
+                if _b not in _valid:
+                    _log.critical(
+                        "exec_broker_invalid trade=%s exec_broker=%r -- not a registered live "
+                        "broker; tracking it with kite",
+                        tid,
+                        _b,
+                    )
+                    try:
+                        from src.infrastructure.operator_alerts import raise_alert as _op_alert
+
+                        _op_alert(
+                            f"Open live trade {tid} has invalid exec_broker {_b!r}; tracked "
+                            "with kite. Fix the trade row.",
+                            source="exec_broker_invalid",
+                            tier="CRITICAL",
+                            dedupe_seconds=4 * 3600,
+                        )
+                    except Exception as _ae:  # noqa: BLE001 -- the CRITICAL log already fired
+                        _log.error("exec_broker_invalid_alert_failed err=%s", _ae)
+                    _b = "kite"  # same owner as NULL / the reseed's catch-all stack
+                by_broker.setdefault(_b, []).append(tid)
         except Exception as exc:  # noqa: BLE001
             _log.critical(
                 "live_position_check_failed err=%s -- building the live broker anyway", exc
             )
-            open_ids = ["<unknown: db read failed>"]
-        if not open_ids:
-            return None, []
+            by_broker = {legacy_name: ["<unknown: db read failed>"]}
     else:
         _log.critical("live_position_check_skipped reason=no_db -- building the live broker anyway")
-        open_ids = ["<unknown: no db>"]
-    _log.warning(
-        "live_broker_forced_by_open_positions count=%d trades=%s -- config says paper but these "
-        "real positions are still open, so they stay monitored/reconciled live "
-        "(new entries still follow the config switch)",
-        len(open_ids),
-        open_ids,
-    )
-    return create(), open_ids
+        by_broker = {legacy_name: ["<unknown: no db>"]}
+    forced: dict[str, list[str]] = {}
+    for name, open_ids in by_broker.items():
+        if name in live_brokers:
+            continue
+        _log.warning(
+            "live_broker_forced_by_open_positions broker=%s count=%d trades=%s -- config says "
+            "paper but these real positions are still open, so they stay monitored/reconciled "
+            "live (new entries still follow the config switch)",
+            name,
+            len(open_ids),
+            open_ids,
+        )
+        live_brokers[name] = create(name)
+        forced[name] = open_ids
+    return forced
+
+
+# (what, broker_name, outcome) already logged for a missing exec_broker column: the 30 s
+# reconcile loop reseeds every cycle, so the condition is logged once per process.
+_RESEED_LOGGED: set[tuple[str, str, str]] = set()
+
+
+async def _fetch_reseed_rows(
+    db_pool: Any,
+    sql: str,
+    paper_mode: bool,
+    broker_name: str | None,
+    known_brokers: Sequence[str] | None,
+    unfiltered_if_no_column: bool,
+    what: str,
+) -> list[Any]:
+    """Run a reseed SELECT (`sql` ends in its WHERE clause), restricted for a live stack to the
+    rows its broker holds -- see _reseed_scope. `known_brokers` (kite stack only) adds rows
+    whose exec_broker is NULL or not a registered broker. Paper, or broker_name None (legacy
+    callers), runs `sql` unchanged. Raises whatever the fetch raises, except a missing column."""
+    if paper_mode or broker_name is None:
+        return list(await db_pool.fetch(sql))
+    args: list[Any] = [broker_name]
+    own = "COALESCE(exec_broker, 'kite') = $1"
+    if known_brokers:
+        args.append(list(known_brokers))
+        own = f"({own} OR COALESCE(exec_broker, 'kite') <> ALL($2::text[]))"
+    try:
+        return list(await db_pool.fetch(f"{sql} AND {own}", *args))
+    except Exception as exc:
+        if "exec_broker" not in str(exc) or "does not exist" not in str(exc):
+            raise  # only the missing-column case (UndefinedColumnError) is handled here
+        outcome = "unfiltered" if unfiltered_if_no_column else "none"
+        if (what, broker_name, outcome) not in _RESEED_LOGGED:
+            _RESEED_LOGGED.add((what, broker_name, outcome))
+            if unfiltered_if_no_column:
+                _log.warning(
+                    "%s_reseed_exec_broker_missing broker=%s -- migration 089 not applied; the "
+                    "kite stack reseeds every live row (all pre-routing, placed through Kite)",
+                    what,
+                    broker_name,
+                )
+            else:
+                _log.error(
+                    "%s_reseed_exec_broker_missing broker=%s -- migration 089 not applied; "
+                    "this non-kite live stack reseeds nothing",
+                    what,
+                    broker_name,
+                )
+        if unfiltered_if_no_column:
+            return list(await db_pool.fetch(sql))
+        return []
+
+
+# Last orphan summary logged by _report_orphaned_live_rows (log again only when it changes).
+_ORPHANS_LOGGED: dict[str, str] = {}
+
+
+async def _report_orphaned_live_rows(db_pool: Any, stacks: Mapping[str, Any]) -> int:
+    """Count open live `trades` rows that NO stack reseeds (their owner has no live stack) and
+    raise a CRITICAL log + operator alert, deduplicated. Owner = exec_broker; NULL, unknown
+    values and a DB without the column mean "kite" (as _reseed_scope). Such positions are left
+    unmonitored on purpose: handing them to another broker's monitor would send their exits to
+    the wrong account. Returns the orphan count (0 when the DB cannot be read)."""
+    if db_pool is None:
+        return 0
+    _open = "FROM trades WHERE order_state NOT IN ('CLOSED','REJECTED','CANCELLED','TIMED_OUT')"
+    try:
+        try:
+            rows = await db_pool.fetch(
+                f"SELECT exec_broker, COUNT(*) AS n {_open} GROUP BY exec_broker"  # noqa: S608
+            )
+        except Exception as exc:
+            if "exec_broker" not in str(exc) or "does not exist" not in str(exc):
+                raise
+            rows = [  # pre-089 DB: every row is a pre-routing (Kite) row
+                {"exec_broker": None, "n": r["n"]}
+                for r in await db_pool.fetch(f"SELECT COUNT(*) AS n {_open}")  # noqa: S608
+            ]
+    except Exception as exc:  # noqa: BLE001 -- a check only; the reseed itself logs its errors
+        _log.warning("reseed_orphan_check_failed err=%s", str(exc)[:160])
+        return 0
+    known = set(_known_live_brokers())
+    have = {stack_broker(k) for k in live_stacks(stacks)}
+    orphans: dict[str, int] = {}
+    for r in rows:
+        owner = str(r["exec_broker"] or LEGACY_LIVE_BROKER)
+        if owner not in known:
+            owner = LEGACY_LIVE_BROKER
+        if owner not in have and int(r["n"] or 0) > 0:
+            orphans[owner] = orphans.get(owner, 0) + int(r["n"])
+    summary = " ".join(f"{b}={n}" for b, n in sorted(orphans.items()))
+    if summary != _ORPHANS_LOGGED.get("last", ""):
+        _ORPHANS_LOGGED["last"] = summary
+        if orphans:
+            _log.critical(
+                "reseed_orphaned_live_rows %s -- open live trades whose broker has no live "
+                "stack; NOT monitored (never handed to another broker's monitor)",
+                summary,
+            )
+            try:
+                from src.infrastructure import operator_alerts as _oa
+
+                _oa.raise_alert(
+                    f"Open live trades not monitored ({summary}): their broker has no live "
+                    "stack. Exits/SL are not managed by the engine; check the broker.",
+                    source="reseed_orphaned_live_rows",
+                    tier="CRITICAL",
+                    dedupe_seconds=4 * 3600,
+                )
+            except Exception as _ae:  # noqa: BLE001 -- the CRITICAL log already fired
+                _log.error("reseed_orphaned_live_rows_alert_failed err=%s", _ae)
+    return sum(orphans.values())
 
 
 async def _reseed_order_monitor(
     order_monitor: Any,
     db_pool: Any,
     paper_mode: bool,
+    broker_name: str | None = None,
+    known_brokers: Sequence[str] | None = None,
+    unfiltered_if_no_column: bool = False,
 ) -> int:
     """Register every DB-open trade with OrderMonitor.
 
@@ -8867,6 +9706,9 @@ async def _reseed_order_monitor(
     "Orders Watched" on the dashboard, after dozens of restarts since entry).
     Idempotent — already-tracked agent_trade_ids are skipped, so this is safe
     to call repeatedly (both once at startup and every reconciliation cycle).
+
+    A live stack passes its `broker_name` (+ _reseed_scope's extras) so it reseeds only
+    the rows its own broker holds; None = every row of the table (legacy).
     """
     if db_pool is None:
         return 0
@@ -8874,7 +9716,8 @@ async def _reseed_order_monitor(
 
     table = "paper_trades" if paper_mode else "trades"
     try:
-        rows = await db_pool.fetch(
+        rows = await _fetch_reseed_rows(
+            db_pool,
             f"SELECT agent_trade_id, symbol, direction, quantity, fill_price, "  # noqa: S608
             f"initial_sl, current_sl, initial_target, current_target, "
             f"sl_order_id, target_order_id, gtt_sl_id, gtt_target_id, product, "
@@ -8882,7 +9725,12 @@ async def _reseed_order_monitor(
             f"charges_breakdown "
             f"FROM {table} "
             f"WHERE order_state NOT IN ('CLOSED','REJECTED','CANCELLED','TIMED_OUT') "
-            f"AND fill_price IS NOT NULL"
+            f"AND fill_price IS NOT NULL",
+            paper_mode,
+            broker_name,
+            known_brokers,
+            unfiltered_if_no_column,
+            "order_monitor",
         )
     except Exception as exc:
         _log.error("order_monitor_reseed_fetch_err table=%s err=%s", table, str(exc)[:160])
@@ -8930,6 +9778,9 @@ async def _reseed_pending_entries(
     db_pool: Any,
     paper_mode: bool,
     order_types: dict[str, str],
+    broker_name: str | None = None,
+    known_brokers: Sequence[str] | None = None,
+    unfiltered_if_no_column: bool = False,
 ) -> int:
     """Re-register every DB-resting entry order for the per-cycle fill re-poll.
 
@@ -8943,7 +9794,7 @@ async def _reseed_pending_entries(
     naked). Same class of bug as _reseed_order_monitor, for unfilled entries.
 
     Idempotent — ids already registered as pending are skipped, so this is safe
-    at startup and on every reconciliation cycle.
+    at startup and on every reconciliation cycle. Broker filter: as _reseed_order_monitor.
     """
     if db_pool is None or lifecycle is None:
         return 0
@@ -8952,11 +9803,17 @@ async def _reseed_pending_entries(
 
     table = "paper_trades" if paper_mode else "trades"
     try:
-        rows = await db_pool.fetch(
+        rows = await _fetch_reseed_rows(
+            db_pool,
             f"SELECT agent_trade_id, broker_order_id, symbol, exchange, direction, "  # noqa: S608
             f"quantity, intended_price, initial_sl, current_sl, initial_target, "
             f"current_target, product, strategy_name, entry_timestamp FROM {table} "
-            f"WHERE order_state IN ('SUBMITTED','OPEN') AND fill_price IS NULL"
+            f"WHERE order_state IN ('SUBMITTED','OPEN') AND fill_price IS NULL",
+            paper_mode,
+            broker_name,
+            known_brokers,
+            unfiltered_if_no_column,
+            "pending_entry",
         )
     except Exception as exc:
         _log.error("pending_entry_reseed_fetch_err table=%s err=%s", table, str(exc)[:160])
@@ -9655,6 +10512,7 @@ async def _process_manual_order_actions(
     order_monitor: Any,
     db_pool: Any,
     broker: Any,
+    all_order_monitors: list[Any] | None = None,
 ) -> None:
     """Execute dashboard-queued manual actions (Market Exit button) against the
     live OrderMonitor.
@@ -9666,6 +10524,11 @@ async def _process_manual_order_actions(
     breach again. This is the real channel: POST /api/orders/{id}/force-exit
     (server.py) inserts a PENDING row here; this picks it up every monitor
     cycle (~2s) since server.py has no direct reference to order_monitor.
+
+    Called once per stack (each _monitor_loop) with that stack's monitor and broker (the
+    LTP source). A stack that does not track the trade leaves the row PENDING when another
+    monitor in `all_order_monitors` does -- that stack's loop executes it; FAILED only
+    when no stack tracks it.
     """
     if db_pool is None:
         return
@@ -9682,6 +10545,11 @@ async def _process_manual_order_actions(
         _id, tid, action = r["id"], r["agent_trade_id"], r["action"]
         pos = order_monitor.get(tid)
         if pos is None:
+            if any(
+                m is not order_monitor and m.get(tid) is not None
+                for m in (all_order_monitors or [])
+            ):
+                continue  # another stack owns it; left PENDING for that stack's loop
             await db_pool.execute(
                 "UPDATE manual_order_actions SET status='FAILED', "
                 "result='not_tracked_or_already_closed', resolved_at=NOW() WHERE id=$1",
@@ -9729,6 +10597,7 @@ async def _monitor_loop(
     is_paper: bool | None = None,
     all_order_monitors: list[Any] | None = None,
     lifecycle: Any = None,
+    broker: Any = None,
 ) -> None:
     """Cycle OrderMonitor every `cycle_seconds` (execution.json monitoring.cycle_seconds,
     2026-08-20 — was hardcoded); drain closed_trades into shared + logs + DB.
@@ -9812,8 +10681,13 @@ async def _monitor_loop(
                 await order_monitor.execute_events(events)
                 _actions_total += len(events)
             await _check_swing_live_triggers(shared, all_order_monitors)
+            # LTP from THIS stack's broker (the one holding its positions); shared["broker"]
+            # is the primary (paper under --paper), kept only as the legacy fallback.
             await _process_manual_order_actions(
-                order_monitor, shared.get("db_pool"), shared.get("broker")
+                order_monitor,
+                shared.get("db_pool"),
+                broker if broker is not None else shared.get("broker"),
+                all_order_monitors=all_order_monitors,
             )
             # NOTE: paper SL/target close now runs through order_monitor.cycle() above
             # (one wiring) — the paper adapter simulates the exit fill. No separate
@@ -11227,7 +12101,11 @@ async def _persist_index_intraday(
     to the last weeks. Live day-change comes from the live LTP and was unaffected."""
     import pandas as _pd_local
 
-    df = await broker.get_ohlcv(broker_symbol, "5minute", days)
+    fetch = getattr(broker, "get_ohlcv_with_source", None)
+    if fetch is not None:
+        df, source = await fetch(broker_symbol, "5minute", days)
+    else:
+        df, source = await broker.get_ohlcv(broker_symbol, "5minute", days), None
     if df is None or df.empty:
         return 0
     ts_col = df["date"] if "date" in df.columns else _pd_local.Series(df.index)
@@ -11242,7 +12120,7 @@ async def _persist_index_intraday(
         }
         for i in range(len(df))
     ]
-    return int(await repo.upsert_candles(db_symbol, "5m", rows) or len(rows))
+    return int(await repo.upsert_candles(db_symbol, "5m", rows, source=source) or len(rows))
 
 
 async def _regime_loop(
@@ -11254,7 +12132,11 @@ async def _regime_loop(
     detector = RegimeDetector(log_path=_LOGS / "market_regime.json")
     while not stop.is_set():
         try:
-            df = await broker.get_ohlcv("NSE:NIFTY 50", "day", 400)
+            _fetch = getattr(broker, "get_ohlcv_with_source", None)
+            if _fetch is not None:
+                df, _src = await _fetch("NSE:NIFTY 50", "day", 400)
+            else:
+                df, _src = await broker.get_ohlcv("NSE:NIFTY 50", "day", 400), None
             # Persist the index's daily bars — nothing else in the regular
             # ingestion pipeline writes them (equities get their own backfill
             # loop; the index was never added to it), so every reader of
@@ -11279,7 +12161,7 @@ async def _regime_loop(
                         }
                         for i in range(len(df))
                     ]
-                    await _repo.upsert_candles("NIFTY 50", "1d", _rows)
+                    await _repo.upsert_candles("NIFTY 50", "1d", _rows, source=_src)
                 except Exception as _npe:
                     _log.debug("nifty_daily_persist_err err=%s", str(_npe)[:80])
             if _repo is not None:
@@ -11439,6 +12321,10 @@ async def _earnings_loop(
         await asyncio.sleep(60.0)
 
 
+# Registry name the buyer-first options path runs under (its mode override, see boot).
+_OPTIONS_DESK_STRATEGY = "options_seller_desk_v3"
+
+
 async def _try_options_structure(
     *,
     shared: dict[str, Any],
@@ -11471,6 +12357,31 @@ async def _try_options_structure(
         return False  # no preferred bearish options structure
     if not getattr(crm_ctx, "can_trade_options", False):
         return False  # G0 permission
+    # R1 for a LIVE execution: this path runs the options segment as the seller desk's
+    # strategy (options_seller_desk_v3) through ONE boot-time executor. An unusable route, or a
+    # usable one naming another broker than that executor's, places nothing (the signal falls
+    # back to the equity path like any other options block).
+    if not getattr(opt.get("executor"), "_is_paper", True):
+        from src.brokers.routing import route_rejection
+
+        _routes = getattr(crm_ctx, "strategy_routes", None) or shared.get("strategy_routes")
+        _why = route_rejection(_routes, _OPTIONS_DESK_STRATEGY)
+        _route = (_routes or {}).get(_OPTIONS_DESK_STRATEGY)
+        _boot_broker = opt.get("exec_broker") or LEGACY_LIVE_BROKER
+        if _why is None and _route is not None and _route.broker != _boot_broker:
+            _why = (
+                f"route names broker {_route.broker} but the boot options executor trades "
+                f"through {_boot_broker}"
+            )
+        if _why is not None:
+            _opt_log.warning(
+                "broker_route_rejected strategy=%s segment=options_buyer_first symbol=%s "
+                "reason=%s",
+                _OPTIONS_DESK_STRATEGY,
+                symbol,
+                _why,
+            )
+            return False
 
     # Time horizon from the strategy product: MIS → intraday (equity only).
     product = getattr(getattr(strategy.spec, "meta", None), "product", None)
@@ -11591,6 +12502,9 @@ async def _kite_token_refresh_loop(shared: dict[str, Any], stop: asyncio.Event) 
     )
     if not brokers:
         return  # non-Kite-backed broker (e.g. test doubles) — nothing to refresh
+    if not os.environ.get("KITE_API_KEY", "").strip():
+        _log.info("kite_token_refresh_loop_skipped reason=no_kite_credentials")
+        return
 
     while not stop.is_set():
         try:
@@ -11605,6 +12519,129 @@ async def _kite_token_refresh_loop(shared: dict[str, Any], stop: asyncio.Event) 
         except Exception as exc:  # noqa: BLE001 — one bad refresh must not kill the loop
             _log.warning("kite_token_refresh_failed err=%s", exc)
         await asyncio.sleep(_CHECK_INTERVAL_SECONDS)
+
+
+async def _angel_token_refresh_loop(shared: dict[str, Any], stop: asyncio.Event) -> None:
+    """Angel One twin of _kite_token_refresh_loop: refresh-token renewal (no TOTP needed)
+    then push the new token into every Angel adapter. Tokens are broker-specific, so this
+    never touches Kite objects."""
+    brokers = shared.get("angel_brokers") or []
+    if not brokers:
+        return
+    from src.brokers import angel_one_auth  # only when Angel is in use (needs SmartApi)
+
+    while not stop.is_set():
+        try:
+            new_token = await asyncio.to_thread(angel_one_auth.auto_refresh)
+            for b in brokers:
+                b.set_access_token(new_token)
+        except Exception as exc:  # noqa: BLE001 — one bad refresh must not kill the loop
+            _log.warning("angel_token_refresh_failed err=%s", exc)
+        await asyncio.sleep(1800.0)
+
+
+def _flattrade_headless_login(env_path: Path | None = None) -> str:
+    """HOOK ONLY -- where a future headless (TOTP) Flattrade login would plug in.
+
+    Deliberately not implemented and not called anywhere: Flattrade documents no headless
+    login and its terms 2(a)/2(e) rule out scripting auth.flattrade.in, so whether to build
+    one is an owner decision that is still pending. Until then the daily login is the manual
+    `python -m src.brokers.flattrade_auth` and _flattrade_token_refresh_loop only validates
+    and picks up the token it writes to .env."""
+    raise NotImplementedError(
+        "Flattrade headless login is not implemented (owner decision pending; ToS). "
+        "Run: python -m src.brokers.flattrade_auth"
+    )
+
+
+# How long after the operator's manual Flattrade login the running system picks the new
+# token up from .env. One UserDetails call per check, against a 200 calls/min API limit.
+_FLATTRADE_CHECK_INTERVAL_SECONDS = 300.0
+# The "log in" alert is only useful when the operator can act on it before/while trading:
+# NSE trading days (weekends/holidays stay quiet, like the 2026-10-02 quiet mode), from this
+# time until the regular close (config/market_hours.json).
+_FLATTRADE_ALERT_FROM_MINUTES = 8 * 60  # 08:00 IST
+
+
+def _flattrade_now() -> Any:
+    """Current IST datetime (a seam for tests)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+
+def _flattrade_alert_due(now: Any) -> bool:
+    """True on an NSE trading day between 08:00 IST and the regular close."""
+    mins = now.hour * 60 + now.minute
+    return is_trading_day(now.date()) and (
+        _FLATTRADE_ALERT_FROM_MINUTES <= mins <= _sessions.minutes(_sessions.regular_close())
+    )
+
+
+async def _flattrade_token_refresh_loop(shared: dict[str, Any], stop: asyncio.Event) -> None:
+    """Flattrade twin of _angel_token_refresh_loop, but it NEVER logs in (the daily login is
+    manual-assisted). Each check validates the token in .env (flattrade_auth.auto_refresh,
+    which re-reads .env, so a token written by the manual login is picked up without a
+    restart) and pushes a changed token to every Flattrade object via
+    shared["flattrade_token_targets"] (router.set_provider_token("flattrade", .) for the
+    market-data provider -- the router has no set_access_token -- and set_access_token for
+    a live Flattrade broker). An invalid/missing token raises one operator alert per IST day,
+    only on NSE trading days inside the alert window (_flattrade_alert_due); a valid check
+    re-arms it, so a session that dies again later the same day alerts again.
+
+    No-op when no Flattrade object was built (Flattrade is neither an eligible data provider
+    nor a live strategy's broker) or when Flattrade has no credentials."""
+    import os
+    from datetime import date
+
+    targets = shared.get("flattrade_token_targets") or []
+    if not targets:
+        return
+    try:
+        from src.brokers import flattrade_auth
+        from src.brokers.adapters.flattrade.client import FlattradeError
+        from src.brokers.routing import broker_is_configured
+        from src.infrastructure import operator_alerts
+    except Exception as exc:  # noqa: BLE001 — the main gather would swallow this silently
+        _log.error("flattrade_token_refresh_loop_disabled reason=import_failed err=%r", exc)
+        return
+    if not broker_is_configured("flattrade", os.environ):
+        _log.info("flattrade_token_refresh_loop_skipped reason=no_flattrade_credentials")
+        return
+    pushed = ""
+    alerted_on: date | None = None
+    while not stop.is_set():
+        try:
+            token = await asyncio.to_thread(flattrade_auth.auto_refresh)
+            alerted_on = None  # valid again: a later expiry today must alert again
+            if token != pushed:
+                for push in targets:
+                    push(token)
+                pushed = token
+                _log.info("flattrade_token_picked_up targets=%d", len(targets))
+        except FlattradeError as exc:  # API/network trouble, not an expired session
+            _log.warning("flattrade_token_check_failed err=%s", exc)
+        except RuntimeError as exc:  # no token / expired: only a human can log in
+            _log.warning(
+                "flattrade_token_invalid action='run python -m src.brokers.flattrade_auth' err=%s",
+                exc,
+            )
+            now = _flattrade_now()
+            today = now.date()
+            if alerted_on != today and _flattrade_alert_due(now):
+                operator_alerts.raise_alert(
+                    "Flattrade session is not valid -- no Flattrade market data or orders "
+                    "until you log in: python -m src.brokers.flattrade_auth",
+                    source="flattrade_token_invalid",
+                    tier="CRITICAL",
+                    dedupe_seconds=0.0,  # once per IST day is enforced here
+                    push_title="FLATTRADE LOGIN NEEDED",
+                )
+                alerted_on = today
+        except Exception as exc:  # noqa: BLE001 — one bad check must not kill the loop
+            _log.warning("flattrade_token_check_failed err=%s", exc)
+        await asyncio.sleep(_FLATTRADE_CHECK_INTERVAL_SECONDS)
 
 
 async def _options_seller_vol_loop(shared: dict[str, Any], stop: asyncio.Event) -> None:
@@ -11642,6 +12679,23 @@ def _refresh_options_risk_budget(crm_ctx: Any) -> None:
     crm_ctx.max_intraday_loss_per_trade = _b.intraday.max_loss_per_trade_rupees(_eq)
     crm_ctx.max_intraday_shared_risk = _b.intraday.max_share_of_shared_risk_rupees(_eq)
     crm_ctx.max_intraday_daily_loss = _b.intraday.max_loss_per_day_rupees(_eq)
+    if getattr(crm_ctx, "per_broker_equity", False):
+        # Per-broker risk (system.per_broker_equity): the same capital.json percentages,
+        # applied to each live broker's own equity and baseline. A broker without a fresh
+        # equity gets no caps at all -- CRM G1 blocks its entries before any cap is read.
+        from src.risk.crm import per_key_rupee_caps
+
+        _caps: dict[str, dict[str, float]] = {}
+        _dd: dict[str, float] = {}
+        for _key, _keq in dict(crm_ctx.mode_current_equity).items():
+            if not _keq or _keq <= 0:
+                continue
+            _caps[_key] = per_key_rupee_caps(_b, float(_keq))
+            _base = float(crm_ctx.mode_total_capital.get(_key, 0.0) or 0.0)
+            if _base > 0:
+                _dd[_key] = max(0.0, (_base - float(_keq)) / _base * 100.0)
+        crm_ctx.mode_rupee_caps = _caps
+        crm_ctx.mode_drawdown_pct = _dd
 
 
 async def _hosted_margin(shared: dict[str, Any], desk: Any, broker: Any, is_paper: bool) -> float:
@@ -11649,16 +12703,17 @@ async def _hosted_margin(shared: dict[str, Any], desk: Any, broker: Any, is_pape
     the live broker's real free cash when live."""
     if is_paper:
         return float(desk.paper_sleeve_margin())
-    live_broker = ((shared.get("stacks") or {}).get("live") or {}).get("broker") or broker
+    # Primary live stack: the options desk is single-broker until its executors are keyed.
+    live_broker = (_pick_stack(shared, False) or {}).get("broker") or broker
     return float((await live_broker.get_margins()).available_cash)
 
 
-async def _weekly_condor_step(
+async def _hosted_options_step(
     shared: dict[str, Any], desk: Any, broker: Any, today: Any, now: Any, crm_ctx: Any
 ) -> None:
-    """Desk-hosted strategies' entry attempts: weekly condor (hypothesis B) and
-    options_expiry_day (F2). Each runs only when its registry entry is enabled AND its own
-    options_settings block is enabled, in its own registry execution_mode."""
+    """Desk-hosted strategies' entry attempts: options_expiry_day (F2, legacy butterfly). Runs only
+    when its registry entry is enabled AND its own options_settings block is enabled, in its own
+    registry execution_mode."""
     from src.options import seller_settings as _ss
 
     # 2026-10-07: unconditional, every call -- the two branch-level logs below
@@ -11668,14 +12723,13 @@ async def _weekly_condor_step(
     reg = shared.get("strategy_registry")
     vix: float | None = None
     for cfg, default_name, runner in (
-        (_ss.weekly_condor(), "nifty_weekly_condor_simple", desk.run_weekly_condor_cycle),
         (_ss.expiry_day(), "options_expiry_day", desk.run_expiry_day_cycle),
     ):
         name = str(cfg.get("registry_name", default_name))
         # 2026-10-07: both pre-checks below used to `continue` with ZERO logging --
-        # found live: nifty_weekly_condor_simple produced not one log line, in either
-        # direction, across its first 3 days enabled, including its one-per-week entry
-        # window, with no way to tell which of these two silently fired. Never again.
+        # found live: a hosted strategy produced not one log line, in either direction,
+        # across its first 3 days enabled, with no way to tell which of these two
+        # silently fired. Never again.
         if not cfg.get("enabled", False):
             _opt_log.info(
                 "hosted_options_step_skip strategy=%s reason=disabled_in_options_settings", name
@@ -11794,6 +12848,14 @@ async def _options_pnl_snapshot_loop(shared: dict[str, Any], stop: asyncio.Event
         await asyncio.sleep(300.0)
 
 
+def _options_desk_market_open(now: Any) -> bool:
+    """True only on an NSE trading day inside the regular session. The seller desk opens, adjusts
+    and closes positions off live quotes -- outside the session those are frozen, so any action
+    is taken at a stale price (2026-10-16 00:05: a condor closed at -Rs2,059 on a date roll, then
+    two spreads opened at 00:10/00:15 against the same frozen chain)."""
+    return is_trading_day(now.date()) and _sessions.is_regular_session(now)
+
+
 async def _seller_desk_loop(shared: dict[str, Any], stop: asyncio.Event) -> None:
     """Seller-desk decision cycle + safety sweeps, every 5 minutes (matches
     position_manager's own spec'd monitoring cadence — options_spec.md §10).
@@ -11855,6 +12917,10 @@ async def _seller_desk_loop(shared: dict[str, Any], stop: asyncio.Event) -> None
                 if chain_fetcher is not None and broker is not None and repo is not None:
                     now = _dt.now(_IST)
                     today = now.date()
+                    if not _options_desk_market_open(now):
+                        _opt_log.debug("seller_desk_market_closed_skip now=%s", now.isoformat())
+                        await asyncio.sleep(300.0)
+                        continue
                     calendar = load_expiry_calendar()
                     try:
                         _n_reconciled = await desk.reconcile_duplicate_positions()
@@ -11978,9 +13044,9 @@ async def _seller_desk_loop(shared: dict[str, Any], stop: asyncio.Event) -> None
 
                     try:
                         _opt_log.info("hosted_options_step_calling")
-                        await _weekly_condor_step(shared, desk, broker, today, now, _seg_ctx)
+                        await _hosted_options_step(shared, desk, broker, today, now, _seg_ctx)
                     except Exception as exc:  # noqa: BLE001 — must not kill the desk loop
-                        _opt_log.warning("weekly_condor_step_failed err=%s", exc)
+                        _opt_log.warning("hosted_options_step_failed err=%s", exc)
 
                     try:
                         await desk.sweep_expiry_guardian(today, now)
@@ -12445,6 +13511,10 @@ async def _crm_loop(
                 # ONE path for paper + live — the injected adapter is the only
                 # difference. Place entry+SL+target, realize the fill + reanchor, then
                 # register with the shared OrderMonitor for exit management.
+                # By design this legacy ring path is NOT broker-routed: `lifecycle` and the
+                # monitor below are the primary alias -- paper under the launcher's --paper,
+                # and on a live boot the legacy (global.json) broker's stack, which stamps
+                # its own exec_broker. Do not add per-strategy routing here.
                 _record = await lifecycle.place_entry_protection_and_poll(
                     signal_id=crm_signal.signal_id,
                     symbol=symbol,
@@ -12563,16 +13633,24 @@ async def _run(paper_mode: bool) -> None:
     )
 
     # ── Broker ───────────────────────────────────────────────────────────────
-    from src.brokers.factory import create_broker
-    from src.brokers.kite_auth import auto_refresh
+    from src.brokers.factory import create_broker, peek_market_data_router
+    from src.market_data.provider_config import (
+        parse_provider_config,
+        refresh_provider_credentials,
+    )
 
-    try:
-        auto_refresh(_BASE / ".env")
-    except Exception as exc:
-        _log.warning("kite_auth_skipped", extra={"ctx": {"reason": str(exc)}})
     _broker_cfg = global_cfg.get("broker", "kite")
     _live_broker_name = (
         _broker_cfg.get("name", "kite") if isinstance(_broker_cfg, dict) else str(_broker_cfg)
+    )
+    # Refresh tokens only for brokers this run can actually use: configured data providers
+    # plus the live broker. A user with no Kite account is never asked to log in to Kite.
+    # In a worker thread: Angel's auto_refresh uses asyncio.run(), which raises if called on
+    # this running loop's thread (Kite's is plain sync, so it never mattered before).
+    await asyncio.to_thread(
+        refresh_provider_credentials,
+        [*parse_provider_config(global_cfg).providers, _live_broker_name],
+        _BASE / ".env",
     )
     # UNIFIED ENGINE: paper and live run the exact same execution wiring (lifecycle +
     # OrderMonitor + SL/target/reanchor/exit). The ONLY difference is the injected
@@ -12607,9 +13685,11 @@ async def _run(paper_mode: bool) -> None:
     # which can be live) and logs a warning. Read once at boot, same
     # "restart to pick up changes" pattern as segment paper_mode.
     _strategy_execution_mode: dict[str, str] = {}
+    _reg_entries: list[dict[str, Any]] = []
     try:
         _reg_raw = json.loads((_CONFIG / "strategies_registry.json").read_text(encoding="utf-8"))
-        for _entry in _reg_raw.get("strategies", []):
+        _reg_entries = list(_reg_raw.get("strategies", []))
+        for _entry in _reg_entries:
             if not _entry.get("name"):
                 continue
             _mode = _entry.get("execution_mode")
@@ -12635,15 +13715,39 @@ async def _run(paper_mode: bool) -> None:
     # while locked — skip building one.
     _locked = bool(_account_cfg.get("paper_mode_locked", False))
     _any_seg_paper = any(_seg_paper_mode.values()) or "paper" in _strategy_execution_mode.values()
-    _any_seg_live = not _locked and (
-        any(not v for v in _seg_paper_mode.values()) or "live" in _strategy_execution_mode.values()
-    )
     # Reuse `broker` above for whichever mode it already is; only construct the
     # second adapter if some segment actually needs the opposite mode.
     broker_paper = broker if paper_mode else (create_broker("paper") if _any_seg_paper else None)
-    broker_live = (
-        broker if not paper_mode else (create_broker(_live_broker_name) if _any_seg_live else None)
-    )
+    # One live broker per needed broker name: the legacy (global.json) broker exactly
+    # when it was built before (live boot, a live segment, or a live registry entry
+    # without a usable route), plus every broker a live registry entry routes to.
+    import os as _route_os
+
+    from src.brokers.registry import list_brokers
+    from src.brokers.routing import parse_strategy_routes, rejected_routes_message, route_table
+
+    _strategy_routes = parse_strategy_routes(_reg_entries, list_brokers(), _route_os.environ)
+    # (the route table + rejected-routes alert are reported once the live stacks exist and
+    # the operator-alert hook is configured, see "strategy_routes_table" below)
+    # Routed live brokers need fresh tokens before create_broker() reads them, like the
+    # legacy broker and data providers refreshed above (only names not refreshed there).
+    _routed_refresh = [
+        r.broker
+        for r in _strategy_routes.values()
+        if r.ok
+        and r.broker is not None
+        and r.broker not in (*parse_provider_config(global_cfg).providers, _live_broker_name)
+    ]
+    if _routed_refresh and not _locked:
+        await asyncio.to_thread(refresh_provider_credentials, _routed_refresh, _BASE / ".env")
+    # (a live segment adds the legacy broker inside needed_live_brokers)
+    _legacy_live_needed = not paper_mode or any(not r.ok for r in _strategy_routes.values())
+    live_brokers: dict[str, Any] = {
+        _name: (broker if not paper_mode and _name == _live_broker_name else create_broker(_name))
+        for _name in needed_live_brokers(
+            _strategy_routes, _seg_paper_mode, _live_broker_name, _locked, _legacy_live_needed
+        )
+    }
     # _kite_token_refresh_loop needs every DISTINCT Kite-credentialed object,
     # not just `broker` -- when segments are split paper/live (e.g. options
     # paper, swing live), broker_live above is a SEPARATELY constructed
@@ -12656,13 +13760,34 @@ async def _run(paper_mode: bool) -> None:
     # KiteConnect client instance never received it. De-duplicated by
     # identity since broker/broker_paper/broker_live legitimately alias the
     # same object in the common (not-segment-split) case.
+    # Only Kite adapters get a Kite token: a live non-Kite broker (even when it is the
+    # primary `broker`) must never be in this list; its own refresh list is below.
+    _non_kite_live = {id(b) for n, b in live_brokers.items() if n != "kite"}
     _kite_brokers = list(
         {
             id(b): b
-            for b in (broker, broker_paper, broker_live)
-            if b is not None and hasattr(b, "set_access_token")
+            for b in (broker, broker_paper, live_brokers.get("kite"))
+            if b is not None and hasattr(b, "set_access_token") and id(b) not in _non_kite_live
         }.values()
     )
+    # The market-data router's Angel provider is not a trading broker, so it is not in
+    # _kite_brokers; register it for its own token-refresh loop. (Kite tokens reach the
+    # router's kite provider via PaperAdapter.set_access_token.)
+    _router = peek_market_data_router()
+    _angel_brokers: list[Any] = []
+    if _router is not None:
+        _router_angel = _router.provider("angel_one")
+        if _router_angel is not None:
+            _angel_brokers.append(_router_angel)
+    if live_brokers.get("angel_one") is not None:
+        _angel_brokers.append(live_brokers["angel_one"])
+    # Flattrade: the router provider gets its token by name (the router has no
+    # set_access_token); a live Flattrade broker directly. Empty => the loop is a no-op.
+    _flattrade_targets: list[Any] = []
+    if _router is not None and _router.provider("flattrade") is not None:
+        _flattrade_targets.append(functools.partial(_router.set_provider_token, "flattrade"))
+    if live_brokers.get("flattrade") is not None:
+        _flattrade_targets.append(live_brokers["flattrade"].set_access_token)
     _log.info(
         "segment_paper_mode_resolved",
         extra={
@@ -12898,6 +14023,9 @@ async def _run(paper_mode: bool) -> None:
     crm_ctx.strategy_execution_mode = (
         {} if _account_cfg.get("paper_mode_locked", False) else dict(_strategy_execution_mode)
     )
+    # The options desk reads routes from crm_ctx (R1). Kept even when locked: routes are only
+    # consulted for a LIVE-resolved strategy, so they can only ever add a rejection.
+    crm_ctx.strategy_routes = dict(_strategy_routes)
     CRMContext.apply_risk_json(crm_ctx, risk_cfg)
 
     # Per-strategy LLM gate policy (registry llm_gate_required / llm_originated). A
@@ -12949,7 +14077,11 @@ async def _run(paper_mode: bool) -> None:
         retry_delay_seconds=_retry_delay_seconds,
     )
 
-    def _build_stack(_broker: Any, _is_paper: bool) -> dict[str, Any]:
+    def _build_stack(
+        _broker: Any, _is_paper: bool, broker_name: str | None = None
+    ) -> dict[str, Any]:
+        # broker_name (live stacks only): stamped on new trade rows as exec_broker and used
+        # for the stack's charges; None for paper.
         _lc = OrderLifecycleManager(
             _broker,
             max_risk_rupees=crm_ctx.max_risk_per_trade,
@@ -12957,6 +14089,7 @@ async def _run(paper_mode: bool) -> None:
             is_paper=_is_paper,
             idempotency=_idempotency,
             rejection_handler=_rejection_handler,
+            broker_name=broker_name,
         )
         _om = OrderMonitor(
             _broker,
@@ -12967,6 +14100,7 @@ async def _run(paper_mode: bool) -> None:
                 _monitoring_cfg.get("gtt_check_interval_seconds", 30.0)
             ),
             trade_repo=trade_repo,
+            broker_name=broker_name,
         )
         return {
             "broker": _broker,
@@ -12981,25 +14115,40 @@ async def _run(paper_mode: bool) -> None:
     # state between OrderLifecycleManager/OrderMonitor instances beyond DB rows
     # (which already carry product/strategy_name), so running both concurrently is
     # safe. trade_repo is shared — DB rows are segment/mode-discriminated already.
-    broker_live, _forced_live = await _ensure_live_broker_for_open_positions(
-        broker_live, db_pool, lambda: create_broker(_live_broker_name)
+    _forced_live = await _ensure_live_broker_for_open_positions(
+        live_brokers, db_pool, create_broker, _live_broker_name
     )
-    if _forced_live and broker_live is not None and hasattr(broker_live, "set_access_token"):
-        _kite_brokers.append(broker_live)  # the token-refresh loop must refresh it too
+    for _fname in _forced_live:  # the token-refresh loops must refresh forced brokers too
+        _fb = live_brokers[_fname]
+        if _fname == "kite" and hasattr(_fb, "set_access_token"):
+            _kite_brokers.append(_fb)
+        elif _fname == "angel_one":
+            _angel_brokers.append(_fb)
+        elif _fname == "flattrade":
+            _flattrade_targets.append(_fb.set_access_token)
+        else:
+            _log.info("live_broker_no_token_refresh broker=%s (forced by open positions)", _fname)
     stacks: dict[str, dict[str, Any]] = {}
     if broker_paper is not None:
-        stacks["paper"] = _build_stack(broker_paper, True)
-    if broker_live is not None:
-        stacks["live"] = _build_stack(broker_live, False)
+        stacks[stack_key(True)] = _build_stack(broker_paper, True)
+    # One live stack per live broker, legacy broker first ("live:<name>").
+    for _lname, _lbroker in live_brokers.items():
+        stacks[stack_key(False, _lname)] = _build_stack(_lbroker, False, _lname)
+    # Legacy single-live-broker consumers below (options desk, reconciler, boot
+    # reconcile) use the primary live stack's broker; per-broker wiring comes later.
+    _primary_live = primary_live_key(stacks, _live_broker_name)
+    broker_live = stacks[_primary_live]["broker"] if _primary_live else None
 
     # Restore SL/target monitoring for every trade that was already open before
     # this process started — see _reseed_order_monitor docstring for why this
     # is required (OrderMonitor.track() only fires at entry, never on restart).
-    # Each stack reseeds ONLY its own table (paper stack <- paper_trades, live
-    # stack <- trades) so a mixed-mode restart never cross-registers positions.
+    # Each stack reseeds ONLY its own rows (paper stack <- paper_trades, each live
+    # stack <- the `trades` rows its broker holds, see _reseed_scope) so a mixed-mode or
+    # multi-broker restart never cross-registers positions.
     for _stack_mode, _stack in stacks.items():
+        _scope = _reseed_scope(_stack_mode, stacks, _live_broker_name)
         _reseeded = await _reseed_order_monitor(
-            _stack["order_monitor"], db_pool, _stack_mode == "paper"
+            _stack["order_monitor"], db_pool, stack_is_paper(_stack_mode), **_scope
         )
         if _reseeded:
             _log.warning("order_monitor_startup_reseed mode=%s count=%d", _stack_mode, _reseeded)
@@ -13007,18 +14156,22 @@ async def _run(paper_mode: bool) -> None:
         # AMO must still be re-polled after a restart or its fill — and with it the
         # only chance to arm SL/target — is missed entirely.
         _pending = await _reseed_pending_entries(
-            _stack["lifecycle"], db_pool, _stack_mode == "paper", _exec_order_types
+            _stack["lifecycle"], db_pool, stack_is_paper(_stack_mode), _exec_order_types, **_scope
         )
         if _pending:
             _log.warning("pending_entry_startup_reseed mode=%s count=%d", _stack_mode, _pending)
+    # Open live rows whose broker has no stack were reseeded by nobody: say so loudly.
+    # Best effort (an alert, never a reason to abort boot), like the 30 s call.
+    with contextlib.suppress(Exception):
+        await _report_orphaned_live_rows(db_pool, stacks)
     # Legacy singular aliases for every call site not yet stack-aware (options
     # paths, dashboard/status reads via shared["order_monitor"], etc.) — resolve
     # to the mode matching the --paper/--live boot flag, falling back to whichever
     # stack actually exists if that mode has no segments in it.
-    if paper_mode and "paper" in stacks:
-        _primary_mode = "paper"
-    elif not paper_mode and "live" in stacks:
-        _primary_mode = "live"
+    if paper_mode and stack_key(True) in stacks:
+        _primary_mode = stack_key(True)
+    elif not paper_mode and _primary_live:
+        _primary_mode = _primary_live
     else:
         _primary_mode = next(iter(stacks))
     lifecycle = stacks[_primary_mode]["lifecycle"]
@@ -13085,6 +14238,13 @@ async def _run(paper_mode: bool) -> None:
             ),
             "repo": _options_repo,
             "broker": _options_order_broker,
+            # Live broker the boot executor trades through (None = paper); the buyer-first
+            # path rejects a live route naming any other broker (one executor in this phase).
+            "exec_broker": (
+                None
+                if _options_is_paper
+                else ((stack_broker(_primary_live) if _primary_live else None) or _live_broker_name)
+            ),
         }
         _log.info("options_structure_selection_enabled")
 
@@ -13152,6 +14312,30 @@ async def _run(paper_mode: bool) -> None:
     from src.infrastructure import operator_alerts as _operator_alerts
 
     _operator_alerts.configure(supervisor._alert_manager)
+
+    # Show at startup which broker each live registry strategy trades through, and which live
+    # strategies will have every signal rejected (R1, or an ok route whose broker got no live
+    # stack/executor) -- before the first signal does. CRITICAL alert unless paper-locked
+    # (then they all run as PAPER and the text says so).
+    _route_tbl, _route_rejected = route_table(
+        _strategy_routes, {b for b in map(stack_broker, live_stacks(stacks)) if b}
+    )
+    _log.info("strategy_routes_table locked=%s %s", _locked, _route_tbl)
+    if _route_rejected:
+        _route_msg = rejected_routes_message(_route_rejected, _locked)
+        _log.warning(
+            "strategy_routes_rejected count=%d locked=%s %s",
+            len(_route_rejected),
+            _locked,
+            _route_msg,
+        )
+        if not _locked:
+            _operator_alerts.raise_alert(
+                _route_msg,
+                source="strategy_routes_rejected",
+                tier="CRITICAL",
+                dedupe_seconds=4 * 3600,
+            )
 
     # Set initial equity on CRM context (G1 25% floor + G2 drawdown staircase)
     crm_ctx.current_equity = _initial_equity
@@ -13234,7 +14418,7 @@ async def _run(paper_mode: bool) -> None:
         "trade_repo": trade_repo,
         "lifecycle": lifecycle,
         "order_monitor": order_monitor,
-        # Per-mode execution stacks, keyed "paper"/"live". _execute_intraday_signal and
+        # Per-mode execution stacks, keyed "paper"/"live:<broker>". _execute_intraday_signal and
         # _execute_swing_signal resolve their stack from this by the segment's own
         # paper_mode, and fall back to the primary lifecycle above when it is absent.
         # 2026-08-27: this key was read in four places and assigned in none, so the
@@ -13248,6 +14432,10 @@ async def _run(paper_mode: bool) -> None:
         # Per-strategy paper/live override (strategies_registry.json
         # execution_mode) — see _resolve_is_paper for the full precedence.
         "strategy_execution_mode": _strategy_execution_mode,
+        # Live registry strategies' broker routes (R1) and the global.json broker used by
+        # strategies outside the registry.
+        "strategy_routes": _strategy_routes,
+        "legacy_live_broker": _live_broker_name,
         # pre-order chase guard: skip an intraday entry if the fill price has drifted
         # more than this many R past the breakout (risk.json hard_limits override).
         "max_entry_chase_r": float(risk_cfg.get("hard_limits", {}).get("max_entry_chase_r", 0.75)),
@@ -13287,6 +14475,8 @@ async def _run(paper_mode: bool) -> None:
         "seller_options": _seller_options,
         "broker": broker,
         "kite_brokers": _kite_brokers,
+        "angel_brokers": _angel_brokers,
+        "flattrade_token_targets": _flattrade_targets,
         # execution.json order_types, read here so callers of
         # place_entry_protection_and_poll (intraday + swing) can pass it through
         # instead of falling back to their own hardcoded defaults (2026-08-20:
@@ -13424,13 +14614,22 @@ async def _run(paper_mode: bool) -> None:
             else 0.0
         )
         _seller_options["event_calendar"] = EventCalendar(_seller_repo, earnings=earnings_calendar)
-        _seller_options["executor"] = OptionsLegExecutor(_options_order_broker)
+        # One options executor per stack ("paper", "live:<broker>"): each position is placed,
+        # closed and rolled through its OWN broker's executor (positions remember exec_broker).
+        _seller_options["executors"] = {
+            _sk: OptionsLegExecutor(_st["broker"]) for _sk, _st in stacks.items()
+        }
+        _desk_key = stack_key(True) if _options_is_paper else _primary_live
+        _seller_options["executor"] = _seller_options["executors"].get(
+            _desk_key or ""
+        ) or OptionsLegExecutor(_options_order_broker)
         # Executor for the OTHER mode, so a desk-hosted strategy (weekly condor, options_expiry_day)
         # follows its OWN registry execution_mode -- going live is one registry switch (+restart).
         # None when that mode's broker isn't wired (e.g. account paper_mode_locked) -> fail closed.
-        _alt_options_broker = broker_live if _options_is_paper else broker_paper
+        # (Kept for the legacy call style; the desk resolves executors from the map above.)
+        _alt_key = _primary_live if _options_is_paper else stack_key(True)
         _seller_options["alt_executor"] = (
-            OptionsLegExecutor(_alt_options_broker) if _alt_options_broker is not None else None
+            _seller_options["executors"].get(_alt_key) if _alt_key else None
         )
         _seller_options["desk"] = SellerDesk(
             _SellerStrategySelector(),
@@ -13455,6 +14654,16 @@ async def _run(paper_mode: bool) -> None:
             repo=_seller_repo,
             is_paper=_options_is_paper,
             alt_executor=_seller_options["alt_executor"],
+            executors=_seller_options["executors"],
+        )
+        # The legacy live broker: the primary live executor's broker, used by live strategies
+        # without a registry route (a routed live strategy uses its own broker's executor).
+        _seller_options["desk"].live_broker_name = (
+            (stack_broker(_primary_live) or _live_broker_name) if _primary_live else None
+        )
+        # system.per_broker_equity: live options entries sized/capped on their broker's equity.
+        _seller_options["desk"].per_broker_equity = (
+            _cfg("global").get("system", {}).get("per_broker_equity", False) is True
         )
         _seller_restored = await _seller_options["desk"].restore_positions()
         _log.info(
@@ -13668,8 +14877,6 @@ async def _run(paper_mode: bool) -> None:
         import json as _json
         import time as _time
 
-        from src.supervisor.reconciler import Reconciler as _Reconciler
-
         while not stop.is_set():
             _pool = _state.get("db_pool")
             if _pool is not None:
@@ -13683,22 +14890,31 @@ async def _run(paper_mode: bool) -> None:
                     # Reconciler compare real IFCI/JINDALSAW trades against the paper
                     # adapter's own empty holdings/positions, so every live position was
                     # unconditionally reported as a GHOST_DB_TRADE (found 2026-09-02).
+                    # Phase 2: one reconcile per LIVE broker (its own rows vs its own
+                    # books), primary first; with no live stack the primary `broker`
+                    # exactly as before. `_res`/`_db_open` stay the primary's.
                     _live_broker_for_positions = broker_live if broker_live is not None else broker
-                    _rec = _Reconciler(_live_broker_for_positions, _pool)
-                    _db_open = await _rec._fetch_db_open_trades()
-                    _res = await asyncio.wait_for(_rec.reconcile(_db_open), timeout=8.0)
-                    _auto_closed = 0
-                    with contextlib.suppress(Exception):
-                        _auto_closed = await _auto_close_ghost_trades(
-                            _res,
-                            _live_broker_for_positions,
-                            trade_repo,
-                            stacks.get("live", {}).get("order_monitor"),
-                            alert_manager=supervisor._alert_manager,
-                        )
+                    _rec_targets = _reconcile_targets(_state, stacks, _live_broker_for_positions)
+                    _runs = await _reconcile_live_brokers(
+                        _state,
+                        stacks,
+                        _live_broker_for_positions,
+                        _pool,
+                        trade_repo,
+                        supervisor._alert_manager,
+                        call_timeout=8.0,
+                    )
+                    _db_open = _runs[0]["db_open"]
+                    _res = _runs[0]["result"]
+                    _auto_closed = sum(int(r["auto_closed"]) for r in _runs)
+                    _all_gap_names = [f"{g.kind}:{g.symbol}" for g in _res.gaps] + [
+                        f"{g.kind}:{g.symbol}@{stack_broker(r['key']) if r['key'] else 'legacy'}"
+                        for r in _runs[1:]
+                        for g in r["result"].gaps
+                    ]
                     _rec_summary = (
                         len(_db_open),
-                        ", ".join(f"{g.kind}:{g.symbol}" for g in _res.gaps) or "none",
+                        ", ".join(_all_gap_names) or "none",
                         _auto_closed,
                     )
                     # Every 30s, forever, drowned the log with an unchanged line; log at INFO
@@ -13714,7 +14930,7 @@ async def _run(paper_mode: bool) -> None:
                             await _pool.execute(
                                 "INSERT INTO runtime_events (event_type, source, severity, payload) "
                                 "VALUES ('RECONCILIATION_CHANGED', 'reconciler', $1, $2::jsonb)",
-                                "WARNING" if _res.gaps else "INFO",
+                                "WARNING" if any(r["result"].gaps for r in _runs) else "INFO",
                                 _json.dumps(
                                     {
                                         "db_open_trades": _rec_summary[0],
@@ -13729,57 +14945,55 @@ async def _run(paper_mode: bool) -> None:
                                             for g in _res.gaps
                                         ],
                                         "auto_closed": _rec_summary[2],
+                                        **(
+                                            {
+                                                "other_brokers": [
+                                                    {
+                                                        "broker": stack_broker(r["key"])
+                                                        if r["key"]
+                                                        else "legacy",
+                                                        "gaps": [
+                                                            {
+                                                                "kind": g.kind,
+                                                                "symbol": g.symbol,
+                                                                "broker_qty": g.broker_qty,
+                                                                "db_qty": g.db_qty,
+                                                                "agent_trade_id": g.agent_trade_id,
+                                                            }
+                                                            for g in r["result"].gaps
+                                                        ],
+                                                    }
+                                                    for r in _runs[1:]
+                                                ]
+                                            }
+                                            if len(_runs) > 1
+                                            else {}
+                                        ),
                                     }
                                 ),
                             )
                     _rec_log(
                         "reconciliation_check db_open_trades=%d gaps_found=%d (%s) auto_closed=%d",
                         _rec_summary[0],
-                        len(_res.gaps),
+                        sum(len(r["result"].gaps) for r in _runs),
                         _rec_summary[1],
                         _rec_summary[2],
                     )
-                    _raw: Any = await asyncio.wait_for(
-                        _live_broker_for_positions.get_positions(), timeout=8.0
-                    )
-                    # get_positions() returns list[Position] (kite/paper adapters);
-                    # tolerate a raw {"net": [...]} dict defensively.
-                    _net: list[Any] = (
-                        (_raw.get("net", []) or []) if isinstance(_raw, dict) else list(_raw or [])
-                    )
-
-                    def _pos_sym(_p: Any) -> str | None:
-                        _s = getattr(_p, "symbol", None) or (
-                            _p.get("tradingsymbol") if isinstance(_p, dict) else None
-                        )
-                        return _s.split(":")[-1] if _s else None
-
-                    def _pos_qty(_p: Any) -> float:
-                        _q = getattr(_p, "quantity", None)
-                        if _q is None and isinstance(_p, dict):
-                            _q = _p.get("quantity") or _p.get("net_quantity")
-                        return float(_q or 0)
-
                     # Phase 2: kept fully separate — a symbol held in paper must NOT block a
                     # live entry on that symbol, and vice versa (confirmed with user). Any
                     # nonzero broker net position (including external/manual holdings) is
-                    # "live"; the paper set comes only from paper_trades.
-                    _held_live = {_pos_sym(_p) for _p in _net if _pos_sym(_p) and _pos_qty(_p) != 0}
-                    # Live = the broker's own books: the day position book above PLUS
+                    # "live"; the paper set comes only from paper_trades. Live = the UNION
+                    # of every live broker's books (R3), each its day positions PLUS
                     # delivery holdings, which is where any swing position from a prior
                     # day lives (found 2026-09-21: positions() alone never saw them, so
                     # a real-money swing entry could duplicate a held symbol). On a
                     # holdings failure keep the last known set — never silently shrink
                     # the guard for real money.
-                    try:
-                        _held_live |= _held_symbols_from_holdings(
-                            await asyncio.wait_for(
-                                _live_broker_for_positions.get_holdings(), timeout=8.0
-                            )
-                        )
-                    except Exception as _he:
-                        _held_live |= set(_state.get("held_symbols_live") or set())
-                        _log.error("live_holdings_fetch_err %s", str(_he)[:80])
+                    (
+                        _held_live,
+                        _held_live_primary,
+                        _held_all_loaded,  # noqa: F841 -- scoped via held_symbols_unloaded_keys
+                    ) = await _held_symbols_live_union(_state, _rec_targets, call_timeout=8.0)
                     _held_paper: set[str] = set()
                     try:
                         # CNC (swing) rows stay held across multiple days, so they must
@@ -13805,40 +15019,40 @@ async def _run(paper_mode: bool) -> None:
                     _state["held_symbols"] = _held_live | _held_paper
                     # Mark that the held set has been authoritatively loaded at least once,
                     # so the entry guard can fail CLOSED (refuse to trade) before the first
-                    # reconciliation completes — no more restart-window re-entries.
+                    # reconciliation completes — no more restart-window re-entries. Every
+                    # The PRIMARY's books were read (a primary failure raises above); a live
+                    # broker never read yet keeps ITS live entries fail-closed via
+                    # held_symbols_unloaded_keys (_held_symbols_unknown_for), not everyone's.
                     _state["held_symbols_loaded"] = True
                     # Self-healing safety net alongside the one-shot startup reseed:
                     # catches any position that entered without a track() call
                     # reaching OrderMonitor (e.g. an exception between fill and
                     # track(), or a future call site that forgets to wire it).
                     for _rc_mode, _rc_stack in stacks.items():
+                        _rc_scope = _reseed_scope(_rc_mode, stacks, _live_broker_name)
                         with contextlib.suppress(Exception):
                             await _reseed_order_monitor(
-                                _rc_stack["order_monitor"], _pool, _rc_mode == "paper"
+                                _rc_stack["order_monitor"],
+                                _pool,
+                                stack_is_paper(_rc_mode),
+                                **_rc_scope,
                             )
                         with contextlib.suppress(Exception):
                             await _reseed_pending_entries(
                                 _rc_stack["lifecycle"],
                                 _pool,
-                                _rc_mode == "paper",
+                                stack_is_paper(_rc_mode),
                                 _state.get("order_types", {}),
+                                **_rc_scope,
                             )
+                    with contextlib.suppress(Exception):
+                        await _report_orphaned_live_rows(_pool, stacks)
                     with contextlib.suppress(Exception):
                         await _reseed_swing_exit_state(_state)
                     with contextlib.suppress(Exception):
                         await _reseed_intraday_exit_state(_state)
-                    _bn = len(_held_live) + len(_held_paper)
-                    _dn = len(_db_open)
-                    _gaps_json = _json.dumps(
-                        [
-                            {
-                                "kind": g.kind,
-                                "symbol": g.symbol,
-                                "broker_qty": g.broker_qty,
-                                "db_qty": g.db_qty,
-                            }
-                            for g in _res.gaps
-                        ]
+                    _dn, _bn, _matched, _gaps_json, _by_broker_json = _reconciliation_log_fields(
+                        _runs, _held_live_primary, _held_paper
                     )
                     await _pool.execute(
                         "INSERT INTO reconciliation_log "
@@ -13851,15 +15065,50 @@ async def _run(paper_mode: bool) -> None:
                         "duration_ms = EXCLUDED.duration_ms",
                         _dn,
                         _bn,
-                        max(_dn - len(_res.gaps), 0),
+                        _matched,
                         _gaps_json,
                         int((_time.monotonic() - _t0) * 1000),
                     )
+                    # Per-broker detail (migration 091); best-effort, never blocks the row above.
+                    with contextlib.suppress(Exception):
+                        await _pool.execute(
+                            "UPDATE reconciliation_log SET by_broker = $1::jsonb WHERE id = 1",
+                            _by_broker_json,
+                        )
                 except TimeoutError:
                     _log.debug("reconciliation_timeout — broker slow, skipping cycle")
                 except Exception as _rec_exc:
                     _log.debug("reconciliation_write_failed err=%s", _rec_exc)
             await asyncio.sleep(30.0)
+
+    # Per-broker equity and risk (config/global.json system.per_broker_equity, default
+    # false; owner decision -- it moves live sizing from the primary's equity to each live
+    # broker's own). Off: nothing below runs and crm_ctx keeps the legacy single figures.
+    _per_broker_tasks: list[Any] = []
+    if _cfg("global").get("system", {}).get("per_broker_equity", False) is True:
+        from src.risk.budget import get_budget as _pb_budget
+
+        _state["per_broker_equity"] = True
+        _state.setdefault("equity_by_key", {})
+        _state.setdefault("cash_by_key", {})
+        _state.setdefault("equity_baseline_by_key", {})
+        _state.setdefault("entries_blocked_brokers", {})
+        crm_ctx.per_broker_equity = True
+        crm_ctx.legacy_live_broker = _live_broker_name or LEGACY_LIVE_BROKER
+        # Same dict objects: the fetch loop and the breaker update CRM's view in place.
+        crm_ctx.mode_current_equity = _state["equity_by_key"]
+        crm_ctx.mode_total_capital = _state["equity_baseline_by_key"]
+        crm_ctx.entries_blocked_brokers = _state["entries_blocked_brokers"]
+        crm_ctx.min_viable_equity_rupees = _pb_budget().account.min_viable_equity_rupees
+        for _pb_key, _pb_stack in live_stacks(stacks).items():
+            await _fetch_live_stack_equity(_state, _pb_key, _pb_stack["broker"])
+        _refresh_options_risk_budget(crm_ctx)
+        _log.info(
+            "per_broker_equity_on equity=%s baseline=%s",
+            _state["equity_by_key"],
+            _state["equity_baseline_by_key"],
+        )
+        _per_broker_tasks.append(_per_broker_equity_loop(_state, stop))
 
     # One _monitor_loop task per active stack (paper and/or live) — each polls
     # only its own broker/OrderMonitor and drains closed trades tagged with its
@@ -13874,9 +15123,10 @@ async def _run(paper_mode: bool) -> None:
             trade_repo,
             _stack["price_truth"],
             cycle_seconds=float(_monitoring_cfg.get("cycle_seconds", 2.0)),
-            is_paper=(_mode_name == "paper"),
+            is_paper=stack_is_paper(_mode_name),
             all_order_monitors=_all_order_monitors,
             lifecycle=_stack["lifecycle"],
+            broker=_stack["broker"],
         )
         for _mode_name, _stack in stacks.items()
     ]
@@ -13906,26 +15156,26 @@ async def _run(paper_mode: bool) -> None:
     # forever afterward regardless).
     _boot_live_broker = broker_live if broker_live is not None else broker
     try:
-        from src.supervisor.reconciler import Reconciler as _BootReconciler
-
-        _boot_rec = _BootReconciler(_boot_live_broker, db_pool)
-        _boot_db_open = await asyncio.wait_for(_boot_rec._fetch_db_open_trades(), timeout=10.0)
-        _boot_res = await asyncio.wait_for(_boot_rec.reconcile(_boot_db_open), timeout=10.0)
-        _boot_closed = await asyncio.wait_for(
-            _auto_close_ghost_trades(
-                _boot_res,
-                _boot_live_broker,
-                trade_repo,
-                stacks.get("live", {}).get("order_monitor"),
-                alert_manager=supervisor._alert_manager,
-            ),
-            timeout=15.0,
+        # Every live broker (Phase 2), primary first; each with its own rows/books/monitor.
+        _boot_runs = await _reconcile_live_brokers(
+            _state,
+            stacks,
+            _boot_live_broker,
+            db_pool,
+            trade_repo,
+            supervisor._alert_manager,
+            call_timeout=10.0,
+            fetch_timeout=10.0,
+            ghost_timeout=15.0,
+            suppress_ghost_errors=False,
         )
-        _log.info(
-            "boot_reconciliation_done gaps=%d auto_closed=%d",
-            len(_boot_res.gaps),
-            _boot_closed,
-        )
+        for _br in _boot_runs:
+            _log.info(
+                "boot_reconciliation_done gaps=%d auto_closed=%d%s",
+                len(_br["result"].gaps),
+                _br["auto_closed"],
+                f" broker={stack_broker(_br['key'])}" if len(_boot_runs) > 1 and _br["key"] else "",
+            )
     except Exception as _boot_rec_exc:
         _log.warning("boot_reconciliation_failed err=%s — periodic loop will retry", _boot_rec_exc)
 
@@ -13951,6 +15201,7 @@ async def _run(paper_mode: bool) -> None:
         ),
         *_monitor_tasks,
         _equity_loop(broker, _state, supervisor._alert_manager, stop),
+        *_per_broker_tasks,
         _regime_loop(
             broker,
             _state,
@@ -13990,6 +15241,8 @@ async def _run(paper_mode: bool) -> None:
         _llm_health_loop(stop),
         _nfo_ingester_loop(_state, stop),
         _kite_token_refresh_loop(_state, stop),
+        _angel_token_refresh_loop(_state, stop),
+        _flattrade_token_refresh_loop(_state, stop),
         _options_seller_vol_loop(_state, stop),
         _seller_desk_loop(_state, stop),
         _options_intraday_short_premium_loop(_state, stop),

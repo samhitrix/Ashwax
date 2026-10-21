@@ -1,5 +1,9 @@
 """
-ashwax API server — FastAPI wrapper around live Kite Connect data.
+ashwax API server — FastAPI wrapper around live broker and DB data.
+
+Kite is optional: market data comes from the configured market-data router and funds from
+each configured broker's get_margins() (src/api/broker_access.py). Kite-account-specific
+endpoints (positions/orders/holdings/GTT/WS) return their empty shape without Kite.
 
 Endpoints:
   GET  /api/session          validate access token
@@ -31,8 +35,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +48,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from kiteconnect import KiteConnect
 
-from src.brokers.adapters.kite.adapter import _margin_from_kite
+from src.api.broker_access import (
+    BROKER_FAILURE_TTL_SECONDS,
+    BROKERS,
+    LABELS,
+    SECONDARY_TIMEOUT_SECONDS,
+    TOKEN_ENV,
+    BrokerAccess,
+)
 from src.brokers.kite_auth import CredentialsMissingError, auto_refresh
+from src.brokers.registry import list_brokers
+from src.brokers.routing import BrokerRoute, broker_is_configured, parse_strategy_routes
 from src.infrastructure.logger import get_logger
 from src.risk.report_costs import equity_costs, options_costs
 
@@ -84,12 +99,17 @@ app.include_router(_news_router)
 async def _startup() -> None:
     global _ACCESS_TOKEN, _db_pool
     _log = get_logger(__name__)
-    try:
-        _ACCESS_TOKEN = auto_refresh(_ENV)
-    except CredentialsMissingError as exc:
-        _log.warning("kite_auth_skipped", extra={"ctx": {"reason": str(exc)}})
-    except Exception as exc:
-        _log.error("kite_auth_failed", extra={"ctx": {"error": str(exc)}})
+    if not _kite_configured():
+        # Kite is optional: no KITE_API_KEY means no Kite login attempt (spec 3.2).
+        _log.info("kite_auth_skipped", extra={"ctx": {"reason": "Kite not configured"}})
+    else:
+        try:
+            # Worker thread: a Kite re-login runs asyncio.run(), illegal on this loop.
+            _ACCESS_TOKEN = await asyncio.to_thread(auto_refresh, _ENV)
+        except CredentialsMissingError as exc:
+            _log.warning("kite_auth_skipped", extra={"ctx": {"reason": str(exc)}})
+        except Exception as exc:
+            _log.error("kite_auth_failed", extra={"ctx": {"error": str(exc)}})
     try:
         from src.db.pool import init_pool
 
@@ -142,6 +162,30 @@ def _kite() -> KiteConnect:
         return _kite_client
 
 
+def _kite_configured() -> bool:
+    """Kite credentials present. Kite-account-specific endpoints are guarded by this."""
+    return broker_is_configured("kite", os.environ)
+
+
+_BROKER_ACCESS = BrokerAccess(_ENV)
+
+
+def _access() -> BrokerAccess:
+    """Read-only market-data router + per-broker funds for this process (tests replace it)."""
+    return _BROKER_ACCESS
+
+
+def _legacy_broker_name() -> str | None:
+    """global.json broker.name (display preference for the single funds card only)."""
+    try:
+        glob = json.loads((_config_dir() / "global.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    cfg = glob.get("broker")
+    name = cfg.get("name") if isinstance(cfg, dict) else cfg
+    return name if isinstance(name, str) else None
+
+
 # Short-lived cache for broker reads, with single-flight coalescing.
 # The dashboard polls several broker-backed endpoints on one timer, and each was an
 # independent uncoalesced Zerodha round-trip; concurrent callers (a second browser
@@ -160,6 +204,7 @@ def _clear_broker_cache() -> None:
     global _kite_client, _kite_client_token
     with _BROKER_CACHE_LOCK:
         _BROKER_CACHE.clear()
+    _BROKER_ACCESS.clear_cache()
     with _kite_client_lock:
         _kite_client = None
         _kite_client_token = ""
@@ -208,7 +253,14 @@ def _get_option_chain_provider() -> Any:
     from src.brokers.adapters.kite.adapter import KiteAdapter
     from src.options.nfo_chain import NFOChainProvider
 
-    if _option_chain_broker is None:
+    if not _kite_configured():
+        # No Kite: chain data through the market-data router (per_use.options_chain order).
+        router = _access().require_router()
+        if _option_chain_provider is None or _option_chain_broker is not router:
+            _option_chain_broker = router
+            _option_chain_provider = NFOChainProvider(router)
+        return _option_chain_provider
+    if _option_chain_broker is None or not isinstance(_option_chain_broker, KiteAdapter):
         _option_chain_broker = KiteAdapter.from_env()
         _option_chain_provider = NFOChainProvider(_option_chain_broker)
     _option_chain_broker.set_access_token(_ACCESS_TOKEN)
@@ -513,24 +565,93 @@ async def agent_status() -> dict[str, Any]:
     }
 
 
-@app.get("/api/session")
-def session_status() -> dict[str, Any]:
+async def _kite_profile() -> tuple[dict[str, Any] | None, str]:
+    """(Kite profile, "") or (None, error). One call per poll, shared by the Kite card and
+    the legacy /api/session fields.
+
+    30s TTL. This drives the dashboard's connected/disconnected badge, so it must still
+    detect a dead token promptly — but the profile payload itself is static for the whole
+    trading day, and calling it on every poll made this one of the slowest endpoints in a
+    refresh cycle (8.8s under load). A failed call is not cached, so a genuine auth failure
+    surfaces at once."""
     try:
         k = _kite()
-        # 30s TTL. This drives the dashboard's connected/disconnected badge, so it
-        # must still detect a dead token promptly — but the profile payload itself
-        # is static for the whole trading day, and calling it on every poll made
-        # this one of the slowest endpoints in a refresh cycle (8.8s under load).
-        # A failed call is not cached, so a genuine auth failure surfaces at once.
-        profile: dict[str, Any] = _broker_cached("profile", 30.0, k.profile)
-        return {
-            "ok": True,
-            "user_id": profile.get("user_id"),
-            "user_name": profile.get("user_name"),
-            "email": profile.get("email"),
-        }
+        profile: dict[str, Any] = await asyncio.to_thread(
+            _broker_cached, "profile", 30.0, k.profile
+        )
+        return profile, ""
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return None, str(exc)
+
+
+async def _secondary_session(name: str) -> tuple[bool, str]:
+    """(token valid, message) for a non-Kite broker. BrokerAccess bounds the check to
+    SECONDARY_TIMEOUT_SECONDS and reuses a failure for BROKER_FAILURE_TTL_SECONDS."""
+    try:
+        status = await _access().session_status(name)
+        return bool(status.is_valid), str(status.message or "")
+    except Exception as exc:
+        return False, str(exc) or type(exc).__name__
+
+
+def _broker_card(name: str, check: tuple[bool, str] | None) -> dict[str, Any]:
+    """Health card: configured (credentials), token present/valid and REST connected (an
+    authenticated REST call succeeded). Real checks only; a broker that is not configured
+    is reported as such, never as healthy. `check` is None for an unconfigured broker."""
+    card: dict[str, Any] = {
+        "broker": name,
+        "label": LABELS[name],
+        "configured": check is not None,
+        "token_present": bool(os.environ.get(TOKEN_ENV[name], "").strip()),
+        "token_valid": None,
+        "rest_connected": None,
+        "error": None,
+    }
+    if check is not None:
+        valid, msg = check
+        card["token_present"] = card["token_present"] or _access().token_present(name)
+        card["token_valid"] = valid
+        card["rest_connected"] = valid
+        card["error"] = msg[:200] or None
+    return card
+
+
+@app.get("/api/session")
+async def session_status() -> dict[str, Any]:
+    """Kite profile (the legacy fields the dashboard badge reads) plus `brokers`: one health
+    card per broker. Without Kite: ok=False, configured=False, and the cards still report
+    Angel One / Flattrade.
+
+    All broker checks run concurrently and each non-Kite check is bounded, so a slow Angel
+    One / Flattrade adds at most SECONDARY_TIMEOUT_SECONDS (then its failure is reused) and
+    never blanks the Kite badge."""
+    kite_on = _kite_configured()
+    others = [n for n in BROKERS if n != "kite" and broker_is_configured(n, os.environ)]
+
+    async def _no_kite() -> tuple[dict[str, Any] | None, str]:
+        return None, "Kite not configured (no KITE_API_KEY)"
+
+    kite_res, *other_res = await asyncio.gather(
+        _kite_profile() if kite_on else _no_kite(),
+        *(_secondary_session(n) for n in others),
+    )
+    checks: dict[str, tuple[bool, str] | None] = dict.fromkeys(BROKERS)
+    checks.update(zip(others, other_res, strict=True))
+    profile, kite_err = kite_res
+    if kite_on:
+        checks["kite"] = (profile is not None, kite_err)
+    brokers = [_broker_card(n, checks[n]) for n in BROKERS]
+    if not kite_on:
+        return {"ok": False, "configured": False, "error": kite_err, "brokers": brokers}
+    if profile is None:
+        return {"ok": False, "error": kite_err, "brokers": brokers}
+    return {
+        "ok": True,
+        "user_id": profile.get("user_id"),
+        "user_name": profile.get("user_name"),
+        "email": profile.get("email"),
+        "brokers": brokers,
+    }
 
 
 @app.get("/api/config")
@@ -577,6 +698,96 @@ def _backup_config_file(path: Path) -> None:
     backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+# exec_broker (migration 089) is the broker that HOLDS a trade/position row. The dashboard can be
+# deployed before the migration is applied, so every SELECT of it degrades to a NULL column
+# (SQLSTATE 42703 = undefined_column ONLY; any other DB error keeps its existing handling) and the
+# column is re-tried every _EXEC_BROKER_RECHECK_S so it appears without a restart.
+_EXEC_BROKER_RECHECK_S = 60.0
+_exec_broker_missing_until: dict[str, float] = {}
+
+
+async def _fetch_exec_broker_aware(key: str, build: Callable[[str], str], *args: Any) -> list[Any]:
+    """Run build(column_sql) with the real exec_broker column; if the DB lacks it, with
+    `NULL::text AS exec_broker`. `key` names the table for the remembered-missing flag."""
+    now = time.monotonic()
+    if now >= _exec_broker_missing_until.get(key, 0.0):
+        try:
+            return list(await _db_pool.fetch(build("exec_broker"), *args))
+        except Exception as exc:
+            if getattr(exc, "sqlstate", None) != "42703":
+                raise
+            _exec_broker_missing_until[key] = now + _EXEC_BROKER_RECHECK_S
+            _log.warning(
+                "exec_broker_column_missing table=%s -- apply migration 089; live rows are "
+                "reported as 'kite' (the only live broker before it) until then",
+                key,
+            )
+    return list(await _db_pool.fetch(build("NULL::text AS exec_broker"), *args))
+
+
+def _exec_broker_label(row: Any, is_paper: bool) -> str | None:
+    """Broker holding a row: None for paper (nothing was placed), else the stamped broker;
+    NULL on a live row is legacy = "kite"."""
+    return None if is_paper else (row.get("exec_broker") or "kite")
+
+
+def _route_if_live(entry: dict[str, Any]) -> BrokerRoute:
+    """R1 route of a registry entry evaluated as if it were live (registered, non-paper and
+    configured via env credentials). Same function the orchestrator boots its route table with."""
+    candidate = {**entry, "execution_mode": "live"}
+    return parse_strategy_routes([candidate], list_brokers(), os.environ)[str(entry["name"])]
+
+
+# Every config writer here is a read-modify-write on a file other requests also write, and sync
+# endpoints run in a threadpool: hold this lock across the whole read -> modify -> write (not just
+# the write) or concurrent PUTs lose each other's updates.
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
+def _write_json_atomic(path: Path, content: dict[str, Any]) -> None:
+    """Backup, then write through a UNIQUE temp file in the same directory and os.replace it in
+    (a shared temp name lets one writer replace another's half-written file). Call with
+    _CONFIG_WRITE_LOCK held."""
+    _backup_config_file(path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(content, indent=2, ensure_ascii=False) + "\n")
+        # mkstemp creates 0600; keep the file's existing mode (0644 by default).
+        os.chmod(tmp_name, (path.stat().st_mode & 0o777) if path.exists() else 0o644)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _registry_live_violations(content: dict[str, Any], current_path: Path) -> list[str]:
+    """R1 problems in a registry about to be saved wholesale: a live entry with no usable broker
+    that is NEW or whose (execution_mode, broker) differs from the stored entry of that name.
+    A legacy-invalid live entry that is left unchanged is not reported, so unrelated edits to a
+    registry that already contains one still save."""
+    entries = content.get("strategies")
+    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+        raise HTTPException(status_code=400, detail='"strategies" must be a list of objects')
+    try:
+        stored = json.loads(current_path.read_text(encoding="utf-8")).get("strategies", [])
+        current = {
+            e.get("name"): (e.get("execution_mode"), e.get("broker"))
+            for e in stored
+            if isinstance(e, dict)
+        }
+    except (OSError, ValueError, AttributeError):
+        current = {}
+    bad: list[str] = []
+    for e in entries:
+        if e.get("execution_mode") != "live" or not e.get("name"):
+            continue
+        route = parse_strategy_routes([e], list_brokers(), os.environ)[e["name"]]
+        if not route.ok and current.get(e["name"]) != ("live", e.get("broker")):
+            bad.append(f"{e['name']} ({route.reason})")
+    return bad
+
+
 @app.get("/api/settings/files")
 def get_settings_files() -> list[dict[str, str]]:
     return [{"name": stem, "path": f"config/{stem}.json"} for stem in sorted(_config_allowlist())]
@@ -602,10 +813,18 @@ def update_setting(name: str, body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail='Body must be {"content": <object>}')
     config_dir = _config_dir()
     path = config_dir / f"{name}.json"
-    _backup_config_file(path)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(content, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp_path, path)
+    with _CONFIG_WRITE_LOCK:
+        if name == "strategies_registry":
+            # Same R1 rule as the dedicated endpoints: never create or keep-by-edit a live
+            # strategy without a usable broker.
+            bad = _registry_live_violations(content, path)
+            if bad:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot save registry: live strategies without a usable broker: "
+                    + "; ".join(bad),
+                )
+        _write_json_atomic(path, content)
     return {"ok": True}
 
 
@@ -652,12 +871,17 @@ async def get_positions(mode: str = "all") -> dict[str, Any]:
     """`mode`: "all" (default) | "paper" | "live" — filters both net/day lists
     by each row's `paper` flag (live Kite rows never carry that key, so they
     read as paper=False)."""
-    try:
-        # 3s TTL, below the dashboard's 5s poll: each poll still triggers a real
-        # read, while concurrent callers share one round-trip instead of racing.
-        cached = await asyncio.to_thread(_broker_cached, "positions", 3.0, _kite().positions)
-    except Exception as exc:
-        return {"error": str(exc), "net": [], "day": []}
+    if not _kite_configured():
+        # Broker positions here are Kite's raw payload; without Kite there are none to
+        # show, but the paper rows below (DB truth, router LTP) still are.
+        cached: Any = {"net": [], "day": []}
+    else:
+        try:
+            # 3s TTL, below the dashboard's 5s poll: each poll still triggers a real
+            # read, while concurrent callers share one round-trip instead of racing.
+            cached = await asyncio.to_thread(_broker_cached, "positions", 3.0, _kite().positions)
+        except Exception as exc:
+            return {"error": str(exc), "net": [], "day": []}
     # _broker_cached returns the SAME object to every caller within its TTL. This
     # endpoint mutates rows below (LTP overlay, external/strategy tagging) and
     # appends synthetic paper-trade rows, so it must work on a private copy —
@@ -730,7 +954,7 @@ async def get_positions(mode: str = "all") -> dict[str, Any]:
                             str(_trade["entry_timestamp"]) if _trade["entry_timestamp"] else ""
                         )
     # Surface OPEN paper trades in the same view, tagged paper. Read from the
-    # paper_trades table (the broker never sees them); LTP from Kite for live P&L.
+    # paper_trades table (the broker never sees them); LTP from the market-data router.
     if _db_pool is not None and isinstance(data, dict):
         try:
             prows = await _db_pool.fetch(
@@ -746,9 +970,7 @@ async def get_positions(mode: str = "all") -> dict[str, Any]:
             )
             if prows:
                 try:
-                    _ltp = await asyncio.to_thread(
-                        _kite().ltp, [f"NSE:{r['symbol']}" for r in prows]
-                    )
+                    _ltp = await _access().ltp([f"NSE:{r['symbol']}" for r in prows])
                 except Exception:
                     _ltp = {}
                 for r in prows:
@@ -806,11 +1028,12 @@ async def get_swing_positions(mode: str = "all") -> list[Any]:
     if _db_pool is None:
         return []
     try:
-        rows = await _db_pool.fetch(
-            """
+        rows = await _fetch_exec_broker_aware(
+            "trades",
+            lambda col: f"""
             SELECT agent_trade_id, symbol, strategy_name, direction, quantity,
                    fill_price, exit_price, current_sl, current_target, partial_pnl_booked,
-                   entry_timestamp, exit_timestamp, false AS is_paper
+                   entry_timestamp, exit_timestamp, false AS is_paper, {col}
               FROM trades
              WHERE product = 'CNC' AND order_state NOT IN
                    ('CLOSED','REJECTED','CANCELLED','TIMED_OUT')
@@ -818,13 +1041,13 @@ async def get_swing_positions(mode: str = "all") -> list[Any]:
             UNION ALL
             SELECT agent_trade_id, symbol, strategy_name, direction, quantity,
                    fill_price, exit_price, current_sl, current_target, partial_pnl_booked,
-                   entry_timestamp, exit_timestamp, is_paper
+                   entry_timestamp, exit_timestamp, is_paper, NULL::text AS exec_broker
               FROM paper_trades
              WHERE product = 'CNC' AND order_state NOT IN
                    ('CLOSED','REJECTED','CANCELLED','TIMED_OUT')
                AND fill_price IS NOT NULL
              ORDER BY entry_timestamp DESC
-            """
+            """,  # noqa: S608
         )
     except Exception:
         return []
@@ -851,7 +1074,7 @@ async def get_swing_positions(mode: str = "all") -> list[Any]:
             # which the Day %Chg column needs; falls back to ltp() (no prev close)
             # so a quote() failure can never blank the LTP/P&L columns.
             try:
-                quotes = await asyncio.to_thread(_kite().quote, _qkeys)
+                quotes = await _access().quote(_qkeys)
             except Exception as _qe:
                 _log.warning(
                     "positions_quote_failed err=%s: %s — falling back to ltp() "
@@ -859,7 +1082,7 @@ async def get_swing_positions(mode: str = "all") -> list[Any]:
                     type(_qe).__name__,
                     _qe,
                 )
-                quotes = await asyncio.to_thread(_kite().ltp, _qkeys)
+                quotes = await _access().ltp(_qkeys)
             _by_query = {
                 sym: float(q.get("last_price", 0) or 0) for sym, q in (quotes or {}).items()
             }
@@ -903,6 +1126,7 @@ async def get_swing_positions(mode: str = "all") -> list[Any]:
                 "entryTime": str(r["entry_timestamp"]) if r["entry_timestamp"] else "",
                 "exitTime": str(r["exit_timestamp"]) if r["exit_timestamp"] else "",
                 "paper": bool(r["is_paper"]),
+                "exec_broker": _exec_broker_label(r, bool(r["is_paper"])),
                 "ltp": ltp if ltp > 0 else None,
                 # Stock's own move vs the previous session's close (not signed by
                 # position direction); None when either price is unavailable.
@@ -924,6 +1148,8 @@ async def get_swing_positions(mode: str = "all") -> list[Any]:
 
 @app.get("/api/orders")
 def get_orders() -> list[Any]:
+    if not _kite_configured():
+        return []  # Kite order book; nothing to show without Kite (never mock)
     try:
         # 4s TTL: orders change only on a fill/placement, and the dashboard polls at 5s.
         return _broker_cached("orders", 4.0, _kite().orders)
@@ -933,6 +1159,8 @@ def get_orders() -> list[Any]:
 
 @app.get("/api/holdings")
 def get_holdings() -> list[Any]:
+    if not _kite_configured():
+        return []  # Kite holdings; nothing to show without Kite (never mock)
     try:
         # Holdings settle overnight; a 60s TTL is still far fresher than they change.
         return _broker_cached("holdings", 60.0, _kite().holdings)
@@ -940,28 +1168,52 @@ def get_holdings() -> list[Any]:
         return [{"error": str(exc)}]
 
 
-@app.get("/api/margins")
-def get_margins() -> dict[str, Any]:
-    """Raw Kite margins payload plus a normalized `ashwax` block.
-
-    Zerodha reports equity.available.cash as 0 for accounts whose free cash sits
-    in available.live_balance, so the raw field is not spending power and reads 0
-    on the dashboard. `ashwax` carries the same figures the engine trades on
-    (see _margin_from_kite) — clients must read that, not the raw fields.
-    """
-    try:
-        # 4s TTL — margins move only on fills, same reasoning as /api/orders.
-        data = _broker_cached("margins", 4.0, _kite().margins)
-    except Exception as exc:
-        return {"error": str(exc)}
-    m = _margin_from_kite(data)
-    data["ashwax"] = {
-        "available_cash": m.available_cash,
-        "used_margin": m.used_margin,
-        "collateral": m.collateral,
-        "net": m.equity,
+def _funds_block(m: Any) -> dict[str, float]:
+    return {
+        "available_cash": float(m.available_cash),
+        "used_margin": float(m.used_margin),
+        "collateral": float(m.collateral),
+        "net": float(m.equity),
     }
-    return data
+
+
+@app.get("/api/margins")
+async def get_margins() -> dict[str, Any]:
+    """Funds through each configured broker's get_margins() (no raw broker payload).
+
+    `ashwax` = the funds card's broker (global.json broker.name when configured, else the
+    first configured broker; named in `broker`), normalized the way the engine trades on
+    (Kite's zero equity.available.cash -> live_balance, see _margin_from_kite). `brokers`
+    has one block per configured broker ({"error": ...} when that read failed). On a
+    failure of the card's broker there is no `ashwax` block, so the dashboard shows its
+    empty state rather than 0 funds."""
+    access = _access()
+    name = access.primary_account(_legacy_broker_name())
+    if name is None:
+        return {"error": "no broker configured", "brokers": {}}
+
+    async def _one(b: str) -> dict[str, Any]:
+        try:
+            # 4s TTL (BrokerAccess.margins) — margins move only on fills. Brokers other than
+            # the card's are bounded and their failures reused, so they cannot delay it.
+            if b == name:
+                return _funds_block(await access.margins(b))
+            return _funds_block(
+                await access.margins(
+                    b, timeout_s=SECONDARY_TIMEOUT_SECONDS, fail_ttl_s=BROKER_FAILURE_TTL_SECONDS
+                )
+            )
+        except Exception as exc:
+            return {"error": str(exc) or type(exc).__name__}
+
+    configured = access.configured()
+    brokers: dict[str, Any] = dict(
+        zip(configured, await asyncio.gather(*(_one(b) for b in configured)), strict=True)
+    )
+    primary = brokers.get(name) or {"error": f"{name} funds unavailable"}
+    if "error" in primary:
+        return {"error": primary["error"], "broker": name, "brokers": brokers}
+    return {"broker": name, "ashwax": primary, "brokers": brokers}
 
 
 @app.get("/api/options_funds_margins")
@@ -997,8 +1249,10 @@ async def get_options_funds_margins() -> dict[str, Any]:
     live_margin = 0.0
     live_equity = 0.0
     try:
-        live_data = _broker_cached("margins", 4.0, _kite().margins)
-        live_m = _margin_from_kite(live_data)
+        _live_name = _access().primary_account(_legacy_broker_name())
+        if _live_name is None:
+            raise RuntimeError("no broker configured")
+        live_m = await _access().margins(_live_name)
         # Fund Available = free cash (what you could actually withdraw);
         # Margin Available = total margin capacity for new F&O positions
         # (net equity, incl. collateral) -- operator correction 2026-10-07,
@@ -1029,6 +1283,8 @@ async def get_options_funds_margins() -> dict[str, Any]:
 
 @app.get("/api/gtt")
 def get_gtt() -> list[Any]:
+    if not _kite_configured():
+        return []  # Kite GTTs; nothing to show without Kite (never mock)
     try:
         # GTTs are placed/modified rarely; 10s is well inside useful freshness.
         return _broker_cached("gtt", 10.0, _kite().get_gtts)
@@ -1037,11 +1293,12 @@ def get_gtt() -> list[Any]:
 
 
 @app.get("/api/ltp")
-def get_ltp(symbols: str = "NSE:NIFTY 50") -> dict[str, Any]:
-    """Comma-separated instrument symbols. Uses quote() to include ohlc.close for change %."""
+async def get_ltp(symbols: str = "NSE:NIFTY 50") -> dict[str, Any]:
+    """Comma-separated instrument symbols, served by the market-data router. Kite-shaped
+    rows; ohlc.close (for change %) only when a provider with quotes (Kite) answered."""
     try:
         sym_list = [s.strip() for s in symbols.split(",")]
-        return _kite().quote(sym_list)
+        return await _access().quote(sym_list)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -1073,6 +1330,21 @@ async def get_option_chain(symbol: str, expiry: str | None = None) -> dict[str, 
         except ValueError:
             return {"error": f"invalid expiry date: {expiry!r}"}
 
+    if not _kite_configured() and _access().rate_capped():
+        # A chain costs ~120 per-symbol quote calls on a rate-capped provider (Flattrade), on
+        # every 5s page poll, out of a per-key budget the orchestrator trades on. Refused.
+        return {
+            "symbol": root,
+            "expiry": None,
+            "spot": None,
+            "strikes": [],
+            "rate_limited": True,
+            "error": (
+                "Option chain unavailable: the only market-data provider is rate-capped "
+                "(Flattrade); its request budget is kept for trading. Add Kite or Angel One "
+                "credentials to see the chain here."
+            ),
+        }
     try:
         provider = _get_option_chain_provider()
         chain = await provider.get_chain(f"NSE:{root}", min_days_to_expiry=min_days, now=now)
@@ -1380,11 +1652,21 @@ def get_strategies() -> list[Any]:
     _reg_path = _BASE / "config" / "strategies_registry.json"
     _registry_enabled: dict[str, bool] = {}
     _registry_execution_mode: dict[str, str] = {}
+    _registry_broker: dict[str, str | None] = {}
+    _registry_broker_ready: dict[str, bool | None] = {}
     if _reg_path.exists():
         try:
             for entry in json.loads(_reg_path.read_text(encoding="utf-8")).get("strategies", []):
                 _registry_enabled[entry["name"]] = bool(entry.get("enabled", True))
                 _registry_execution_mode[entry["name"]] = entry.get("execution_mode", "paper")
+                _b = entry.get("broker")
+                _registry_broker[entry["name"]] = _b if isinstance(_b, str) and _b else None
+                # brokerReady = the R1 route is usable. Live entries: always evaluated (a live
+                # entry without a broker is False, its signals would be rejected). Paper entries:
+                # None when no broker is chosen yet, else whether the chosen one WOULD be usable
+                # if the strategy were switched live.
+                if entry.get("execution_mode") == "live" or _registry_broker[entry["name"]]:
+                    _registry_broker_ready[entry["name"]] = _route_if_live(entry).ok
         except Exception:
             pass
     strategies: list[dict[str, Any]] = []
@@ -1404,6 +1686,8 @@ def get_strategies() -> list[Any]:
                         "display_name": meta.get("display_name") or name.replace("_", " ").title(),
                         "enabled": _registry_enabled.get(name, meta.get("enabled", True)),
                         "executionMode": _registry_execution_mode.get(name, "paper"),
+                        "broker": _registry_broker.get(name),
+                        "brokerReady": _registry_broker_ready.get(name),
                         "direction": meta.get("direction", "LONG"),
                         "timeframe": meta.get("timeframe", ""),
                         "product": meta.get("product", ""),
@@ -1448,31 +1732,28 @@ def update_strategy_enabled(name: str, body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"No strategy file found for: {name}")
 
     reg_path = _BASE / "config" / "strategies_registry.json"
-    registry: dict[str, Any] = (
-        json.loads(reg_path.read_text(encoding="utf-8"))
-        if reg_path.exists()
-        else {"strategies": []}
-    )
-    strategies = registry.setdefault("strategies", [])
-    for entry in strategies:
-        if entry.get("name") == name:
-            entry["enabled"] = enabled
-            break
-    else:
-        strategies.append(
-            {
-                "name": name,
-                "source": source,
-                "spec_path": spec_path,
-                "enabled": enabled,
-                "min_quality_score": 65,
-            }
+    with _CONFIG_WRITE_LOCK:
+        registry: dict[str, Any] = (
+            json.loads(reg_path.read_text(encoding="utf-8"))
+            if reg_path.exists()
+            else {"strategies": []}
         )
-
-    _backup_config_file(reg_path)
-    tmp_path = reg_path.with_suffix(reg_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp_path, reg_path)
+        strategies = registry.setdefault("strategies", [])
+        for entry in strategies:
+            if entry.get("name") == name:
+                entry["enabled"] = enabled
+                break
+        else:
+            strategies.append(
+                {
+                    "name": name,
+                    "source": source,
+                    "spec_path": spec_path,
+                    "enabled": enabled,
+                    "min_quality_score": 65,
+                }
+            )
+        _write_json_atomic(reg_path, registry)
     return {"ok": True, "enabled": enabled}
 
 
@@ -1482,6 +1763,10 @@ def update_strategy_execution_mode(name: str, body: dict[str, Any]) -> dict[str,
     Always explicit: "paper" or "live" — see _resolve_is_paper in orchestrator.py
     for the full precedence (operator.json paper_mode_locked always wins, so
     "live" is refused while the account is locked).
+    Going "live" additionally needs a usable broker (spec rule R1: no default, no failover):
+    the entry's stored `broker`, or one supplied in the body as {"broker": "<name>"}, must be
+    registered, non-paper and configured, else HTTP 400 and nothing is written. "paper" never
+    touches the stored broker.
     Takes effect on the next engine restart, same as every other config here."""
     mode = body.get("executionMode")
     if mode not in ("paper", "live"):
@@ -1502,20 +1787,61 @@ def update_strategy_execution_mode(name: str, body: dict[str, Any]) -> dict[str,
     reg_path = _BASE / "config" / "strategies_registry.json"
     if not reg_path.exists():
         raise HTTPException(status_code=404, detail="strategies_registry.json not found")
-    registry: dict[str, Any] = json.loads(reg_path.read_text(encoding="utf-8"))
-    strategies = registry.setdefault("strategies", [])
-    for entry in strategies:
-        if entry.get("name") == name:
-            entry["execution_mode"] = mode
-            break
-    else:
-        raise HTTPException(status_code=404, detail=f"No registry entry found for: {name}")
+    with _CONFIG_WRITE_LOCK:
+        registry: dict[str, Any] = json.loads(reg_path.read_text(encoding="utf-8"))
+        strategies = registry.setdefault("strategies", [])
+        for entry in strategies:
+            if entry.get("name") == name:
+                if mode == "live":
+                    broker = body["broker"] if "broker" in body else entry.get("broker")
+                    if "broker" in body and (not isinstance(broker, str) or not broker.strip()):
+                        raise HTTPException(
+                            status_code=400, detail='"broker" must be a non-empty broker name'
+                        )
+                    route = _route_if_live({**entry, "broker": broker})
+                    if not route.ok:
+                        raise HTTPException(
+                            status_code=400, detail=f"Cannot set {name} live: {route.reason}"
+                        )
+                    entry["broker"] = route.broker
+                entry["execution_mode"] = mode
+                break
+        else:
+            raise HTTPException(status_code=404, detail=f"No registry entry found for: {name}")
 
-    _backup_config_file(reg_path)
-    tmp_path = reg_path.with_suffix(reg_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp_path, reg_path)
+        _write_json_atomic(reg_path, registry)
     return {"ok": True, "executionMode": mode}
+
+
+@app.put("/api/strategies/{name}/broker")
+def update_strategy_broker(name: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Choose the live broker of a registry strategy (strategies_registry.json `broker`).
+    The broker must be registered, non-paper and configured (credentials in env), else HTTP 400
+    and nothing is written. Does not change execution_mode. Takes effect on the next engine
+    restart; open positions keep exiting on the broker stamped on their own row."""
+    broker = body.get("broker")
+    if not isinstance(broker, str) or not broker.strip():
+        raise HTTPException(status_code=400, detail='Body must be {"broker": "<broker name>"}')
+
+    reg_path = _BASE / "config" / "strategies_registry.json"
+    if not reg_path.exists():
+        raise HTTPException(status_code=404, detail="strategies_registry.json not found")
+    with _CONFIG_WRITE_LOCK:
+        registry: dict[str, Any] = json.loads(reg_path.read_text(encoding="utf-8"))
+        for entry in registry.setdefault("strategies", []):
+            if entry.get("name") == name:
+                route = _route_if_live({**entry, "broker": broker})
+                if not route.ok:
+                    raise HTTPException(
+                        status_code=400, detail=f"Cannot use broker for {name}: {route.reason}"
+                    )
+                entry["broker"] = broker
+                break
+        else:
+            raise HTTPException(status_code=404, detail=f"No registry entry found for: {name}")
+
+        _write_json_atomic(reg_path, registry)
+    return {"ok": True, "broker": broker}
 
 
 # ---------------------------------------------------------------------------
@@ -1790,11 +2116,13 @@ _SECTOR_INDICES = {
 
 
 @app.get("/api/market_breadth")
-def get_market_breadth() -> dict[str, Any]:
-    """Advance/Decline computed from Kite LTP for NIFTY 50 constituents."""
+async def get_market_breadth() -> dict[str, Any]:
+    """Advance/Decline for NIFTY 50 constituents vs the previous close. Needs quotes with a
+    previous close (Kite today); without one, or on failure, the "unavailable" payload."""
     try:
-        k = _kite_refreshed()
-        ltp_data = k.quote(_NIFTY50_SYMBOLS)
+        if _kite_configured():
+            await asyncio.to_thread(_kite_refreshed)
+        ltp_data = await _access().quote(_NIFTY50_SYMBOLS, ltp_fallback=False)
         advances = declines = unchanged = 0
         for _sym, entry in ltp_data.items():
             last = float(entry.get("last_price", 0))
@@ -1807,6 +2135,8 @@ def get_market_breadth() -> dict[str, Any]:
                 declines += 1
             else:
                 unchanged += 1
+        if advances + declines + unchanged == 0:
+            raise ValueError("no previous-close data from the market-data provider")
         return {
             "advances": advances,
             "declines": declines,
@@ -1818,14 +2148,20 @@ def get_market_breadth() -> dict[str, Any]:
 
 
 @app.get("/api/sector_performance")
-def get_sector_performance() -> list[Any]:
-    """Live daily sector performance from Kite sector index LTPs."""
+async def get_sector_performance() -> list[Any]:
+    """Live daily sector performance from sector index quotes (market-data router)."""
     try:
-        k = _kite_refreshed()
+        if _kite_configured():
+            await asyncio.to_thread(_kite_refreshed)
         symbols = list(_SECTOR_INDICES.values())
         # 30s TTL: this quotes every sector index at once and daily sector
         # performance does not move meaningfully inside one dashboard poll.
-        ltp_data = _broker_cached("sector_quotes", 30.0, lambda: k.quote(symbols))
+        ltp_data = await _access().cached(
+            "sector_quotes", 30.0, lambda: _access().quote(symbols, ltp_fallback=False)
+        )
+        if not any((q or {}).get("ohlc") for q in ltp_data.values()):
+            # No provider gave a previous close: every change would read 0% -> show none.
+            return []
         result = []
         for sector, sym in _SECTOR_INDICES.items():
             entry = ltp_data.get(sym) or ltp_data.get(sym.replace("NSE:", "")) or {}
@@ -2312,19 +2648,24 @@ async def get_closed_positions(mode: str = "all") -> list[Any]:
             continue
         if mode == "paper" and not is_paper:
             continue
-        try:
-            rows = await _db_pool.fetch(
-                f"""
+
+        def _closed_sql(col: str, table: str = table) -> str:
+            return f"""
                 SELECT symbol, direction, quantity, fill_price, exit_price,
                        pnl_realized, strategy_name, entry_timestamp, exit_timestamp,
-                       partial_qty_booked
+                       partial_qty_booked, {col}
                   FROM {table}
                  WHERE order_state = 'CLOSED'
                    AND (exit_timestamp AT TIME ZONE 'Asia/Kolkata')::date
                      = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                  ORDER BY exit_timestamp DESC NULLS LAST LIMIT 50
                 """  # noqa: S608
-            )
+
+        try:
+            if is_paper:  # paper rows never carry a broker: no need to touch the column
+                rows = await _db_pool.fetch(_closed_sql("NULL::text AS exec_broker"))
+            else:
+                rows = await _fetch_exec_broker_aware("trades", _closed_sql)
         except Exception:
             rows = []
         for r in rows:
@@ -2342,6 +2683,7 @@ async def get_closed_positions(mode: str = "all") -> list[Any]:
                     "entryAt": str(r["entry_timestamp"]) if r["entry_timestamp"] else "",
                     "closedAt": str(r["exit_timestamp"]) if r["exit_timestamp"] else "",
                     "paper": is_paper,
+                    "exec_broker": _exec_broker_label(r, is_paper),
                 }
             )
     out.sort(key=lambda x: x["closedAt"], reverse=True)
@@ -2419,7 +2761,7 @@ async def get_paper_trades() -> list[Any]:
     if _all_syms:
         try:
             # to_thread — same event-loop-blocking reason as /api/swing_positions.
-            _ltp = await asyncio.to_thread(_kite().ltp, [f"NSE:{s}" for s in _all_syms])
+            _ltp = await _access().ltp([f"NSE:{s}" for s in _all_syms])
         except Exception:
             _ltp = {}
 
@@ -2515,7 +2857,7 @@ async def get_paper_trades() -> list[Any]:
         _opt_ltp: dict[str, Any] = {}
         if _opt_syms:
             try:
-                _opt_ltp = await asyncio.to_thread(_kite().ltp, list(_opt_syms))
+                _opt_ltp = await _access().ltp(list(_opt_syms))
             except Exception:
                 _opt_ltp = {}
 
@@ -2699,23 +3041,24 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
         else ""
     )
     try:
-        rows = await _db_pool.fetch(
-            f"""
+        rows = await _fetch_exec_broker_aware(
+            "options_positions",
+            lambda col: f"""
             SELECT position_id, underlying, strategy_type, status, legs, expiry,
                    dte_at_entry, lot_size_at_entry, net_credit, max_loss, max_profit,
                    entry_margin, entry_delta, entry_gamma, entry_theta, entry_vega,
-                   realized_pnl, exit_reason, opened_at, closed_at, is_paper
+                   realized_pnl, exit_reason, opened_at, closed_at, is_paper, {col}
               FROM options_positions
              WHERE opened_at >= NOW() - INTERVAL '30 days'
                {today_only}
              ORDER BY opened_at DESC
              LIMIT 200
-            """  # noqa: S608
+            """,  # noqa: S608
         )
     except Exception:
         return []
 
-    from src.options.nfo_chain import index_spot_symbol
+    from src.options.nfo_chain import index_spot_quote_symbol
 
     open_rows = [r for r in rows if r["status"] == "OPEN"]
     all_syms = {
@@ -2724,14 +3067,14 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
         for leg in _flat_option_legs(r["legs"])
         if leg.get("tradingsymbol")
     }
-    spot_syms = {f"NSE:{index_spot_symbol(str(r['underlying']).split(':')[-1])}" for r in open_rows}
+    spot_syms = {index_spot_quote_symbol(str(r["underlying"]).split(":")[-1]) for r in open_rows}
     all_syms |= spot_syms
     ltp: dict[str, Any] = {}
     if all_syms:
         try:
             # tradingsymbol already carries its exchange prefix ("NFO:...") --
             # unlike equity's bare symbol, no prefixing needed here.
-            ltp = await asyncio.to_thread(_kite().ltp, list(all_syms))
+            ltp = await _access().ltp(list(all_syms))
         except Exception:
             ltp = {}
 
@@ -2854,7 +3197,7 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
             if closed_leg_rows and exit_levels.get("stopAmount") is not None:
                 max_loss = max(0.0, float(exit_levels["stopAmount"] or 0) - closed_legs_pnl)
 
-        spot_sym = f"NSE:{index_spot_symbol(str(r['underlying']).split(':')[-1])}"
+        spot_sym = index_spot_quote_symbol(str(r["underlying"]).split(":")[-1])
         spot_tick = ltp.get(spot_sym)
         spot = float(spot_tick["last_price"]) if spot_tick else None
 
@@ -2892,6 +3235,7 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
                 "openedAt": str(r["opened_at"]) if r["opened_at"] else "",
                 "closedAt": str(r["closed_at"]) if r["closed_at"] else "",
                 "isPaper": bool(r["is_paper"]),
+                "exec_broker": _exec_broker_label(r, bool(r["is_paper"])),
             }
         )
     return out
@@ -3429,20 +3773,20 @@ async def get_earnings_calendar() -> dict[str, Any]:
 @app.websocket("/ws")
 async def websocket_ltp(ws: WebSocket) -> None:
     await ws.accept()
-    k = _kite()
     try:
         while True:
             try:
                 symbols: list[str] = ["NSE:NIFTY 50", "NSE:NIFTY BANK"]
-                # Both Kite calls go through to_thread: this coroutine runs on the
-                # shared uvicorn event loop, so a blocking call here freezes every
-                # HTTP request for the duration of the round-trip, every 2 seconds.
-                _pos: dict[str, Any] = await asyncio.to_thread(k.positions)
-                net: list[dict[str, Any]] = _pos.get("net", [])
-                for p in net[:8]:
-                    if p.get("quantity", 0) != 0:
-                        symbols.append(f"{p['exchange']}:{p['tradingsymbol']}")
-                ltp = await asyncio.to_thread(k.ltp, list(dict.fromkeys(symbols)))
+                if _kite_configured():
+                    # Open Kite positions join the feed (Kite-account specific). to_thread:
+                    # this coroutine runs on the shared uvicorn event loop, so a blocking
+                    # call here freezes every HTTP request for the round-trip, every 2s.
+                    _pos: dict[str, Any] = await asyncio.to_thread(_kite().positions)
+                    net: list[dict[str, Any]] = _pos.get("net", [])
+                    for p in net[:8]:
+                        if p.get("quantity", 0) != 0:
+                            symbols.append(f"{p['exchange']}:{p['tradingsymbol']}")
+                ltp = await _access().ltp(list(dict.fromkeys(symbols)))
                 await ws.send_json({"type": "ltp", "data": ltp})
             except Exception as exc:
                 await ws.send_json({"type": "error", "message": str(exc)})

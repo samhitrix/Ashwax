@@ -23,6 +23,7 @@ The 25% absolute floor in G1 is HARDCODED — not configurable via JSON.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -54,17 +55,19 @@ _ABSOLUTE_FLOOR_PCT: float = _absolute_floor_pct()
 # Registry strategy names (signal.strategy_name) of the two desk-hosted strategies that
 # own their own uniqueness guarantee (at most one concurrent position each -- see
 # _g7_portfolio_margin's own comment on the exemption these names trigger). Must match
-# options_settings.json options_trading.{weekly_condor_simple,options_expiry_day}.
-# registry_name exactly.
+# options_settings.json options_trading.{options_expiry_day,options_intraday_short_premium,
+# options_intraday_short_premium2}.registry_name exactly.
 _HOSTED_OPTIONS_STRATEGIES: frozenset[str] = frozenset(
-    {"nifty_weekly_condor_simple", "options_expiry_day", "options_intraday_short_premium"}
+    {"options_expiry_day", "options_intraday_short_premium", "options_intraday_short_premium2"}
 )
 # options_intraday_short_premium runs EVERY trading day regardless of how many positions are open or how many
 # trades were taken (operator decision 2026-10-12): exempt from the open-position count, the
 # new-trades-per-day cap, the total-exposure cap and the portfolio open-risk cap in G7. It still
 # faces every other gate (daily-loss caps, circuit breakers, regime, news, G9 when required...).
-# Must match options_settings.json options_trading.options_intraday_short_premium.registry_name.
-_UNCAPPED_OPTIONS_STRATEGIES: frozenset[str] = frozenset({"options_intraday_short_premium"})
+# Must match options_settings.json options_trading.options_intraday_short_premium{,2}.registry_name.
+_UNCAPPED_OPTIONS_STRATEGIES: frozenset[str] = frozenset(
+    {"options_intraday_short_premium", "options_intraday_short_premium2"}
+)
 
 
 _INTRADAY_TIMEFRAMES = frozenset({"5MIN", "15MIN", "5M", "15M"})
@@ -287,6 +290,24 @@ class CRMContext:
     # takes precedence over segment_paper_mode in mode_of(). Empty when
     # paper_mode_locked (the orchestrator does not populate it then).
     strategy_execution_mode: dict[str, str] = field(default_factory=dict)
+    # Per-strategy live broker route (src.brokers.routing.BrokerRoute) for registry entries
+    # whose execution_mode is "live". The options desk rejects a LIVE-resolved strategy whose
+    # route is not usable (R1, src.brokers.routing.route_rejection).
+    strategy_routes: dict[str, Any] = field(default_factory=dict)
+    # ── Per-broker equity and risk (config/global.json system.per_broker_equity, default
+    # false). Off: none of these fields is read and mode_of() keeps "paper"/"live". On: a
+    # live signal's mode is "live:<broker>" and broker_view() swaps in that broker's own
+    # equity, baseline (its first fetched equity), drawdown, capital.json rupee caps and
+    # counters; G1 blocks the broker when its equity is unknown, below the minimum viable
+    # equity, or its daily-loss breaker fired today (entries_blocked_brokers).
+    per_broker_equity: bool = False
+    legacy_live_broker: str = "kite"  # broker of a live signal without a registry route
+    mode_current_equity: dict[str, float] = field(default_factory=dict)
+    mode_total_capital: dict[str, float] = field(default_factory=dict)
+    mode_drawdown_pct: dict[str, float] = field(default_factory=dict)
+    mode_rupee_caps: dict[str, dict[str, float]] = field(default_factory=dict)
+    entries_blocked_brokers: dict[str, str] = field(default_factory=dict)  # broker -> IST day
+    min_viable_equity_rupees: float = 0.0  # capital.json account.min_viable_equity_rupees
     allowed_regimes: dict[str, list[str]] = field(default_factory=dict)
     # strategy -> regimes in which it may NOT open new positions (exits are never affected).
     # llm_swing_agent: config/global.json llm_swing.block_regimes.
@@ -518,7 +539,9 @@ def registry_name_of(signal: CRMSignal) -> str:
     return str(signal.meta.get("registry_name") or signal.strategy_name)
 
 
-_SAME_DAY_OPTION_STRATEGIES = frozenset({"options_intraday_short_premium", "options_expiry_day"})
+_SAME_DAY_OPTION_STRATEGIES = frozenset(
+    {"options_intraday_short_premium", "options_intraday_short_premium2", "options_expiry_day"}
+)
 
 
 def segment_of(signal: CRMSignal) -> str:
@@ -540,9 +563,97 @@ def mode_of(signal: CRMSignal, ctx: CRMContext) -> str:
     """
     override = getattr(ctx, "strategy_execution_mode", {}).get(signal.strategy_name)
     if override in ("paper", "live"):
-        return str(override)
-    is_paper = getattr(ctx, "segment_paper_mode", {}).get(segment_of(signal), True)
-    return "paper" if is_paper else "live"
+        mode = str(override)
+    else:
+        is_paper = getattr(ctx, "segment_paper_mode", {}).get(segment_of(signal), True)
+        mode = "paper" if is_paper else "live"
+    if mode == "paper" or not getattr(ctx, "per_broker_equity", False):
+        return mode
+    # Per-broker risk: the broker the orchestrator routes this live signal to (R1). A route
+    # without a usable broker yields "live:" -- no equity is ever keyed there, so G1 blocks.
+    routes = getattr(ctx, "strategy_routes", {}) or {}
+    route = routes.get(registry_name_of(signal)) or routes.get(signal.strategy_name)
+    if route is not None:
+        return f"live:{getattr(route, 'broker', None) or ''}"
+    return f"live:{getattr(ctx, 'legacy_live_broker', 'kite')}"
+
+
+# CRMContext mode_* dicts a per-broker view re-keys: an absent "live:<broker>" (or
+# "live:<broker>:<engine>") entry falls back to the legacy combined "live" bucket.
+_MODE_DICTS = (
+    "mode_daily_loss_so_far",
+    "mode_open_position_count",
+    "mode_new_trades_today",
+    "mode_consecutive_losses",
+    "mode_open_risk_rupees",
+    "mode_intraday_daily_loss_so_far",
+    "mode_engine_open_positions",
+    "mode_engine_trades_today",
+)
+_ENGINES = ("intraday", "swing", "options")
+
+
+def per_key_rupee_caps(budget: Any, equity: float) -> dict[str, float]:
+    """The capital.json rupee caps CRMContext carries as scalars, computed from ONE broker's
+    equity with the same percentages (src/risk/budget.py RiskBudget)."""
+    return {
+        "max_intraday_loss_per_trade": budget.intraday.max_loss_per_trade_rupees(equity),
+        "max_intraday_shared_risk": budget.intraday.max_share_of_shared_risk_rupees(equity),
+        "max_intraday_daily_loss": budget.intraday.max_loss_per_day_rupees(equity),
+        "max_swing_loss_per_trade": budget.swing.max_loss_per_trade_rupees(equity),
+        "max_swing_shared_risk": budget.swing.max_share_of_shared_risk_rupees(equity),
+        "max_options_daily_loss": budget.options.max_loss_per_day_all_strategies_rupees(equity),
+        "max_options_structure_loss_per_trade": (
+            budget.options.max_structure_loss_per_strategy_rupees(equity)
+        ),
+    }
+
+
+def broker_view(ctx: CRMContext, mode: str) -> CRMContext:
+    """`ctx` as seen by one live broker's signal. Identity (the same object) unless
+    per_broker_equity is on and `mode` is "live:<broker>"; then a shallow copy whose
+    equity, total capital (the broker's own baseline), drawdown and rupee caps are that
+    broker's, and whose mode_* dicts fall back to the combined "live" entry when the
+    broker has none. Never mutates `ctx`."""
+    if not (getattr(ctx, "per_broker_equity", False) and mode.startswith("live:")):
+        return ctx
+    view = copy.copy(ctx)
+    for name in _MODE_DICTS:
+        src = getattr(ctx, name)
+        d = dict(src)
+        if mode not in d and "live" in src:
+            d[mode] = src["live"]
+        for eng in _ENGINES:
+            if f"{mode}:{eng}" not in d and f"live:{eng}" in src:
+                d[f"{mode}:{eng}"] = src[f"live:{eng}"]
+        setattr(view, name, d)
+    equity = float(ctx.mode_current_equity.get(mode, 0.0) or 0.0)
+    view.current_equity = equity
+    baseline = float(ctx.mode_total_capital.get(mode, 0.0) or 0.0)
+    view.total_capital = baseline
+    view.drawdown_pct = ctx.mode_drawdown_pct.get(
+        mode, max(0.0, (baseline - equity) / baseline * 100.0) if baseline > 0 else 0.0
+    )
+    for cap_name, value in ctx.mode_rupee_caps.get(mode, {}).items():
+        setattr(view, cap_name, float(value))
+    return view
+
+
+def _broker_entry_block(mode: str, ctx: CRMContext) -> str | None:
+    """G1 reason a per-broker view must take no new entry, else None."""
+    broker = mode[len("live:") :]
+    today = datetime.now(_IST).date().isoformat()
+    if ctx.entries_blocked_brokers.get(broker) == today:
+        return f"New entries blocked for broker {broker or '?'} today (daily-loss breaker)"
+    equity = ctx.mode_current_equity.get(mode)
+    if equity is None or equity <= 0 or ctx.mode_total_capital.get(mode, 0.0) <= 0:
+        return f"Broker equity unavailable for {broker or '<no broker>'}: no new entries"
+    if ctx.min_viable_equity_rupees > 0 and equity < ctx.min_viable_equity_rupees:
+        return (
+            f"Broker {broker} equity {equity:.0f} below the minimum viable equity "
+            f"{ctx.min_viable_equity_rupees:.0f} (capital.json account.min_viable_equity_rupees)"
+        )
+    return None
 
 
 def is_shadow(signal: CRMSignal, ctx: CRMContext) -> bool:
@@ -646,6 +757,8 @@ class CentralRiskManager:
             signal.asset_class,
             mode_of(signal, ctx),
         )
+        # Flag off (or paper): the same object. On: the routed broker's own risk context.
+        ctx = broker_view(ctx, mode_of(signal, ctx))
         gates = [
             self._g0_master_switch,
             self._g1_hard_caps,
@@ -729,6 +842,12 @@ class CentralRiskManager:
         return GateResult("G0", GateDecision.PASS)
 
     def _g1_hard_caps(self, signal: CRMSignal, ctx: CRMContext, qty: int) -> GateResult:
+        if getattr(ctx, "per_broker_equity", False):
+            _bmode = mode_of(signal, ctx)
+            if _bmode.startswith("live:"):
+                _block = _broker_entry_block(_bmode, ctx)
+                if _block is not None:
+                    return GateResult("G1", GateDecision.BLOCK, _block)
         # 25% ABSOLUTE FLOOR — hardcoded
         if ctx.total_capital > 0:
             equity_pct = ctx.current_equity / ctx.total_capital
@@ -789,11 +908,14 @@ class CentralRiskManager:
 
         if signal.stop_loss_pct > 0:
             rr = signal.target_pct / signal.stop_loss_pct
-            if rr < ctx.min_risk_reward_ratio:
+            # Compare at the 2dp precision the floor is quoted in: LLM levels sit on 0.01 ticks, so a
+            # "1.8R" idea lands at e.g. 1.7958 and was blocked while logging "1.80 < 1.80". The block
+            # message shows 3dp so a real miss is never mistaken for a rounding tie.
+            if round(rr, 2) < round(ctx.min_risk_reward_ratio, 2):
                 return GateResult(
                     "G1",
                     GateDecision.BLOCK,
-                    f"R:R {rr:.2f} < minimum {ctx.min_risk_reward_ratio:.2f}",
+                    f"R:R {rr:.3f} < minimum {ctx.min_risk_reward_ratio:.3f}",
                 )
 
         # 1e-9 absorbs float noise only: a stop clamped to exactly the cap computes
@@ -1095,9 +1217,9 @@ class CentralRiskManager:
         # small 2/day cap.
         engine = segment_of(signal)
         _mode = mode_of(signal, ctx)
-        # 2026-10-07: the weekly condor and expiry-day butterfly each already guarantee
-        # at most ONE concurrent position of their own (run_weekly_condor_cycle's
-        # already_open check / expiry-day's own cadence) -- that IS their own slot, same
+        # 2026-10-07: the hosted strategies (expiry-day butterfly, short-premium strategies)
+        # each already guarantee their own concurrency (their own once-a-day / one-open
+        # checks) -- that IS their own slot, same
         # reasoning as the per-index fix made the same day. Counting them against the
         # desk's shared max_options_open_positions cap (or the generic account-wide
         # fallback) meant the desk's own continuous trading (a new structure every few

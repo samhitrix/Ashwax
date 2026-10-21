@@ -494,3 +494,29 @@ async def test_options_incomplete_close_is_flagged_not_invented() -> None:
     stats = await build_eod_stats(_FakeTradeRepo([], []), "2026-10-05", opts)
     assert stats["trade_count"] == 1 and stats["options_incomplete"] == 1
     assert stats["net_pnl"] == 0.0
+
+
+async def test_build_position_snapshot_labels_the_broker_of_each_live_stack() -> None:
+    stacks = {
+        "paper": {
+            "order_monitor": _FakeOrderMonitor([_FakePos("AAA", "BUY", 1, 10.0, 9.0)]),
+            "broker": _FakeBroker({}),
+        },
+        "live:kite": {
+            "order_monitor": _FakeOrderMonitor([_FakePos("BBB", "BUY", 1, 10.0, 9.0)]),
+            "broker": _FakeBroker({}),
+        },
+        "live:angel_one": {
+            "order_monitor": _FakeOrderMonitor([_FakePos("CCC", "BUY", 1, 10.0, 9.0)]),
+            "broker": _FakeBroker({}),
+        },
+        "live": {  # legacy bare key: single live stack, broker unknown
+            "order_monitor": _FakeOrderMonitor([_FakePos("DDD", "BUY", 1, 10.0, 9.0)]),
+            "broker": _FakeBroker({}),
+        },
+    }
+    rows = {r["symbol"]: r for r in await build_position_snapshot(stacks)}
+    assert rows["AAA"]["broker"] is None
+    assert rows["BBB"]["broker"] == "kite"
+    assert rows["CCC"]["broker"] == "angel_one"
+    assert rows["DDD"]["broker"] is None

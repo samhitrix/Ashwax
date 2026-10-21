@@ -78,6 +78,9 @@ class AccountRules:
     max_loss_if_everything_open_hits_stop_pct: float
     stop_trading_below_equity_pct: float
     drawdown_steps: tuple[DrawdownStep, ...]
+    # Optional account.min_viable_equity_rupees: a live broker whose equity is below this
+    # takes no new entries (only with system.per_broker_equity on). 0 / absent = disabled.
+    min_viable_equity_rupees: float = 0.0
 
     def max_loss_if_everything_open_hits_stop_rupees(self, equity: float) -> float:
         return equity * self.max_loss_if_everything_open_hits_stop_pct / 100.0
@@ -199,6 +202,11 @@ def _load_account(raw: dict[str, Any]) -> AccountRules:
         ),
         stop_trading_below_equity_pct=_pct(raw, "stop_all_trading_if_equity_falls_below", path),
         drawdown_steps=parsed_steps,
+        min_viable_equity_rupees=(
+            parse_rupees(raw["min_viable_equity_rupees"], f"{path}.min_viable_equity_rupees")
+            if raw.get("min_viable_equity_rupees") is not None
+            else 0.0
+        ),
     )
 
 
@@ -300,6 +308,8 @@ def _check_invariants(b: RiskBudget) -> None:
 
 _cached_budget: RiskBudget | None = None
 _current_equity: float | None = None
+# Per live stack key ("live:<broker>"), only with system.per_broker_equity on.
+_equity_by_key: dict[str, float] = {}
 
 
 def get_budget() -> RiskBudget:
@@ -317,16 +327,32 @@ def reload_budget() -> RiskBudget:
     return _cached_budget
 
 
-def set_current_equity(value: float) -> None:
+def set_current_equity(value: float, key: str | None = None) -> None:
     """Called wherever live broker equity is refreshed (same cadence as
-    crm_ctx.current_equity), so every RiskBudget-derived rupee figure tracks it."""
+    crm_ctx.current_equity), so every RiskBudget-derived rupee figure tracks it. With a
+    stack `key` it records that one broker's equity instead (per-broker risk)."""
     global _current_equity
+    if key is not None:
+        _equity_by_key[key] = value
+        return
     _current_equity = value
 
 
-def get_current_equity() -> float:
+def clear_current_equity(key: str) -> None:
+    """Forget one broker's equity (its fetch failed): get_current_equity(key) is 0 again."""
+    _equity_by_key.pop(key, None)
+
+
+def get_current_equity(key: str | None = None) -> float:
     """Live equity if set, else the configured fallback -- callers (e.g. at boot,
-    before the first broker refresh) must never divide by an unknown equity."""
+    before the first broker refresh) must never divide by an unknown equity.
+
+    With a stack `key`: that broker's last fetched equity, or 0.0 when unknown. There is
+    deliberately no fallback figure for a broker -- sizing a real account on an invented
+    equity is never safe; the CRM blocks entries for a broker without a fresh equity."""
+    if key is not None:
+        value = _equity_by_key.get(key, 0.0)
+        return value if value > 0 else 0.0
     if _current_equity is not None and _current_equity > 0:
         return _current_equity
     return get_budget().account.fallback_equity_rupees

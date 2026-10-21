@@ -69,13 +69,16 @@ def _opt_g3(name: str, hhmm: str):  # type: ignore[no-untyped-def]
 
 
 def test_multi_day_options_skip_late_window_confidence_bar() -> None:
-    assert _opt_g3("nifty_weekly_condor_simple", "14:35").decision.value == "PASS"
+    assert _opt_g3("options_seller_desk_v3", "14:35").decision.value == "PASS"
 
 
-@pytest.mark.parametrize("name", ["options_intraday_short_premium", "options_expiry_day"])
+@pytest.mark.parametrize(
+    "name",
+    ["options_intraday_short_premium", "options_intraday_short_premium2", "options_expiry_day"],
+)
 def test_same_day_options_keep_the_confidence_bar(name: str) -> None:
     assert _opt_g3(name, "14:35").decision.value == "BLOCK"
 
 
 def test_multi_day_options_still_blocked_in_pre_close() -> None:
-    assert _opt_g3("nifty_weekly_condor_simple", "15:20").decision.value == "BLOCK"
+    assert _opt_g3("options_seller_desk_v3", "15:20").decision.value == "BLOCK"

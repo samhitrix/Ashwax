@@ -6,6 +6,8 @@
     "max_loss_if_everything_open_hits_stop": "3%",
     "_shared_risk_rule": "Sum of every open position's stop loss (equity) or defined max loss (options), across ALL segments. Any segment may use it, first come first served, up to its own max_share_of_shared_risk. Segment ceilings below sum to more than this on purpose, so segments compete for the shared room instead of each getting a locked-away slice.",
     "stop_all_trading_if_equity_falls_below": "25%",
+    "min_viable_equity_rupees": "₹0",
+    "_min_viable_equity_rupees_rule": "Only with config/global.json system.per_broker_equity=true: a live broker whose own equity is below this takes no new entries (CRM G1 blocks with a clear message) instead of trading undersized. ₹0 = disabled (default).",
     "drawdown_steps": [
       { "drawdown_from_start": "3%", "position_size_becomes": "75%" },
       { "drawdown_from_start": "5%", "position_size_becomes": "50%" },

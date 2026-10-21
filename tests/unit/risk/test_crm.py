@@ -260,6 +260,22 @@ def test_g1_blocks_on_low_rr() -> None:
     assert decision.blocking_gate == "G1"
 
 
+def test_g1_rr_a_tick_under_the_minimum_passes_at_two_decimals() -> None:
+    # Live KARURVYSYA 2026-10-21: LLM levels on 0.01 ticks gave R:R 10.38/5.78 = 1.7958, logged
+    # "R:R 1.80 < minimum 1.80" and the idea expired. 1.7958 IS 1.80 at the precision the floor
+    # is quoted and logged at (same convention as the stop-floor check in the intraday pipeline).
+    entry = 384.95
+    decision = crm.evaluate(_sig(stop_loss_pct=5.78 / entry, target_pct=10.38 / entry), _ctx())
+    assert decision.blocking_gate != "G1"
+
+
+def test_g1_rr_genuinely_under_minimum_blocks_with_three_decimal_message() -> None:
+    decision = crm.evaluate(_sig(stop_loss_pct=0.05, target_pct=0.0895), _ctx())  # R:R 1.790
+    assert decision.blocking_gate == "G1"
+    g1 = next(r for r in decision.gate_results if r.gate_id == "G1")
+    assert "R:R 1.790 < minimum 1.800" in g1.reason
+
+
 def test_g1_blocks_on_sl_exceeding_max() -> None:
     decision = crm.evaluate(_sig(stop_loss_pct=0.10), _ctx())
     assert decision.approved is False
@@ -652,25 +668,25 @@ def test_g7_options_open_cap_disabled_falls_back_to_global_cap() -> None:
     assert decision.approved is False
 
 
-def test_g7_hosted_condor_bypasses_options_open_cap_even_when_desk_is_maxed() -> None:
+def test_g7_hosted_strategy_bypasses_options_open_cap_even_when_desk_is_maxed() -> None:
     # 2026-10-07: desk hit its own max_options_open_positions cap from its OWN 3
-    # structures alone (found live). The weekly condor and expiry-day butterfly each
-    # already guarantee at most one concurrent position of their own elsewhere
-    # (run_weekly_condor_cycle's already_open check) -- that IS their slot, so the
-    # desk filling its own cap must never block them.
+    # structures alone (found live). The expiry-day butterfly and the short-premium
+    # strategies each already guarantee their own concurrency elsewhere (own once-a-day /
+    # one-open checks) -- that IS their slot, so the desk filling its own cap must never
+    # block them.
     ctx = _ctx(max_options_open_positions=3, options_open_positions=3)
-    for name in ("nifty_weekly_condor_simple", "options_expiry_day"):
+    for name in ("options_intraday_short_premium2", "options_expiry_day"):
         decision = crm.evaluate(_sig(asset_class="options", strategy_name=name), ctx)
         assert decision.approved is True, name
 
 
-def test_g7_hosted_condor_still_blocked_by_other_real_gates() -> None:
+def test_g7_hosted_strategy_still_blocked_by_other_real_gates() -> None:
     # The exemption is specifically the open-position COUNT -- not a blanket bypass.
     ctx = _ctx(max_total_exposure_rupees=100.0)
     decision = crm.evaluate(
         _sig(
             asset_class="options",
-            strategy_name="nifty_weekly_condor_simple",
+            strategy_name="options_expiry_day",
             entry_price=1000.0,
         ),
         ctx,
@@ -682,8 +698,8 @@ def test_g7_options_intraday_short_premium_is_uncapped_but_other_hosted_strategi
     None
 ):
     # 2026-10-12: options_intraday_short_premium must run every day regardless of open positions, trades
-    # already taken today or deployed exposure. The condor/fly keep the trade-count + exposure
-    # caps (they only ever skip the open-position count).
+    # already taken today or deployed exposure. The expiry-day fly keeps the trade-count + exposure
+    # caps (it only ever skips the open-position count).
     ctx = _ctx(
         max_options_open_positions=3,
         options_open_positions=3,
@@ -700,11 +716,19 @@ def test_g7_options_intraday_short_premium_is_uncapped_but_other_hosted_strategi
         ctx,
     )
     assert ok.approved is True
-    for name in ("nifty_weekly_condor_simple", "options_expiry_day"):
-        blocked = crm.evaluate(
-            _sig(asset_class="options", strategy_name=name, entry_price=1000.0), ctx
-        )
-        assert blocked.approved is False and blocked.blocking_gate == "G7", name
+    ok2 = crm.evaluate(
+        _sig(
+            asset_class="options",
+            strategy_name="options_intraday_short_premium2",
+            entry_price=1000.0,
+        ),
+        ctx,
+    )
+    assert ok2.approved is True  # the second instance is uncapped the same way
+    blocked = crm.evaluate(
+        _sig(asset_class="options", strategy_name="options_expiry_day", entry_price=1000.0), ctx
+    )
+    assert blocked.approved is False and blocked.blocking_gate == "G7"
 
 
 def test_options_intraday_short_premium_still_faces_the_real_breakers() -> None:

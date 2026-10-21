@@ -1,4 +1,5 @@
 {
+  "_note": "Per-strategy live broker routing. An entry with execution_mode 'live' must also carry 'broker': the name of a registered, non-paper broker (kite, angel_one) whose credentials are in .env. Rule R1: there is NO default broker, NO failover and NO paper fallback -- a live entry with a missing, unregistered or unconfigured broker has every signal REJECTED and logged (broker_route_rejected strategy=... reason=...), and the boot log prints the strategy_routes_table line. 'paper' entries need no broker (a stored one is kept, ignored). Set it with the dashboard (Strategy Studio) or PUT /api/strategies/{name}/broker; PUT .../execution_mode refuses 'live' without a usable broker. A position keeps exiting on the broker stamped on its own row (trades/options_positions exec_broker, migration 089), whatever this field says later. operator.json account.paper_mode_locked still forces everything to paper. Changes apply on the next engine restart.",
   "strategies": [
     {
       "name": "minervini_vcp",
@@ -8,6 +9,7 @@
       "enabled": false,
       "min_quality_score": 65,
       "execution_mode": "paper",
+      "broker": "paper",
       "_disabled_note": "DISABLED 2026-09-21. Live health engine SUSPENDED this strategy 2026-09-18 08:34 (score 16.7, win rate 33%, 2 consecutive losses) after a confirmed live stop-out on JINDALSAW (entered 2026-08-27, exited 2026-09-16, -Rs1,196, pnl_r -1.01). This is not bad luck -- it is exactly what the 2026-07-07 expectancy audit already predicted: full-history backtest showed PF 1.30/+0.10R (near-breakeven after costs), and a proper train/hold-out split showed PF 1.42/+0.19R on the training window but PF 0.79/-0.11R on hold-out -- a classic overfit that does not survive out-of-sample. That audit disabled this strategy; it was re-enabled at some later point with no documented re-validation behind the decision. The live SUSPENDED status auto-recovers on its own with no re-validation gate once the rolling window improves, which on this small a live sample could happen on pure noise -- do not rely on that auto-recovery to mean the edge is real. Re-enable only after a fresh walk-forward validation (matching the 2026-07-07 audit's train/hold-out methodology) shows a positive out-of-sample expectancy, or a materially longer live/paper track record than currently exists."
     },
     {
@@ -18,6 +20,7 @@
       "enabled": false,
       "min_quality_score": 70,
       "execution_mode": "paper",
+      "broker": "paper",
       "_disabled_note": "DISABLED 2026-09-11. This strategy had execution_mode inherit and the swing segment runs paper_mode:false, so it was authorised to trade REAL MONEY on an unvalidated edge. Live paper record 13 Jul-10 Sep 2026: 10 closed trades, 1 win (10%), profit factor 0.09, expectancy -0.418R, net -Rs3,617, average realised move -2.98% against an 8% stop / 16% target held ~21 days. Sample is small (n=10) so this is a PRECAUTIONARY halt, not a proven-dead verdict -- but the asymmetry is one-sided: pausing costs nothing and is reversible, continuing risks real capital on a strategy that has never passed validation (see the 2026-07-07 expectancy audit that disabled all five builtins). Re-enable only after a walk-forward backtest at --cost-pct 0.10 or a materially longer paper record."
     },
     {
@@ -28,6 +31,7 @@
       "enabled": false,
       "min_quality_score": 60,
       "execution_mode": "paper",
+      "broker": "paper",
       "_note": "Entry is decided by the news-driven code path in orchestrator.py, not by entry_conditions (deliberately inert). See strategies/builtin/news_catalyst_momentum.json _options."
     },
     {
@@ -38,6 +42,7 @@
       "enabled": true,
       "min_quality_score": 0,
       "execution_mode": "paper",
+      "broker": "paper",
       "_note": "ASHWAX seller-first options desk. Real entry logic is _seller_desk_loop/SellerDesk.run_cycle() in orchestrator.py/seller_desk.py (not entry_conditions, deliberately inert -- matches news_catalyst_momentum's shim pattern). Real risk gating flows through CRM (G0-G10) via src/options/seller_crm_adapter.build_seller_crm_signal(). Live on/off switch remains config/execution.json options_execution.enabled + config/global.json system.segments.options.master_switch/paper_mode -- this registry entry is for listing/visibility only, toggling 'enabled' here has NO effect on the live loop (deliberate deviation from vcp_swing_pipeline's convention -- see CRM retrofit plan, section 1.6)."
     },
     {
@@ -48,17 +53,19 @@
       "enabled": true,
       "min_quality_score": 65,
       "execution_mode": "paper",
+      "broker": "paper",
       "_note": "Added 2026-10-05 as PAPER-ONLY forward data collection (user override of an IN-BETWEEN backtest verdict -- see docs/hypotheses/D_breadth_gated_breakout.md). Same controls as every swing strategy: normal swing scan + ranked pool, G9 LLM review, CRM G0-G10, operator daily caps. 'execution_mode': 'paper' is a hard lock -- do not change to 'live' without >=30 paper trades with PF>=1.2 and E>=+0.10R. Breadth gate fails CLOSED (no breadth data -> no entries); with breadth below 50% it correctly takes no trades."
     },
     {
-      "name": "nifty_weekly_condor_simple",
-      "llm_gate_required": true,
+      "name": "options_intraday_short_premium2",
+      "llm_gate_required": false,
       "source": "BUILTIN",
-      "spec_path": "strategies/builtin/nifty_weekly_condor_simple.json",
+      "spec_path": "strategies/builtin/options_intraday_short_premium2.json",
       "enabled": true,
       "min_quality_score": 0,
       "execution_mode": "paper",
-      "_note": "Added 2026-10-05 as PAPER-ONLY forward data collection (user override of an IN-BETWEEN model verdict -- see docs/hypotheses/B_nifty_weekly_condor_simple.md). Runs inside the seller desk (SellerDesk.run_weekly_condor_cycle) and shares all its risk controls: CRM G0-G10, expiry guardian, daily-loss halt, margin/Greeks budget, event blackout, protection-first executor. Rules in config/options_settings.json weekly_condor_simple. 'enabled' here IS a live switch (with that block's own 'enabled'). 'execution_mode': 'paper' is a HARD LOCK: if the desk itself runs live, B refuses to trade. llm_gate_required is enforced for B because its CRM signal carries this registry name. Promote only after >=12 weekly trades with realized expectancy > 0 and no loss beyond the modeled max loss."
+      "broker": "paper",
+      "_note": "Added 2026-10-16 REPLACING nifty_weekly_condor_simple (deleted). Second instance of the options_intraday_short_premium engine (src/options/short_premium.py) with its OWN config block options_settings.json options_trading.options_intraday_short_premium2: a SENSEX weekly ATM short straddle, per-leg SL (sl_pct, default 40), entry_time (default 10:30), exit_time, skip_weekdays -- ALL variables in that block, read fresh each tick. Basis: docs/hypotheses/N_sensex_weekly_straddle_stockmock.md (one-factor-at-a-time; the 40% SL x 10:30 combination was never run together) and docs/hypotheses/P_sensex_intraday_straddle_paper.md (pre-registered paper run + kill rule). It FAILED once stop slippage was stressed -> PAPER-ONLY, 'execution_mode': 'paper' is a hard lock; never live without broker-side SL-M + the slippage standard. 'enabled' here IS a live switch (checked by short_premium.tick) together with the block's own 'enabled'."
     },
     {
       "name": "options_expiry_day",
@@ -68,7 +75,8 @@
       "enabled": true,
       "min_quality_score": 0,
       "execution_mode": "paper",
-      "_note": "SUPERSEDED 2026-10-13: structure is now the NIFTY +/-100 expiry-day short strangle with per-leg stops (config/options_settings.json options_expiry_day._note_strangle); the text below describes the legacy butterfly, kept for structure=butterfly. Added 2026-10-06 (hypothesis F2, model PASS: +30%/+42% of max loss per trade, positive every year 2021-26 -- MODEL, real credit unverified). NIFTY expiry-day ATM iron butterfly, 10:00 entry, TP50 / SL 2x credit / 14:45 exit. Runs inside the seller desk with its controls; rules in config/options_settings.json options_expiry_day. 'execution_mode' is its OWN paper/live switch: changing 'paper' -> 'live' here (+ restart) is the only change needed to trade it live (the desk keeps a live executor for this; refused if the account is paper_mode_locked). Before going live: >= 20 paper expiries with realized expectancy > 0 and real_vs_model credit (logged every entry) not far below 1.0."
+      "broker": "paper",
+      "_note": "Added 2026-10-06 (hypothesis F2, model PASS: +30%/+42% of max loss per trade, positive every year 2021-26 -- MODEL, real credit unverified). NIFTY expiry-day ATM iron butterfly, 10:00 entry, TP50 / SL 2x credit / 14:45 exit. Runs inside the seller desk with its controls; rules in config/options_settings.json options_expiry_day. 'execution_mode' is its OWN paper/live switch: changing 'paper' -> 'live' here (+ restart) is the only change needed to trade it live (the desk keeps a live executor for this; refused if the account is paper_mode_locked). Before going live: >= 20 paper expiries with realized expectancy > 0 and real_vs_model credit (logged every entry) not far below 1.0."
     },
     {
       "name": "options_intraday_short_premium",
@@ -78,6 +86,7 @@
       "enabled": true,
       "min_quality_score": 0,
       "execution_mode": "paper",
+      "broker": "paper",
       "_note": "Added 2026-10-12. Generic name on purpose (straddle at offsets 0/0, strangle at +/-150, fly with wing_points). NIFTY weekly ATM+/-offset short strangle (default +150/-150; 0/0 = straddle), sold at entry_time (10:30), a stop on EACH leg (sl_pct 23% of its entry premium), exit_time (15:01), Wednesday skipped -- from the user's StockMock runs (23% +88.1k, 40% +66.8k, 50% +54.4k over 347 days, gross of brokerage). Runs daily and is EXEMPT from open-position / trades-per-day / exposure caps (CRM G7 _UNCAPPED_OPTIONS_STRATEGIES); still obeys kill switch, daily-loss caps, margin check. Naked by operator decision (allow_naked) -- see docs/hypotheses/I_options_intraday_short_premium.md. Rules in config/options_settings.json options_intraday_short_premium. 'execution_mode' is its OWN paper/live switch (flip to 'live' + restart); do NOT before the go-live bar in the hypothesis doc AND resting broker-side SL-M orders exist. llm_gate_required: false = LLM off (its verdict is still logged in shadow mode, non-blocking); true = fail-closed G9 gate."
     },
     {
@@ -88,6 +97,7 @@
       "enabled": true,
       "min_quality_score": 65,
       "execution_mode": "paper",
+      "broker": "paper",
       "_note": "Listing/toggle entry only -- this spec's entry_conditions are deliberately inert (see its own _note). Real signal generation is src/strategies/llm_swing/pipeline.py, driven by src/orchestrator.py's _llm_swing_scan_loop, which checks strategy_registry.get('llm_swing_agent') is not None as its master on/off gate -- flipping 'enabled' above IS the switch, same as every other strategy here. The LLM reasons out its own daily candidate trade ideas (symbol/direction/entry/SL/target) from technicals (+ fundamentals once available) instead of picking among the other registered strategies -- it still passes through the full unmodified CRM gate sequence (G0-G9: sizing, exposure caps, SL enforcement, daily loss breaker, regime, LLM advisory check) like any other strategy. 'execution_mode' is the ONE control that decides paper vs live for this strategy (per user instruction) and is a human-edited config field only; no code path in this system ever writes to it -- currently 'live' (see llm_swing_journal for its reasoning history)."
     },
     {
@@ -98,6 +108,7 @@
       "enabled": true,
       "min_quality_score": 65,
       "execution_mode": "paper",
+      "broker": "paper",
       "_note": "Listing/toggle entry only -- this spec's entry_conditions are deliberately inert (see its own _note). Real ideas come from src/strategies/llm_intraday/pipeline.py via src/orchestrator.py's _llm_intraday_agent_loop (runs at config/global.json llm_intraday.decision_times_ist) and are turned into signals inside the 5-minute intraday scan by _evaluate_llm_intraday_signal. Both check strategy_registry.get('llm_intraday_agent') is not None, so flipping 'enabled' above IS the switch; config/global.json llm_intraday.enabled must ALSO be true. Every idea passes the full unmodified intraday path: regime/breadth gates, ranked placement, CRM G0-G10, and an independent fail-closed G9 reviewer (llm.intraday_g9, gemini-first and ANTHROPIC excluded, because anthropic is what originates the idea on llm.discretionary -- a model reviewing its own idea is not an independent check). 'execution_mode': 'paper' is a HARD LOCK forcing every trade into paper regardless of the intraday segment's paper_mode -- human-edited only, no code path writes it. Built 2026-09-11 after all ORB variants were deleted on paper evidence. Pass/fail criteria: pass after >=40 closed trades with net expectancy >= +0.10R and PF >= 1.2; fail (disable) after >=30 trades if expectancy < 0 or PF < 0.8. Do not change to 'live' without that reviewed paper record (see llm_intraday_journal + paper_trades)."
     }
   ]

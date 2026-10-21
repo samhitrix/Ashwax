@@ -266,6 +266,7 @@ class OrderLifecycleManager:
         is_paper: bool = False,
         idempotency: Any | None = None,
         rejection_handler: Any | None = None,
+        broker_name: str | None = None,
     ) -> None:
         from src.monitoring.slippage_tracker import SlippageTracker
 
@@ -276,6 +277,10 @@ class OrderLifecycleManager:
         # Routes persistence to the paper_trades table (is_paper=True) vs trades
         # (is_paper=False). The broker adapter still decides real vs simulated fills.
         self._is_paper = is_paper
+        # Live broker that holds this stack's positions, stamped on every new live row as
+        # trades.exec_broker (migration 089) so exits/reseeds follow it. None = legacy:
+        # nothing stamped, and a NULL exec_broker means "kite".
+        self._broker_name = broker_name
         # Optional DurableIdempotencyGuard (src/execution/idempotency.py). None = no guard,
         # i.e. exactly the previous behaviour.
         self._idempotency = idempotency
@@ -595,6 +600,21 @@ class OrderLifecycleManager:
         _entry_order_price = (
             _marketable_limit_price(entry_price, direction) if is_intraday else entry_price
         )
+        # Refuse BEFORE the entry when its GTT protection cannot exist on this broker:
+        # otherwise the entry fills first (deferred delivery path) and the position
+        # sits naked until _place_protection fails.
+        if "GTT" in (_sl_type.upper(), _target_type.upper()) and not self._broker.supports_gtt():
+            _LOG.error(
+                "entry_refused_no_gtt trade_id=%s symbol=%s broker=%s",
+                trade_id,
+                symbol,
+                type(self._broker).__name__,
+            )
+            raise RuntimeError(
+                f"entry refused: order_types asks for GTT protection but "
+                f"{type(self._broker).__name__} reports supports_gtt()=False — "
+                "no order was placed"
+            )
 
         entry_req = OrderRequest(
             symbol=symbol,
@@ -1091,6 +1111,8 @@ class OrderLifecycleManager:
                 _sq = meta.get("setup_quality_score")
                 if _sq is not None:
                     row["setup_quality_score"] = Decimal(str(_sq))
+            if self._broker_name and not self._is_paper:  # paper rows never hold a broker
+                row["exec_broker"] = self._broker_name
             await self._trade_repo.insert(row, is_paper=self._is_paper)
         except Exception as exc:
             _LOG.error("trade_entry_persist_failed trade_id=%s err=%s", trade_id, exc)
@@ -1485,9 +1507,13 @@ class OrderMonitor:
         gtt_check_interval_seconds: float = _MONITORING_CFG["gtt_check_interval_seconds"],
         chase_max_attempts: int = int(_MONITORING_CFG["chase_max_attempts"]),
         trade_repo: TradeRepository | None = None,
+        broker_name: str | None = None,
     ) -> None:
         self._broker = broker
         self._alert_manager = alert_manager
+        # Live broker of this stack: its rate card prices charges on partials/closes.
+        # None (paper, legacy) = active_broker() as before.
+        self._broker_name = None if is_paper else broker_name
         # Paper mode bounds gap-breach exit fills at SL ± slippage allowance
         # (polling detects breaches late; raw LTP exaggerates slippage vs GTT).
         self._is_paper = is_paper
@@ -1682,6 +1708,7 @@ class OrderMonitor:
                 qty,
                 product,
                 is_short=pos.direction.upper() == "SELL",
+                broker=self._broker_name,
             )
             pos.partial_pnl_booked += slice_pnl.net_pnl
             pos.partial_costs = (
@@ -1785,7 +1812,13 @@ class OrderMonitor:
             product = ProductType.INTRADAY if pos.product.upper() == "MIS" else ProductType.DELIVERY
             is_short = pos.direction.upper() == "SELL"
             pnl = calculate_real_pnl(
-                pos.symbol, pos.fill_price, exit_price, pos.quantity, product, is_short=is_short
+                pos.symbol,
+                pos.fill_price,
+                exit_price,
+                pos.quantity,
+                product,
+                is_short=is_short,
+                broker=self._broker_name,
             )
             original_qty = pos.quantity + pos.partial_qty_booked
             total_net = pnl.net_pnl + pos.partial_pnl_booked
@@ -1804,7 +1837,7 @@ class OrderMonitor:
                     "gross_pnl": round(total_net + total_costs.total, 2),
                     "total_costs": round(total_costs.total, 2),
                     "charges_breakdown": total_costs.as_dict(),
-                    "broker": active_broker(for_paper=self._is_paper),
+                    "broker": self._broker_name or active_broker(for_paper=self._is_paper),
                     "net_pnl": total_net,
                     "partial_pnl_booked": pos.partial_pnl_booked,
                     "partial_qty_booked": pos.partial_qty_booked,

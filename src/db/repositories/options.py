@@ -472,6 +472,7 @@ class OptionsRepository:
         entry_atm_iv: float | None = None,
         entry_spot: float | None = None,
         entry_short_delta: float | None = None,
+        exec_broker: str | None = None,
     ) -> None:
         legs = {
             "protection": [_serialize_leg(leg) for leg in protection_legs],
@@ -486,10 +487,10 @@ class OptionsRepository:
                     dte_at_entry, lot_size_at_entry, net_credit, max_loss, max_profit,
                     entry_margin, entry_delta, entry_gamma, entry_theta, entry_vega,
                     opened_at, is_paper,
-                    entry_regime, entry_atm_iv, entry_spot, entry_short_delta
+                    entry_regime, entry_atm_iv, entry_spot, entry_short_delta, exec_broker
                 ) VALUES (
                     $1, $2, $3, 'OPEN', $4::jsonb, $5, $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+                    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
                 )
                 ON CONFLICT (position_id) DO NOTHING
                 """,
@@ -514,7 +515,27 @@ class OptionsRepository:
                 entry_atm_iv,
                 entry_spot,
                 entry_short_delta,
+                exec_broker,
             )
+
+    async def open_duplicate_ids(
+        self, *, underlying: str, strategy_type: str, expiry: date, is_paper: bool
+    ) -> list[str]:
+        """OPEN rows with this exact (underlying, strategy_type, expiry, mode). DB truth for the
+        pre-order duplicate guard -- migration 088 makes a 2nd such row impossible to insert."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT position_id FROM options_positions
+                WHERE status = 'OPEN' AND underlying = $1 AND strategy_type = $2
+                  AND expiry = $3 AND is_paper = $4
+                """,
+                underlying,
+                strategy_type,
+                expiry,
+                is_paper,
+            )
+        return [str(r["position_id"]) for r in rows]
 
     async def mark_breached(self, position_id: str) -> None:
         async with self._pool.acquire() as conn:
@@ -648,7 +669,7 @@ class OptionsRepository:
         self, day: date, *, is_paper: bool
     ) -> dict[str, float]:
         """Sum of realized_pnl, GROUPED BY strategy_type (structure type, e.g.
-        'bull_put_spread', 'weekly_condor_simple'), for positions closed on IST
+        'bull_put_spread', 'options_intraday_short_premium'), for positions closed on IST
         calendar ``day``. Lets the per-strategy daily-loss kill (SellerDesk) restore
         each strategy's today-so-far loss on restart without a new persisted column --
         same approach realized_pnl_closed_on already uses for the desk-wide figure."""
@@ -756,6 +777,7 @@ class OptionsRepository:
         is_paper: bool,
         keep_per_underlying: int = 1,
         exclude_strategy_types: Sequence[str] = (),
+        exclude_position_ids: Sequence[str] = (),
     ) -> list[str]:
         """Self-healing invariant enforcement: at most one OPEN position per
         underlying (SellerDesk.run_cycle's own dedup guard assumes this holds).
@@ -777,7 +799,9 @@ class OptionsRepository:
         the configured allowance is still treated as a runaway duplicate.
 
         ``exclude_strategy_types`` rows (hosted strategies with their own slot) are
-        neither counted nor ever deleted.
+        neither counted nor ever deleted. Neither are ``exclude_position_ids`` (the desk's
+        rows restored ON HOLD: real positions awaiting the operator, which must neither be
+        deleted nor turn a newer, real row into a "duplicate").
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -790,6 +814,7 @@ class OptionsRepository:
                     FROM options_positions
                     WHERE status = 'OPEN' AND is_paper = $1
                       AND strategy_type <> ALL($3::text[])
+                      AND position_id <> ALL($4::text[])
                 )
                 DELETE FROM options_positions
                 WHERE position_id IN (SELECT position_id FROM ranked WHERE rn > $2)
@@ -798,6 +823,7 @@ class OptionsRepository:
                 is_paper,
                 max(1, int(keep_per_underlying)),
                 list(exclude_strategy_types),
+                [str(i) for i in exclude_position_ids],
             )
         return [str(r["position_id"]) for r in rows]
 
@@ -893,7 +919,7 @@ class OptionsRepository:
                        net_credit, entry_margin, opened_at, adjustments_count,
                        entry_delta, entry_gamma, entry_theta, entry_vega,
                        entry_regime, entry_atm_iv, entry_spot, entry_short_delta, was_breached,
-                       peak_unrealized_pnl, is_paper
+                       peak_unrealized_pnl, is_paper, exec_broker
                 FROM options_positions
                 WHERE {_where}
                 """,  # noqa: S608 — _where is built only from trusted literals above

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 _REGISTRY: dict[str, tuple[str, str]] = {
     "kite": ("src.brokers.adapters.kite.adapter", "KiteAdapter"),
     "angel_one": ("src.brokers.adapters.angel_one.adapter", "AngelOneAdapter"),
+    "flattrade": ("src.brokers.adapters.flattrade.adapter", "FlattradeAdapter"),
     "paper": ("src.brokers.adapters.paper.adapter", "PaperAdapter"),
 }
 

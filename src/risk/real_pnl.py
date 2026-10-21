@@ -68,6 +68,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+# Broker names already warned about by _resolve_rates (one WARNING per name per process).
+_WARNED_UNKNOWN_BROKERS: set[str] = set()
+
+
 def _resolve_rates(raw: dict[str, Any], broker: str, segment: str) -> dict[str, float]:
     """Defaults overlaid with charges.json brokers[broker][segment].
 
@@ -75,6 +79,14 @@ def _resolve_rates(raw: dict[str, Any], broker: str, segment: str) -> dict[str, 
     """
     rates = dict(_DEFAULTS_BY_SEGMENT[segment])
     if "brokers" in raw:
+        if broker not in raw["brokers"] and broker not in _WARNED_UNKNOWN_BROKERS:
+            # Never raise on the close path: fall back to the code defaults, warn once.
+            _WARNED_UNKNOWN_BROKERS.add(broker)
+            _log.warning(
+                "charges_broker_unknown broker=%s -- no charges.json brokers entry; using "
+                "default rates",
+                broker,
+            )
         block = (raw["brokers"].get(broker) or {}).get(segment) or {}
     else:
         block = raw if segment == "equity" else {}
@@ -225,6 +237,7 @@ def calculate_real_pnl(
     quantity: int,
     product: ProductType,
     is_short: bool = False,
+    broker: str | None = None,
 ) -> RealPnL:
     """
     Compute all-in after-cost P&L for a single completed trade.
@@ -236,11 +249,13 @@ def calculate_real_pnl(
         quantity: Number of shares.
         product: CNC (delivery) or MIS (intraday).
         is_short: True for short trades (sell first, buy later).
+        broker: Rate card to use (the broker that holds the position); None means
+            active_broker() as before.
 
     Returns:
         RealPnL with full cost breakdown.
     """
-    c = rates("equity")
+    c = rates("equity", broker)
     if is_short:
         buy_value = exit_price * quantity
         sell_value = entry_price * quantity

@@ -16,12 +16,13 @@ from src.options import seller_desk as sd
 from src.options import seller_settings as ss
 from src.options import short_premium as st
 from src.options.options_leg_executor import ExecutionResult, LegFillState
-from src.options.seller_desk import SHORT_PREMIUM_TYPE, OpenPosition
+from src.options.seller_desk import OpenPosition
+from src.options.short_premium import SHORT_PREMIUM_TYPE
 from src.options.structure_selector import OptionLeg
 
+from tests.unit.options.hosted_helpers import _RecordingCRM, _Repo
 from tests.unit.options.test_expiry_day import _chain
 from tests.unit.options.test_seller_desk import _APPROVE_ALL_CRM, _desk, _FakeExecutor
-from tests.unit.options.test_weekly_condor import _RecordingCRM, _Repo
 
 _IST = ZoneInfo("Asia/Kolkata")
 _NAME = "options_intraday_short_premium"
@@ -710,13 +711,37 @@ async def test_on_a_normal_day_it_falls_back_to_the_nearest_expiry_chain() -> No
     assert pos is not None and pos.expiry == date(2026, 10, 13)
 
 
+async def test_missed_entry_alert_names_the_real_skip_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        st, "_alert", lambda desk, *, is_paper, reason, **kw: sent.append({"reason": reason, **kw})
+    )
+    monkeypatch.setattr("src.market.calendar.is_trading_day", lambda d: True)
+    st._LOG.warning(
+        "%s underlying=NSE:NIFTY skipped reason=insufficient_margin need=1262300 have=1160002",
+        SHORT_PREMIUM_TYPE,
+    )
+    desk, _ = _new_desk()
+    today = datetime.now(_IST).date()  # the recorder stamps the real date
+    await st._maybe_report_missed(
+        desk,
+        st.parse_cfg({**_CFG, "skip_weekdays": []}),
+        today,
+        datetime.combine(today, time(10, 50), tzinfo=_IST),
+    )
+    assert len(sent) == 1 and sent[0]["title"] == "NO ENTRY"
+    assert "insufficient_margin need=1262300" in sent[0]["reason"]
+
+
 async def test_no_false_missed_entry_alert_when_the_position_already_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Found by the paper-day run: a quick target/stop-out inside the 30 minutes after the entry window
     left no open position, and the 'missed entry' alert fired although the day was traded."""
     alerts: list[str] = []
-    monkeypatch.setattr(st, "_alert", lambda desk, *, is_paper, reason: alerts.append(reason))
+    monkeypatch.setattr(st, "_alert", lambda desk, *, is_paper, reason, **kw: alerts.append(reason))
     monkeypatch.setattr("src.market.calendar.is_trading_day", lambda d: True)
     cfg = st.parse_cfg(_CFG)
     after = datetime(2026, 10, 12, 10, 50, tzinfo=_IST)
@@ -794,6 +819,61 @@ async def test_entry_uses_the_auto_sized_lots_and_logs_why(monkeypatch: pytest.M
     assert all(leg.lots == pos.lots for leg in pos.income_legs)
 
 
+class _PerLotMarginExecutor(_PxExecutor):
+    """Margin proportional to lots, so a test can set exactly how many lots the account can margin."""
+
+    per_lot = 250_000.0
+
+    async def get_order_margin_for_structure(self, protection_legs, income_legs, signal_id):  # type: ignore[no-untyped-def]
+        from src.brokers.base import OrderMarginResult
+
+        return OrderMarginResult(total_margin=self.per_lot * income_legs[0].lots)
+
+
+async def _enter_with_margin(monkeypatch, available: float, cfg: dict[str, Any]):  # type: ignore[no-untyped-def]
+    _budget(monkeypatch, 4_000_000)  # auto-sizes to several lots (see the test above)
+    ex = _PerLotMarginExecutor()
+    desk, _ = _desk(_chain(), executor=ex, repo=_SRepo())
+    pos = await st.run_entry(
+        desk,
+        st.parse_cfg({**_CFG, **cfg}),
+        "NSE:NIFTY",
+        today=_MON,
+        now=_AT,
+        available_margin=available,
+        regime="UNKNOWN",
+        vix=13.0,
+        crm=_APPROVE_ALL_CRM,
+        crm_ctx=_ctx(),
+    )
+    return pos, ex
+
+
+async def test_auto_lots_step_down_to_what_the_free_margin_can_carry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unconstrained, _ = await _enter_with_margin(monkeypatch, 1e9, {"lots": 0, "max_lots": 50})
+    assert unconstrained is not None and unconstrained.lots >= 3
+    # room for exactly 2 lots (2 x 250k = 500k <= 600k < 3 x 250k)
+    pos, ex = await _enter_with_margin(monkeypatch, 600_000, {"lots": 0, "max_lots": 50})
+    assert pos is not None and pos.lots == 2
+    assert all(leg.lots == 2 for leg in pos.income_legs)
+
+
+async def test_auto_lots_refused_only_when_not_even_one_lot_margins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pos, _ = await _enter_with_margin(monkeypatch, 200_000, {"lots": 0, "max_lots": 50})
+    assert pos is None  # 1 lot needs 250k
+
+
+async def test_fixed_lots_are_never_silently_resized_for_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pos, _ = await _enter_with_margin(monkeypatch, 600_000, {"lots": 3, "max_lots": 5})
+    assert pos is None  # 3 x 250k > 600k: refused, not shrunk to 2
+
+
 def test_invalid_sizing_config_is_refused() -> None:
     for bad in (
         {"lots": -1},
@@ -822,13 +902,19 @@ async def test_entry_hands_the_decision_prices_to_the_paper_fill() -> None:
     assert ex.hints and set(ex.hints[0]) == {leg.tradingsymbol for leg in pos.income_legs}
 
 
-async def test_a_stop_closes_at_the_price_that_triggered_it() -> None:
+async def test_a_stop_closes_from_the_triggering_price_plus_modelled_slippage() -> None:
+    # The decision price is reused (no extra Kite round trip), but a paper stop never fills AT it: it pays the
+    # frozen stop slippage (src/options/paper_slippage.py) so paper cannot flatter a stop.
+    from src.options.paper_slippage import paper_close_price
+
     ex = _HintExecutor()
     desk, _ = _desk(_chain(), executor=ex, repo=_SRepo())
     pos = _open(desk)
     ex.prices["SC"] = 49.5
     await _manage(desk, {"SC": 49.5, "SP": 35.0}, _T1)
-    assert {"SC": 49.5} in ex.hints and [leg.tradingsymbol for leg in pos.income_legs] == ["SP"]
+    assert {"SC": paper_close_price(49.5, "SELL", stop=True)} in ex.hints
+    assert paper_close_price(49.5, "SELL", stop=True) > 49.5
+    assert [leg.tradingsymbol for leg in pos.income_legs] == ["SP"]
 
 
 async def test_price_polling_uses_the_priority_lane_when_the_broker_has_one() -> None:
@@ -958,3 +1044,36 @@ async def test_trail_lock_shadow_never_fires_unarmed() -> None:
     await _manage(desk, _px(58.0), _T1)  # +1430 < 1560
     await _manage(desk, _px(79.0), _T1)  # big drop but never armed
     assert "trail_lock_shadow" not in pos.meta
+
+
+# ── R1: a LIVE strategy trades only through a usable broker route ─────────────
+
+
+async def test_live_short_premium_with_an_unusable_route_places_nothing(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    from src.brokers.routing import BrokerRoute
+
+    desk, paper_exec = _new_desk()
+    live_exec = _PxExecutor()
+    desk._alt_executor = live_exec
+    ctx = _ctx("live")
+    ctx.strategy_routes = {_NAME: BrokerRoute(None, "broker 'kitee' is not registered")}
+    with caplog.at_level(logging.WARNING, logger="options.seller_desk"):
+        assert await _enter(desk, ctx=ctx) is None
+    assert not live_exec.executed and not paper_exec.executed  # never demoted to paper
+    assert desk._repo.inserted == []
+    assert f"broker_route_rejected strategy={_NAME} segment=options" in caplog.text
+
+
+async def test_live_short_premium_with_a_usable_route_trades_as_today() -> None:
+    from src.brokers.routing import BrokerRoute
+
+    desk, paper_exec = _new_desk()
+    live_exec = _PxExecutor()
+    desk._alt_executor = live_exec
+    ctx = _ctx("live")
+    ctx.strategy_routes = {_NAME: BrokerRoute("kite", None)}
+    pos = await _enter(desk, ctx=ctx)
+    assert pos is not None and pos.is_paper is False
+    assert live_exec.executed and not paper_exec.executed

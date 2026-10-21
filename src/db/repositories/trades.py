@@ -7,6 +7,7 @@ The is_paper flag selects the target table; callers never reference table names 
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -14,12 +15,16 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import asyncpg
 
+_LOG = logging.getLogger(__name__)
+
 
 class TradeRepository:
     """Data access for trades and paper_trades."""
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
+        # table -> whether it has exec_broker (migration 089); checked once per process.
+        self._exec_broker_col: dict[str, bool] = {}
 
     def _table(self, is_paper: bool) -> str:
         return "paper_trades" if is_paper else "trades"
@@ -37,12 +42,64 @@ class TradeRepository:
             The new row id.
         """
         table = self._table(is_paper)
+        if "exec_broker" in data and not await self._has_exec_broker(table):
+            # A DB without migration 089 must still get the row: entry persistence is what
+            # every exit/reseed path reads, and NULL already means legacy "kite".
+            _LOG.error(
+                "trade_exec_broker_column_missing table=%s trade=%s exec_broker=%s -- "
+                "migration 089 not applied; row written without it",
+                table,
+                data.get("agent_trade_id"),
+                data["exec_broker"],
+            )
+            if data["exec_broker"] != "kite":
+                # Stripped, the row reads back as NULL = a Kite row: its reseed/exits would go
+                # to the kite stack. Still written -- losing the entry row is worse.
+                _LOG.critical(
+                    "trade_exec_broker_lost table=%s trade=%s exec_broker=%s -- row now "
+                    "indistinguishable from a Kite row",
+                    table,
+                    data.get("agent_trade_id"),
+                    data["exec_broker"],
+                )
+                try:
+                    from src.infrastructure import operator_alerts as _oa
+
+                    _oa.raise_alert(
+                        f"Trade {data.get('agent_trade_id')} placed on {data['exec_broker']} "
+                        "was saved without exec_broker (migration 089 missing): it will be "
+                        "treated as a Kite position. Apply migration 089 and fix the row.",
+                        source="trade_exec_broker_lost",
+                        tier="CRITICAL",
+                        dedupe_seconds=600,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- the CRITICAL log already fired
+                    _LOG.error("trade_exec_broker_lost_alert_failed err=%s", exc)
+            data = {k: v for k, v in data.items() if k != "exec_broker"}
         cols = list(data.keys())
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
         col_list = ", ".join(cols)
         sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) RETURNING id"  # noqa: S608
         async with self._pool.acquire() as conn:
             return int(await conn.fetchval(sql, *data.values()))
+
+    async def _has_exec_broker(self, table: str) -> bool:
+        """Whether `table` has the exec_broker column; cached once known. An unreadable
+        catalog is not cached and reported as present (the INSERT then decides)."""
+        if table not in self._exec_broker_col:
+            try:
+                async with self._pool.acquire() as conn:
+                    found = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = $1 "
+                        "AND column_name = 'exec_broker')",
+                        table,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warning("exec_broker_column_check_failed table=%s err=%s", table, exc)
+                return True
+            self._exec_broker_col[table] = bool(found)
+        return self._exec_broker_col[table]
 
     async def get_by_agent_id(
         self, agent_trade_id: str, is_paper: bool = False
@@ -171,17 +228,30 @@ class TradeRepository:
                 broker,
             )
 
-    async def open_trades(self, is_paper: bool = False) -> list[asyncpg.Record]:
-        """Return all trades not in a terminal state."""
+    async def open_trades(
+        self, is_paper: bool = False, exec_broker: str | None = None
+    ) -> list[asyncpg.Record]:
+        """Return all trades not in a terminal state.
+
+        Args:
+            is_paper: Read paper_trades when True.
+            exec_broker: Only rows held by this broker (NULL exec_broker = "kite").
+                None = every row, as before.
+        """
         table = self._table(is_paper)
         terminal = ("CLOSED", "REJECTED", "CANCELLED", "TIMED_OUT")
         placeholders = ", ".join(f"${i + 1}" for i in range(len(terminal)))
+        args: list[Any] = list(terminal)
+        broker_sql = ""
+        if exec_broker is not None:
+            args.append(exec_broker)
+            broker_sql = f" AND COALESCE(exec_broker, 'kite') = ${len(args)}"
         async with self._pool.acquire() as conn:
             return list(
                 await conn.fetch(
                     f"SELECT * FROM {table} WHERE order_state NOT IN ({placeholders})"  # noqa: S608
-                    " ORDER BY entry_timestamp ASC",
-                    *terminal,
+                    f"{broker_sql} ORDER BY entry_timestamp ASC",
+                    *args,
                 )
             )
 

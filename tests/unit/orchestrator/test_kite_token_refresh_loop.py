@@ -13,8 +13,15 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 import src.brokers.kite_auth as kite_auth_mod
 import src.orchestrator as orch_mod
+
+
+@pytest.fixture(autouse=True)
+def _kite_credentials(monkeypatch):  # type: ignore[no-untyped-def]
+    # The loop is a no-op without KITE_API_KEY; these tests exercise the refresh path.
+    monkeypatch.setenv("KITE_API_KEY", "test-key")
 
 
 class _FakeKiteBroker:

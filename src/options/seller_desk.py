@@ -37,13 +37,17 @@ not fabricated precision.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
+
+from asyncpg.exceptions import UniqueViolationError
 
 from src.notifications import EventKind, notify
 from src.notifications.events import Segment
@@ -68,6 +72,7 @@ from src.options.greeks_monitor import (
 )
 from src.options.margin_monitor import evaluate_position_margin, new_entries_blocked
 from src.options.options_autopsy import run_autopsy
+from src.options.paper_slippage import paper_close_price
 from src.options.portfolio_loss_monitor import circuit_breaker_check
 from src.options.position_manager import (
     ManagementAction,
@@ -78,7 +83,7 @@ from src.options.position_manager import evaluate_position as pm_evaluate_positi
 from src.options.position_sizer import size_position
 from src.options.rom_tracker import rom_gate
 from src.options.seller_crm_adapter import build_seller_crm_signal
-from src.options.short_premium import SHORT_PREMIUM_TYPE, is_strangle_position
+from src.options.short_premium import SHORT_PREMIUM_TYPES, is_strangle_position
 from src.options.strategy_selector import (
     StrategySelector,
     calibrated_pop,
@@ -119,20 +124,20 @@ _DIRECTIONAL_SIDE = {
 # Credit verticals whose width is fitted to the per-lot risk budget (see evaluate_and_size).
 _WIDTH_CAPPED_TYPES = frozenset({"bull_put_spread", "bear_call_spread"})
 _IST = ZoneInfo("Asia/Kolkata")
+# A failed operator close (config operator_actions.close_position_ids) is retried at most this
+# often per id: a transient broker error (timeout, rate limit) clears within minutes, a
+# persistent one needs the operator, who was alerted by the CRITICAL log on the first failure.
+_OPERATOR_CLOSE_RETRY_SECONDS = 300
+_monotonic = time.monotonic  # module seam so tests can drive the retry clock
 
-# Hypothesis B (config options_settings.json weekly_condor_simple): its own position
-# family -- own one-per-underlying slot, own TP/SL, never rolled.
-WEEKLY_CONDOR_TYPE = "weekly_condor_simple"
 # Hypothesis F2 (config options_settings.json options_expiry_day).
 EXPIRY_DAY_TYPE = "options_expiry_day"
 _SINGLE_SIDED_TYPES = frozenset({"bull_put_spread", "bear_call_spread"})
 # Hosted strategies that hold their own slot: the DB duplicate-reconciler must never
 # delete their rows (a 4th NIFTY row would otherwise be hard-deleted as a "duplicate").
-HOSTED_STRATEGY_TYPES: frozenset[str] = frozenset(
-    {WEEKLY_CONDOR_TYPE, EXPIRY_DAY_TYPE, SHORT_PREMIUM_TYPE}
-)
+HOSTED_STRATEGY_TYPES: frozenset[str] = frozenset({EXPIRY_DAY_TYPE, *SHORT_PREMIUM_TYPES})
 # Desk-hosted strategies that carry their OWN paper/live mode (registry execution_mode).
-HOSTED_OWN_MODE_TYPES = frozenset({WEEKLY_CONDOR_TYPE, EXPIRY_DAY_TYPE, SHORT_PREMIUM_TYPE})
+HOSTED_OWN_MODE_TYPES = frozenset({EXPIRY_DAY_TYPE, *SHORT_PREMIUM_TYPES})
 # The desk's OWN structures (bull_put_spread, iron_condor, ...) all trade under this one
 # registry entry -- matches seller_crm_adapter.build_seller_crm_signal's own default.
 DESK_OWN_STRATEGY_NAME = "options_seller_desk_v3"
@@ -195,6 +200,18 @@ class OpenPosition:
     # entry (SL % per leg, exit time, LLM shadow verdict). Both ride in options_positions.legs.
     closed_legs: list[dict[str, Any]] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
+    # Live broker whose executor placed it (options_positions.exec_broker); None for paper
+    # (and for a live row restored before migration 089 = "kite"). Exits use ONLY this broker.
+    exec_broker: str | None = None
+    # Restored live position whose broker has no executor this process (never rerouted).
+    broker_unwired: bool = False
+    # Restored ON HOLD (monitoring only; see SellerDesk.held_positions): why. None = managed.
+    # "restored_unaudited_live_row" | "expired_live_row" | "broker_unwired" | "partial_close".
+    hold_reason: str | None = None
+
+    @property
+    def hold(self) -> bool:
+        return self.hold_reason is not None
 
     @property
     def lots(self) -> int:
@@ -276,36 +293,6 @@ def estimate_economics(
     return debit, debit * 1.5, net_premium, "debit"
 
 
-def build_weekly_condor(
-    chain: OptionChain, lots: int, *, short_delta: float, wing_points: float
-) -> tuple[list[OptionLeg], list[OptionLeg]] | None:
-    """Hypothesis B's condor: short CE/PE at ~``short_delta`` (desk's liquidity-checked
-    delta search), long wings exactly ``wing_points`` beyond each short. None when a
-    short strike, a wing strike, or a wing's liquidity is missing -- never a
-    substituted strike, so the traded structure is always the tested one."""
-    short_c = find_strike_by_delta(chain, short_delta, "CE")
-    short_p = find_strike_by_delta(chain, short_delta, "PE")
-    if short_c is None or short_p is None or short_p.strike >= short_c.strike:
-        return None
-    by_strike = {row.strike: row for row in chain.strikes}
-    long_c = by_strike.get(short_c.strike + wing_points)
-    long_p = by_strike.get(short_p.strike - wing_points)
-    if long_c is None or long_p is None:
-        return None
-    if not (row_is_liquid(long_c, "CE") and row_is_liquid(long_p, "PE")):
-        return None
-    legs = [
-        leg_from_chain_row(long_p, "PE", "BUY", lots, chain.lot_size),
-        leg_from_chain_row(long_c, "CE", "BUY", lots, chain.lot_size),
-        leg_from_chain_row(short_p, "PE", "SELL", lots, chain.lot_size),
-        leg_from_chain_row(short_c, "CE", "SELL", lots, chain.lot_size),
-    ]
-    if any(leg is None for leg in legs):
-        return None
-    full = cast("list[OptionLeg]", legs)
-    return full[:2], full[2:]
-
-
 def build_expiry_butterfly(
     chain: OptionChain, lots: int, *, wing_points: float
 ) -> tuple[list[OptionLeg], list[OptionLeg]] | None:
@@ -359,22 +346,6 @@ def model_credit_points(
         p = bs_price(spot, leg.strike, t, DEFAULT_RISK_FREE_RATE, vix / 100.0, leg.instrument_type)
         total += p if leg.direction == "SELL" else -p
     return total
-
-
-def first_trading_day_of_cycle(expiry: date) -> date:
-    """First trading day after the previous weekly expiry (taken as expiry - 7 days).
-    If that previous expiry was itself holiday-shifted, this can land one day late --
-    the entry is then simply a day later, never an extra entry."""
-    from datetime import timedelta  # noqa: PLC0415
-
-    from src.market.calendar import is_trading_day  # noqa: PLC0415
-
-    d = expiry - timedelta(days=7)
-    for _ in range(10):
-        d += timedelta(days=1)
-        if is_trading_day(d):
-            return d
-    return d
 
 
 def _per_lot_greeks(
@@ -790,6 +761,7 @@ class SellerDesk:
         repo: OptionsRepository | None = None,
         is_paper: bool = True,
         alt_executor: OptionsLegExecutor | None = None,
+        executors: dict[str, OptionsLegExecutor] | None = None,
     ) -> None:
         self._selector = selector
         self._event_calendar = event_calendar
@@ -797,6 +769,20 @@ class SellerDesk:
         # Executor for the OTHER mode (live when the desk is paper, and vice versa), used
         # only by strategies whose own registry execution_mode differs from the desk's.
         self._alt_executor = alt_executor
+        # One executor per orchestrator stack, keyed "paper" / "live:<broker>". When given it
+        # is the ONLY source of executors (see _executor_for); None = the legacy pair above.
+        self._executors = executors
+        # The legacy (global.json) live broker: the primary live executor's broker, used for
+        # live strategies with no registry route. Set at boot. None = unknown (legacy callers
+        # and tests): treated as "kite", the legacy rule.
+        self.live_broker_name: str | None = None
+        # config/global.json system.per_broker_equity, set at boot. False = every cap and size
+        # below uses the one legacy equity figure, exactly as before. True = a LIVE entry or
+        # position is sized and capped on ITS broker's own equity (_equity_key); unknown = 0.
+        self.per_broker_equity: bool = False
+        # Per-broker only: today's realized P&L and the desk breaker latch per live stack key.
+        self._realized_today_by_key: dict[str, float] = {}
+        self._entries_halted_keys: dict[str, date] = {}
         self._chain_fetcher = chain_fetcher
         self._options_capital = options_capital
         self._risk_per_trade_pct = risk_per_trade_pct
@@ -819,6 +805,18 @@ class SellerDesk:
         )
         self._enabled_strategy_types = configured & implemented_strategy_types()
         self.positions: dict[str, OpenPosition] = {}
+        # Serialises "check for a duplicate -> place orders -> register position" so two entries
+        # for the same structure can never interleave (2026-10-16 duplicate bull_put_spread).
+        self._entry_lock = asyncio.Lock()
+        # Restored live positions held for MONITORING ONLY (restore_positions): kept OUT of
+        # self.positions, so no sweep/monitor/aggregate (slots, Greeks, margin, P&L) ever sees
+        # them; the ONLY exit is the operator close (operator_actions.close_position_ids).
+        self.held_positions: dict[str, OpenPosition] = {}
+        self._no_executor_logged: set[str] = set()  # CRITICAL once per position per process
+        # Failed operator closes: id -> monotonic time of the last attempt (retry throttle) and
+        # the ids already reported CRITICAL (once per id per process).
+        self._operator_close_failed_at: dict[str, float] = {}
+        self._operator_close_failure_logged: set[str] = set()
         # G9 LLM reviewer (config/global.json llm.options_g9) — lazily built on
         # first use in run_cycle(), same lazy-init pattern as shared["swing_g9_llm"]
         # in orchestrator.py. _g9_llm_loaded distinguishes "not yet attempted" from
@@ -858,6 +856,9 @@ class SellerDesk:
         self._short_premium_entered_day: date | None = None
         self._short_premium_bg: set[Any] = set()  # background LLM-shadow tasks (kept referenced)
         # The expiry-day strangle runs on the same engine under its own name: its own throttle/once-a-day state.
+        self._short_premium2_attempts: dict[date, int] = {}
+        self._short_premium2_missed_day: date | None = None
+        self._short_premium2_entered_day: date | None = None
         self._expiry_strangle_attempts: dict[date, int] = {}
         self._expiry_strangle_missed_day: date | None = None
         self._expiry_strangle_entered_day: date | None = None
@@ -873,9 +874,98 @@ class SellerDesk:
     def _pos_is_paper(self, pos: OpenPosition) -> bool:
         return self._is_paper if pos.is_paper is None else bool(pos.is_paper)
 
-    def _executor_for(self, is_paper: bool) -> Any:
-        """Order executor for a mode; None when that mode is not wired (fail closed)."""
+    def _executor_for(self, is_paper: bool, broker: str | None = None) -> Any:
+        """Order executor for paper, or for `broker`'s live account (None = the primary live
+        broker). None when it is not wired: fail closed, never another broker's executor."""
+        from src.brokers.stack_keys import (  # noqa: PLC0415
+            LEGACY_LIVE_BROKER,
+            primary_live_key,
+            stack_key,
+        )
+
+        if self._executors is not None:
+            if is_paper:
+                return self._executors.get(stack_key(True))
+            if broker:
+                return self._executors.get(stack_key(False, broker))
+            key = primary_live_key(self._executors, self.live_broker_name)
+            return self._executors.get(key) if key else None
+        # Legacy pair: the one live executor trades through live_broker_name only.
+        if not is_paper and broker and broker != (self.live_broker_name or LEGACY_LIVE_BROKER):
+            return None
         return self._executor if is_paper == self._is_paper else self._alt_executor
+
+    def _live_broker_of(self, broker: str | None) -> str | None:
+        """Broker name a live entry through _executor_for(False, broker) is stamped with."""
+        from src.brokers.stack_keys import primary_live_key, stack_broker  # noqa: PLC0415
+
+        if broker:
+            return broker
+        if self._executors is not None:
+            key = primary_live_key(self._executors, self.live_broker_name)
+            return (stack_broker(key) if key else None) or self.live_broker_name
+        return self.live_broker_name
+
+    def _equity_key(self, is_paper: bool, broker: str | None) -> str | None:
+        """Stack key whose equity sizes and caps a LIVE entry/position on `broker` when
+        per_broker_equity is on; None = the legacy single equity figure (flag off, or paper)."""
+        if not self.per_broker_equity or is_paper:
+            return None
+        return f"live:{self._live_broker_of(broker)}"
+
+    def _pos_equity_key(self, pos: OpenPosition) -> str | None:
+        return self._equity_key(self._pos_is_paper(pos), pos.exec_broker)
+
+    @staticmethod
+    def _equity_for(key: str | None) -> float:
+        """Legacy equity for None; else that broker's last fetched equity, 0.0 when unknown."""
+        from src.risk.budget import get_current_equity  # noqa: PLC0415
+
+        return get_current_equity() if key is None else get_current_equity(key)
+
+    def _risk_pct_for(self, key: str | None) -> float:
+        """risk_per_trade_pct of options_capital for an entry sized on `key`: the boot figure for
+        None (legacy); else capital.json options.max_structure_loss_per_strategy of THAT broker's
+        equity re-expressed as a % of options_capital (as the boot figure is), 0 when unknown."""
+        if key is None:
+            return self._risk_per_trade_pct
+        from src.risk.budget import get_budget  # noqa: PLC0415
+
+        equity = self._equity_for(key)
+        if equity <= 0 or self._options_capital <= 0:
+            return 0.0
+        rupees = get_budget().options.max_structure_loss_per_strategy_rupees(equity)
+        return rupees / self._options_capital * 100.0
+
+    def _executor_for_position(self, pos: OpenPosition, *, allow_held: bool = False) -> Any:
+        """The executor of the position's own mode and broker; None when that broker is not
+        wired (logged CRITICAL once per position) or the position is held and this is not the
+        operator close (`allow_held`) -- the caller must then place nothing."""
+        if pos.hold and not allow_held:
+            _LOG.debug(
+                "seller_desk_position_on_hold id=%s reason=%s", pos.position_id, pos.hold_reason
+            )
+            return None
+        executor = self._executor_for(self._pos_is_paper(pos), pos.exec_broker)
+        if executor is None and pos.position_id not in self._no_executor_logged:
+            self._no_executor_logged.add(pos.position_id)
+            _LOG.critical(
+                "seller_desk_no_executor_for_position id=%s mode=%s broker=%s -- no order "
+                "placed (never routed to another broker); retried on the next attempt",
+                pos.position_id,
+                "paper" if self._pos_is_paper(pos) else "live",
+                pos.exec_broker,
+            )
+        return executor
+
+    @staticmethod
+    def strategy_broker(name: str, is_paper: bool, crm_ctx: Any) -> str | None:
+        """Live broker a strategy's registry route names (None for paper / no usable route:
+        the primary live broker; an unusable route is rejected by live_route_rejection)."""
+        if is_paper:
+            return None
+        route = (getattr(crm_ctx, "strategy_routes", None) or {}).get(name)
+        return route.broker if route is not None and route.ok else None
 
     def strategy_is_paper(self, name: str, crm_ctx: Any) -> bool:
         """A desk-hosted strategy's own mode: its registry execution_mode (via
@@ -884,6 +974,26 @@ class SellerDesk:
         if mode in ("paper", "live"):
             return bool(mode == "paper")
         return self._is_paper
+
+    def live_route_rejection(self, name: str, crm_ctx: Any) -> str | None:
+        """R1 for a strategy already resolved LIVE: the reason it must not trade (its registry
+        broker route, crm_ctx.strategy_routes, is not usable), else None. Logged as
+        broker_route_rejected. No route entry = the legacy path (the primary live executor). A
+        usable route whose broker has no live executor is also rejected (never another
+        broker's executor). Never call it for paper."""
+        from src.brokers.routing import route_rejection  # noqa: PLC0415
+
+        routes = getattr(crm_ctx, "strategy_routes", None)
+        reason = route_rejection(routes, name)
+        route = (routes or {}).get(name)
+        if reason is None and route is not None and self._executor_for(False, route.broker) is None:
+            # Fail closed rather than send real orders to the wrong account.
+            reason = f"no live executor for broker {route.broker}"
+        if reason is not None:
+            _LOG.warning(
+                "broker_route_rejected strategy=%s segment=options reason=%s", name, reason
+            )
+        return reason
 
     def available_margin(self, broker_available_cash: float | None = None) -> float:
         """Sizing's margin-gate input (options_spec.md §14 margin check).
@@ -957,10 +1067,18 @@ class SellerDesk:
         tracking). No-op when no repo was injected (e.g. DB unavailable)."""
         if self._repo is None:
             return 0
+        # Every LIVE row comes back, whatever the desk's default mode and whichever broker holds
+        # it (a real position must never be forgotten after a restart); paper rows keep the old
+        # rule (the desk's own mode, or a desk-hosted strategy with its own mode). A live row the
+        # OLD rule dropped (never audited), an expired live row, or one whose broker has no
+        # executor comes back ON HOLD: monitoring only, operator close only (_hold_reason).
+        today = datetime.now(_IST).date()
+        held: list[OpenPosition] = []
         rows = [
             r
             for r in await self._repo.load_open_positions(is_paper=None)
-            if bool(r.get("is_paper", self._is_paper)) == self._is_paper
+            if not bool(r.get("is_paper", self._is_paper))
+            or bool(r.get("is_paper", self._is_paper)) == self._is_paper
             or r.get("strategy_type") in HOSTED_OWN_MODE_TYPES
         ]
         for row in rows:
@@ -1001,8 +1119,19 @@ class SellerDesk:
                     net_theta=float(row.get("entry_theta") or 0.0),  # type: ignore[arg-type]
                     net_vega=float(row.get("entry_vega") or 0.0),  # type: ignore[arg-type]
                 ),
+                # NULL on a live row = the legacy rule (Kite); paper carries no broker.
+                exec_broker=(
+                    None
+                    if bool(row.get("is_paper", self._is_paper))
+                    else str(row.get("exec_broker") or "kite")
+                ),
             )
-        today = datetime.now(_IST).date()
+            pos = self.positions[position_id]
+            pos.hold_reason = self._hold_reason(row, pos, today)
+            if pos.hold:
+                self.held_positions[position_id] = self.positions.pop(position_id)
+                held.append(pos)
+        self._alert_held(held)
         try:
             self._realized_today = await self._repo.realized_pnl_closed_on(
                 today, is_paper=self._is_paper
@@ -1017,6 +1146,60 @@ class SellerDesk:
         if rows:
             _LOG.info("seller_desk_positions_restored count=%d", len(rows))
         return len(rows)
+
+    def _hold_reason(self, row: dict[str, Any], pos: OpenPosition, today: date) -> str | None:
+        """Why a restored row must not be auto-managed, else None. Rows the old restore rule
+        kept (the desk's own mode, or a hosted strategy) and that are tradeable keep today's
+        behaviour exactly."""
+        if self._executor_for(self._pos_is_paper(pos), pos.exec_broker) is None:
+            pos.broker_unwired = True
+        if pos.meta.get("hold_reason") == "partial_close" or pos.meta.get("close_sent"):
+            # A close failed part-way, or the process died mid-close: which legs are still open
+            # is uncertain -- operator only (the operator close never re-sends a sent leg).
+            return "partial_close"
+        row_paper = bool(row.get("is_paper", self._is_paper))
+        if row_paper:
+            return "broker_unwired" if pos.broker_unwired else None
+        if row_paper != self._is_paper and row.get("strategy_type") not in HOSTED_OWN_MODE_TYPES:
+            return "restored_unaudited_live_row"  # the old filter dropped it: never audited
+        if pos.expiry < today:
+            return "expired_live_row"  # cannot be exited by a normal market order
+        return "broker_unwired" if pos.broker_unwired else None
+
+    def _alert_held(self, held: list[OpenPosition]) -> None:
+        """CRITICAL log per held position, and ONE operator alert per restore summarising them."""
+        if not held:
+            return
+        for pos in held:
+            _LOG.critical(
+                "seller_desk_position_restored_on_hold id=%s type=%s mode=%s broker=%s "
+                "expiry=%s reason=%s -- MONITORING ONLY, no automatic exits",
+                pos.position_id,
+                pos.strategy_type,
+                "paper" if self._pos_is_paper(pos) else "live",
+                pos.exec_broker,
+                pos.expiry,
+                pos.hold_reason,
+            )
+        items = "; ".join(
+            f"{p.position_id} ({p.strategy_type}, "
+            f"mode={'paper' if self._pos_is_paper(p) else 'live'} broker={p.exec_broker or '-'}, "
+            f"{p.hold_reason})"
+            for p in held
+        )
+        try:
+            from src.infrastructure import operator_alerts  # noqa: PLC0415
+
+            operator_alerts.raise_alert(
+                f"{len(held)} options positions restored for MONITORING ONLY -- no "
+                f"automatic exits; verify against the broker and close manually or via "
+                f"operator_actions.close_position_ids: {items}",
+                source="options_positions_on_hold",
+                tier="CRITICAL",
+                dedupe_seconds=4 * 3600,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the CRITICAL logs already fired
+            _LOG.error("seller_desk_on_hold_alert_failed err=%s", exc)
 
     async def reconcile_duplicate_positions(self) -> int:
         """DB-level backstop for the "at most max_strategies_per_index OPEN
@@ -1033,8 +1216,12 @@ class SellerDesk:
             is_paper=self._is_paper,
             keep_per_underlying=max(1, _seller_settings.max_strategies_per_index()),
             exclude_strategy_types=sorted(HOSTED_STRATEGY_TYPES),
+            # A held row is a real position awaiting the operator: it never counts towards the
+            # allowance (it must not make a newer row a "duplicate") and is never deleted.
+            exclude_position_ids=sorted(self.held_positions),
         )
         for position_id in deleted_ids:
+            self.held_positions.pop(position_id, None)
             self.positions.pop(position_id, None)
         if deleted_ids:
             _LOG.warning(
@@ -1113,10 +1300,18 @@ class SellerDesk:
         # a new one.
         _per_und = _seller_settings.max_strategies_per_index()
         # The expiry-day fly has its own slot (2026-10-09): it never uses up a desk slot.
+        # A held row of the desk's own mode is still a real open position on this index, so it
+        # keeps its slot (conservative); a held row of the other mode never touches this sleeve.
         _open_here = sum(
             1
             for p in self.positions.values()
             if p.underlying == underlying and p.strategy_type != EXPIRY_DAY_TYPE
+        ) + sum(
+            1
+            for p in self.held_positions.values()
+            if p.underlying == underlying
+            and p.strategy_type != EXPIRY_DAY_TYPE
+            and self._pos_is_paper(p) == self._is_paper
         )
         if _per_und > 0 and _open_here >= _per_und:
             _LOG.info(
@@ -1140,7 +1335,12 @@ class SellerDesk:
                 "seller_desk_entries_blocked underlying=%s reason=%s", underlying, _strat_halted
             )
             return None
-        executor = self._executor_for(self._is_paper)
+        if not self._is_paper and self.live_route_rejection(DESK_OWN_STRATEGY_NAME, crm_ctx):
+            return None
+        _route_broker = self.strategy_broker(DESK_OWN_STRATEGY_NAME, self._is_paper, crm_ctx)
+        executor = self._executor_for(self._is_paper, _route_broker)
+        _eq_key = self._equity_key(self._is_paper, _route_broker)
+        _risk_pct = self._risk_pct_for(_eq_key)
         if executor is None:
             _LOG.error(
                 "seller_desk_no_executor_for_mode underlying=%s mode=%s -- refusing (that "
@@ -1210,12 +1410,25 @@ class SellerDesk:
                         reason,
                     )
                     continue
+                _dup = self._open_duplicate_ids(
+                    underlying, strategy_type, near_chain.expiry.date(), self._is_paper
+                )
+                if _dup:
+                    _LOG.info(
+                        "seller_desk_no_trade_reason strategy=%s reason=duplicate_open_structure "
+                        "underlying=%s expiry=%s open=%s",
+                        strategy_type,
+                        underlying,
+                        near_chain.expiry.date(),
+                        _dup,
+                    )
+                    continue
                 sized = await evaluate_and_size_two_expiry(
                     strategy_type=strategy_type,
                     near_chain=near_chain,
                     far_chain=far_chain,
                     options_capital=self._options_capital,
-                    risk_per_trade_pct=self._risk_per_trade_pct,
+                    risk_per_trade_pct=_risk_pct,
                     margin_safety_pct=self._margin_safety_pct,
                     available_margin=available_margin,
                     current_greeks=self.portfolio_greeks(),
@@ -1272,6 +1485,19 @@ class SellerDesk:
                     reason,
                 )
                 continue
+            _dup = self._open_duplicate_ids(
+                underlying, strategy_type, strategy_chain.expiry.date(), self._is_paper
+            )
+            if _dup:
+                _LOG.info(
+                    "seller_desk_no_trade_reason strategy=%s reason=duplicate_open_structure "
+                    "underlying=%s expiry=%s open=%s",
+                    strategy_type,
+                    underlying,
+                    strategy_chain.expiry.date(),
+                    _dup,
+                )
+                continue
 
             size_mult = sizing_multiplier(strategy_type, ivr, regime=regime)
             if size_mult != 1.0:
@@ -1286,7 +1512,7 @@ class SellerDesk:
                 strategy_type=strategy_type,
                 chain=strategy_chain,
                 options_capital=self._options_capital,
-                risk_per_trade_pct=self._risk_per_trade_pct * size_mult,
+                risk_per_trade_pct=_risk_pct * size_mult,
                 margin_safety_pct=self._margin_safety_pct,
                 available_margin=available_margin,
                 current_greeks=self.portfolio_greeks(),
@@ -1295,7 +1521,7 @@ class SellerDesk:
                 min_rom_pct=self._min_rom_pct,
                 executor=executor,
                 ivr=ivr,
-                full_risk_per_trade_pct=self._risk_per_trade_pct,
+                full_risk_per_trade_pct=_risk_pct,
             )
             if sized is None:
                 continue
@@ -1318,7 +1544,7 @@ class SellerDesk:
         max_loss, max_profit, net_premium, direction = estimate_economics(
             strategy_type, protection_legs, income_legs, chain.lot_size, lots
         )
-        _risk_blocked = self.shared_risk_ceiling_reason(max_loss)
+        _risk_blocked = self.shared_risk_ceiling_reason(max_loss, equity_key=_eq_key)
         if _risk_blocked is not None:
             _LOG.info(
                 "seller_desk_no_trade_reason strategy=%s reason=%s", strategy_type, _risk_blocked
@@ -1408,6 +1634,7 @@ class SellerDesk:
             regime=regime,
             today=today,
             now=now,
+            broker=_route_broker,
         )
         if opened is not None and strategy_type in _WIDTH_CAPPED_TYPES:
             self._schedule_direction_shadow(
@@ -1461,7 +1688,7 @@ class SellerDesk:
                     1
                     for p in self.positions.values()
                     if self._pos_is_paper(p) == mode_paper
-                    and p.strategy_type not in (EXPIRY_DAY_TYPE, SHORT_PREMIUM_TYPE)
+                    and p.strategy_type not in (EXPIRY_DAY_TYPE, *SHORT_PREMIUM_TYPES)
                 )
         self._stamp_daily_loss(crm_ctx)
 
@@ -1650,6 +1877,62 @@ class SellerDesk:
         *,
         underlying: str,
         strategy_type: str,
+        chain: OptionChain,
+        is_paper: bool | None = None,
+        **kwargs: Any,
+    ) -> OpenPosition | None:
+        """Duplicate-proof entry gate in front of ``_place_and_track``. Under one lock (so two
+        entries can never interleave) it refuses when a structure with the same (underlying,
+        strategy, expiry, mode) is already open -- first in memory, then in the DB, which is the
+        truth when memory has drifted. A failed DB check refuses too (fail closed): not knowing
+        whether a duplicate exists is never a reason to place one."""
+        mode_paper = self._is_paper if is_paper is None else is_paper
+        expiry = chain.expiry.date()
+        async with self._entry_lock:
+            dup = self._open_duplicate_ids(underlying, strategy_type, expiry, mode_paper)
+            source = "memory"
+            if not dup and self._repo is not None:
+                try:
+                    dup = await self._repo.open_duplicate_ids(
+                        underlying=underlying,
+                        strategy_type=strategy_type,
+                        expiry=expiry,
+                        is_paper=mode_paper,
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail closed on an unverifiable check
+                    _LOG.error(
+                        "seller_desk_entry_refused underlying=%s strategy=%s "
+                        "reason=duplicate_check_failed err=%s",
+                        underlying,
+                        strategy_type,
+                        exc,
+                    )
+                    return None
+                source = "db"
+            if dup:
+                _LOG.warning(
+                    "seller_desk_entry_refused underlying=%s strategy=%s "
+                    "reason=duplicate_open_structure expiry=%s open=%s source=%s",
+                    underlying,
+                    strategy_type,
+                    expiry,
+                    dup,
+                    source,
+                )
+                return None
+            return await self._place_and_track(
+                underlying=underlying,
+                strategy_type=strategy_type,
+                chain=chain,
+                is_paper=is_paper,
+                **kwargs,
+            )
+
+    async def _place_and_track(
+        self,
+        *,
+        underlying: str,
+        strategy_type: str,
         protection_legs: list[OptionLeg],
         income_legs: list[OptionLeg],
         lots: int,
@@ -1664,12 +1947,25 @@ class SellerDesk:
         now: datetime,
         is_paper: bool | None = None,
         skip_shared_risk: bool = False,
+        broker: str | None = None,
     ) -> OpenPosition | None:
         """Place a CRM-approved structure (protection first), record every attempt,
-        track + persist the opened position, and notify. Shared by run_cycle and
-        run_weekly_condor_cycle so both use one execution path."""
+        track + persist the opened position, and notify. Shared by run_cycle and the
+        hosted strategies so all use one execution path. `broker` = the strategy's routed
+        live broker (None = the primary live broker); ignored for paper."""
         mode_paper = self._is_paper if is_paper is None else is_paper
-        executor = self._executor_for(mode_paper)
+        executor = self._executor_for(mode_paper, broker)
+        exec_broker = None if mode_paper else self._live_broker_of(broker)
+        _halt_key = self._equity_key(mode_paper, broker)
+        if _halt_key is not None and self._entries_halted_keys.get(_halt_key) == today:
+            _LOG.warning(
+                "seller_desk_entries_blocked underlying=%s strategy=%s reason="
+                "broker_daily_loss_halt key=%s",
+                underlying,
+                strategy_type,
+                _halt_key,
+            )
+            return None
         if executor is None:
             _LOG.error(
                 "seller_desk_no_executor_for_mode underlying=%s strategy=%s mode=%s -- "
@@ -1727,7 +2023,13 @@ class SellerDesk:
             except Exception:  # notify() must never break the trade path
                 pass
             return None
-        real_risk_blocked = None if skip_shared_risk else self.shared_risk_ceiling_reason(max_loss)
+        real_risk_blocked = (
+            None
+            if skip_shared_risk
+            else self.shared_risk_ceiling_reason(
+                max_loss, equity_key=self._equity_key(mode_paper, broker)
+            )
+        )
         if real_risk_blocked is not None:
             _LOG.info(
                 "seller_desk_execution_blocked_by_real_margin underlying=%s strategy=%s "
@@ -1753,7 +2055,7 @@ class SellerDesk:
                     "options_execution_log_write_failed position=%s err=%s", result.position_id, exc
                 )
         if (
-            strategy_type == SHORT_PREMIUM_TYPE
+            strategy_type in SHORT_PREMIUM_TYPES
             or (
                 strategy_type == EXPIRY_DAY_TYPE and not protection_legs
             )  # strangle; the fly has wings
@@ -1791,6 +2093,7 @@ class SellerDesk:
             entry_spot=chain.spot,
             entry_short_delta=abs(income_legs[0].delta) if income_legs else None,
             is_paper=None if mode_paper == self._is_paper else mode_paper,
+            exec_broker=exec_broker,
         )
         self.positions[position.position_id] = position
         if self._repo is not None:
@@ -1815,7 +2118,23 @@ class SellerDesk:
                     entry_atm_iv=position.entry_atm_iv,
                     entry_spot=position.entry_spot,
                     entry_short_delta=position.entry_short_delta,
+                    exec_broker=exec_broker,
                 )
+            except UniqueViolationError:
+                # Last-resort layer (migration 088): every earlier duplicate check was bypassed.
+                # The orders are already placed -- flatten them (shorts first) and untrack.
+                _LOG.error(
+                    "seller_desk_duplicate_blocked_by_db_index id=%s underlying=%s strategy=%s "
+                    "-- flattening the structure just placed",
+                    position.position_id,
+                    underlying,
+                    strategy_type,
+                )
+                self.positions.pop(position.position_id, None)
+                for state in result.income_legs + result.protection_legs:
+                    if state.filled:
+                        await executor.close_leg(state.leg, result.position_id)
+                return None
             except Exception as exc:  # noqa: BLE001 — persistence is best-effort, never blocks a live position
                 _LOG.warning(
                     "seller_desk_position_persist_failed id=%s err=%s", position.position_id, exc
@@ -1847,263 +2166,6 @@ class SellerDesk:
             pass
         return position
 
-    async def run_weekly_condor_cycle(
-        self,
-        underlying: str,
-        *,
-        today: date,
-        now: datetime,
-        available_margin: float,
-        regime: str,
-        vix: float | None,
-        crm: CentralRiskManager | None,
-        crm_ctx: CRMContext | None,
-    ) -> OpenPosition | None:
-        """Hypothesis B -- one defined-risk NIFTY iron condor per weekly expiry
-        (docs/hypotheses/B_nifty_weekly_condor_simple.md; config weekly_condor_simple).
-
-        Entered only on the FIRST trading day of the expiry cycle inside the entry
-        window, at most once per expiry (DB-checked, survives restarts and early
-        exits). Shares every desk risk control: paper hard-lock, daily-loss/margin/
-        gap entry blocks, desk min-entry-DTE, event blackout, size_position's
-        margin + Greeks budget, ROM gate, G9 LLM (under its OWN registry name), CRM
-        G0-G10, and the shared protection-first execution path. Skips the desk's
-        IVR/regime menu and crude-POP EV gate -- those select the desk's own
-        structures; this structure's edge was evaluated separately."""
-        cfg = _seller_settings.weekly_condor()
-        if not cfg.get("enabled", False):
-            return None
-        name = str(cfg.get("registry_name", "nifty_weekly_condor_simple"))
-        tag = f"weekly_condor underlying={underlying}"
-        if crm is None or crm_ctx is None:
-            _LOG.warning("%s skipped reason=crm_unavailable (fail-closed)", tag)
-            return None
-        mode_paper = self.strategy_is_paper(name, crm_ctx)
-        executor = self._executor_for(mode_paper)
-        if executor is None:
-            _LOG.error(
-                "%s skipped reason=mode_not_wired mode=%s (registry execution_mode) -- no "
-                "executor for that mode; refusing",
-                tag,
-                "paper" if mode_paper else "live",
-            )
-            return None
-        win = cfg.get("entry_window", ["10:00", "10:30"])
-        start, end = (datetime.strptime(t, "%H:%M").time() for t in win)
-        if not (start <= now.time() <= end):
-            return None
-        if any(
-            p.strategy_type == WEEKLY_CONDOR_TYPE and p.underlying == underlying
-            for p in self.positions.values()
-        ):
-            _LOG.info("%s skipped reason=already_open", tag)
-            return None
-        # 2026-10-07: removed a max_strategies_per_index check against self.positions --
-        # this strategy's own spec (options_settings.json weekly_condor_simple) explicitly
-        # promises "its own one-per-underlying slot (does not block or get deleted by the
-        # desk's NIFTY position)", but this counted the desk's OWN structures against the
-        # SAME cap, starving the condor the moment the desk had 2 of its own NIFTY spreads
-        # open -- found live 2026-10-07 (desk at 2/2 NIFTY, condor blocked). The already_open
-        # check above already guarantees at most one condor per underlying; that IS this
-        # strategy's own slot, independent of how many desk structures are open.
-        blocked_reason = self.entries_blocked_reason(today, available_margin)
-        if blocked_reason is not None:
-            _LOG.warning("%s skipped reason=entries_blocked detail=%s", tag, blocked_reason)
-            return None
-        _strat_halted = self.strategy_halted_reason(name, today)
-        if _strat_halted is not None:
-            _LOG.warning("%s skipped reason=%s", tag, _strat_halted)
-            return None
-
-        chain = await self._chain_fetcher.fetch_tier1(underlying)
-        if chain is None:
-            _LOG.info("%s skipped reason=no_chain_data", tag)
-            return None
-        self._observe_chain(underlying, chain, today)
-        expiry = chain.expiry.date()
-        first_day = first_trading_day_of_cycle(expiry)
-        # 2026-10-07: was `today != first_day` -- exactly ONE calendar day, inside a
-        # single ~20-30min window, to catch an entire week's trade. A restart, a Kite
-        # hiccup or any transient failure on that one day silently loses the whole
-        # cycle with no way to catch up (found live: zero entries across this
-        # strategy's first several days). has_position_for_expiry below already
-        # guarantees at most one entry per expiry, so widening this to "first_day or
-        # later" only adds resilience, never a double-entry risk. min_entry_dte below
-        # still stops it entering too close to expiry if every earlier day was missed.
-        if today < first_day:
-            _LOG.info(
-                "%s skipped reason=cycle_not_started_yet expiry=%s first_day=%s",
-                tag,
-                expiry,
-                first_day,
-            )
-            return None
-        allowed, dte_reason = pre_entry_dte_check_from_expiry(expiry, today)
-        if not allowed:
-            _LOG.info("%s skipped reason=min_entry_dte detail=%s", tag, dte_reason)
-            return None
-        if self._repo is not None and await self._repo.has_position_for_expiry(
-            strategy_type=WEEKLY_CONDOR_TYPE,
-            underlying=underlying,
-            expiry=expiry,
-            is_paper=mode_paper,
-        ):
-            _LOG.info("%s skipped reason=already_traded_this_expiry expiry=%s", tag, expiry)
-            return None
-        blackout = await self._event_calendar.selling_blocked(underlying, now)
-        if blackout.blocked:
-            _LOG.info("%s skipped reason=event_blackout detail=%s", tag, blackout.reason)
-            return None
-
-        built = build_weekly_condor(
-            chain,
-            1,
-            short_delta=float(cfg.get("short_delta", 0.15)),
-            wing_points=float(cfg.get("wing_points", 200)),
-        )
-        if built is None:
-            _LOG.info("%s skipped reason=structure_build_failed (strikes/liquidity)", tag)
-            return None
-        prot1, inc1 = built
-        wing = float(cfg.get("wing_points", 200))
-        credit_1lot = _net_premium(prot1, inc1)
-        max_loss_1lot = wing * chain.lot_size - credit_1lot
-        if credit_1lot <= 0.0 or max_loss_1lot <= 0.0:
-            _LOG.info(
-                "%s skipped reason=degenerate_economics credit=%.0f max_loss=%.0f",
-                tag,
-                credit_1lot,
-                max_loss_1lot,
-            )
-            return None
-        dte_value = compute_dte(expiry, today)
-        passed_rom, rom_reason = rom_gate(
-            credit_1lot, max_loss_1lot, dte_value, min_pct=self._min_rom_pct
-        )
-        if not passed_rom:
-            _LOG.info("%s skipped reason=rom_gate_failed detail=%s", tag, rom_reason)
-            return None
-        try:
-            margin_1lot = await executor.get_order_margin_for_structure(
-                prot1, inc1, f"{tag}-SIZING"
-            )
-        except Exception as exc:  # noqa: BLE001 — never size a trade on a fake number if this fails
-            _LOG.error("%s skipped reason=margin_fetch_failed detail=%s", tag, exc)
-            return None
-        if margin_1lot.total_margin <= 0.0 or margin_1lot.total_margin < max_loss_1lot:
-            _LOG.error(
-                "%s skipped reason=implausible_margin real=%.0f theoretical=%.0f -- refusing "
-                "rather than trusting a parsing bug",
-                tag,
-                margin_1lot.total_margin,
-                max_loss_1lot,
-            )
-            return None
-        sizing = size_position(
-            self._options_capital,
-            self._risk_per_trade_pct,
-            max_loss_1lot,
-            margin_per_lot=margin_1lot.total_margin,
-            available_margin=available_margin,
-            current_greeks=self.portfolio_greeks(),
-            per_lot_greeks=to_rupees(_per_lot_greeks(chain, prot1, inc1, 1), chain.spot),
-            greeks_budget=self._greeks_budget,
-            margin_safety_pct=self._margin_safety_pct,
-        )
-        if sizing.rejected or sizing.lots < 1:
-            _LOG.info("%s skipped reason=sizing_rejected detail=%s", tag, sizing.reason)
-            return None
-        lots = min(sizing.lots, int(cfg.get("max_lots", 1)))
-        final = build_weekly_condor(
-            chain,
-            lots,
-            short_delta=float(cfg.get("short_delta", 0.15)),
-            wing_points=wing,
-        )
-        if final is None:
-            _LOG.info("%s skipped reason=final_structure_build_failed lots=%d", tag, lots)
-            return None
-        protection_legs, income_legs = final
-        net_premium = _net_premium(protection_legs, income_legs)
-        max_loss = wing * chain.lot_size * lots - net_premium
-        max_profit = net_premium
-        _risk_blocked = self.shared_risk_ceiling_reason(max_loss)
-        if _risk_blocked is not None:
-            _LOG.info("%s skipped reason=%s", tag, _risk_blocked)
-            return None
-
-        signal_id = f"SELLER-{uuid.uuid4().hex[:10].upper()}"
-        crm_signal = build_seller_crm_signal(
-            signal_id=signal_id,
-            underlying=underlying,
-            strategy_type=WEEKLY_CONDOR_TYPE,
-            lots=lots,
-            max_loss=max_loss,
-            max_profit=max_profit,
-            regime=regime,
-            vix=vix if vix is not None else 15.0,
-            registry_name=name,
-        )
-        # Own name everywhere (logs, counters, registry policy) -- B is its own strategy.
-        crm_signal.strategy_name = name
-        _LOG.info(
-            "%s candidate expiry=%s dte=%d lots=%d credit=%.0f max_loss=%.0f legs=%s",
-            tag,
-            expiry,
-            dte_value,
-            lots,
-            net_premium,
-            max_loss,
-            [
-                f"{leg.direction[0]}{leg.strike:g}{leg.instrument_type}"
-                for leg in protection_legs + income_legs
-            ],
-        )
-        if not self._crm_precheck(crm, crm_signal, crm_ctx, lots, underlying):
-            return None
-        if not await self._g9_review(
-            crm_signal,
-            crm_ctx,
-            underlying=underlying,
-            strategy_type=WEEKLY_CONDOR_TYPE,
-            regime=regime,
-            max_loss=max_loss,
-            max_profit=max_profit,
-            lots=lots,
-            vix=vix,
-        ):
-            return None
-        self._stamp_open_strategies(crm_ctx)
-        decision = crm.evaluate(crm_signal, crm_ctx)
-        log_gate_decisions(crm_signal, decision)
-        if not decision.approved or decision.final_quantity < lots:
-            _LOG.info(
-                "%s skipped reason=crm gate=%s detail=%s crm_qty=%s lots=%d",
-                tag,
-                decision.blocking_gate,
-                decision.blocking_reason,
-                decision.final_quantity,
-                lots,
-            )
-            return None
-        return await self._execute_and_record(
-            underlying=underlying,
-            strategy_type=WEEKLY_CONDOR_TYPE,
-            protection_legs=protection_legs,
-            income_legs=income_legs,
-            lots=lots,
-            chain=chain,
-            net_premium=net_premium,
-            max_loss=max_loss,
-            max_profit=max_profit,
-            direction="credit",
-            signal_id=signal_id,
-            regime=regime,
-            today=today,
-            now=now,
-            is_paper=mode_paper,
-        )
-
     async def run_expiry_day_cycle(
         self,
         underlying: str,
@@ -2134,7 +2196,11 @@ class SellerDesk:
             _LOG.warning("%s skipped reason=crm_unavailable (fail-closed)", tag)
             return None
         mode_paper = self.strategy_is_paper(name, crm_ctx)
-        executor = self._executor_for(mode_paper)
+        if not mode_paper and self.live_route_rejection(name, crm_ctx):
+            return None
+        _route_broker = self.strategy_broker(name, mode_paper, crm_ctx)
+        executor = self._executor_for(mode_paper, _route_broker)
+        _eq_key = self._equity_key(mode_paper, _route_broker)
         if executor is None:
             _LOG.error(
                 "%s skipped reason=mode_not_wired mode=%s -- refusing",
@@ -2222,7 +2288,7 @@ class SellerDesk:
             return None
         sizing = size_position(
             self._options_capital,
-            self._risk_per_trade_pct,
+            self._risk_pct_for(_eq_key),
             max_loss_1lot,
             margin_per_lot=margin_1lot.total_margin,
             available_margin=available_margin,
@@ -2318,34 +2384,77 @@ class SellerDesk:
             now=now,
             is_paper=mode_paper,
             skip_shared_risk=True,
+            broker=_route_broker,
         )
 
     async def sweep_expiry_guardian(self, today: date, now: datetime) -> None:
         """LAYER0-4 forced closes (options_spec.md §6) — highest priority,
-        called before any other sweep in the orchestrator loop ordering."""
+        called before any other sweep in the orchestrator loop ordering. One position's
+        failure (e.g. its broker raising) is logged CRITICAL and never stops the others."""
         for position_id, pos in list(self.positions.items()):
-            d = compute_dte(pos.expiry, today)
-            _strangle = is_strangle_position(pos, EXPIRY_DAY_TYPE)
-            if pos.strategy_type == EXPIRY_DAY_TYPE and pos.expiry == today and not _strangle:
-                # Strategy-only exception (config options_expiry_day): it exists to hold
-                # on expiry day, so the guardian takes over only from exit_by onward.
-                exit_by = datetime.strptime(
-                    str(_seller_settings.expiry_day().get("exit_by", "14:45")), "%H:%M"
-                ).time()
-                if now.time() < exit_by:
-                    continue
-            if pos.strategy_type == SHORT_PREMIUM_TYPE or _strangle:
-                # Intraday by design: the strategy's own loop exits at its exit_time; the guardian
-                # only takes over from there as the backstop (a stale prior-day row falls through).
-                exit_str = str(pos.meta.get("exit_time") or "15:01")
-                if (
-                    pos.entered_at.astimezone(_IST).date() == today
-                    and now.time() < datetime.strptime(exit_str, "%H:%M").time()
-                ):
-                    continue
-            action = guardian_evaluate(d, now.time(), is_expiry_day=(pos.expiry == today))
-            if action.close_now:
-                await self._close_position(position_id, reason=action.reason)
+            try:
+                await self._guardian_one(position_id, pos, today, now)
+            except Exception as exc:  # noqa: BLE001 -- isolate; CancelledError still propagates
+                _LOG.critical(
+                    "seller_desk_guardian_position_failed id=%s err=%r -- continuing with the "
+                    "other positions; retried next sweep",
+                    position_id,
+                    exc,
+                )
+
+    async def _guardian_one(
+        self, position_id: str, pos: OpenPosition, today: date, now: datetime
+    ) -> None:
+        d = compute_dte(pos.expiry, today)
+        _strangle = is_strangle_position(pos, EXPIRY_DAY_TYPE)
+        if pos.strategy_type == EXPIRY_DAY_TYPE and pos.expiry == today and not _strangle:
+            # Strategy-only exception (config options_expiry_day): it exists to hold
+            # on expiry day, so the guardian takes over only from exit_by onward.
+            exit_by = datetime.strptime(
+                str(_seller_settings.expiry_day().get("exit_by", "14:45")), "%H:%M"
+            ).time()
+            if now.time() < exit_by:
+                return
+        if pos.strategy_type in SHORT_PREMIUM_TYPES or _strangle:
+            # Intraday by design: the strategy's own loop exits at its exit_time; the guardian
+            # only takes over from there as the backstop (a stale prior-day row falls through).
+            exit_str = str(pos.meta.get("exit_time") or "15:01")
+            if (
+                pos.entered_at.astimezone(_IST).date() == today
+                and now.time() < datetime.strptime(exit_str, "%H:%M").time()
+            ):
+                return
+        action = guardian_evaluate(d, now.time(), is_expiry_day=(pos.expiry == today))
+        if action.close_now:
+            await self._close_position(position_id, reason=action.reason)
+
+    async def _operator_close_one(self, position_id: str) -> None:
+        """One operator close, isolated: a raise is logged CRITICAL once per id per process and
+        the id is not retried for _OPERATOR_CLOSE_RETRY_SECONDS; the other ids and the rest of
+        the sweep always run. CancelledError/KeyboardInterrupt are not Exceptions: they propagate."""
+        last = self._operator_close_failed_at.get(position_id)
+        if last is not None and _monotonic() - last < _OPERATOR_CLOSE_RETRY_SECONDS:
+            return
+        _LOG.warning("seller_desk_operator_close id=%s reason=OPERATOR_CLOSE", position_id)
+        try:
+            await self._close_position(position_id, reason="OPERATOR_CLOSE")
+        except Exception as exc:  # noqa: BLE001 -- isolate; never abort the whole sweep
+            self._operator_close_failed_at[position_id] = _monotonic()
+            if position_id in self._operator_close_failure_logged:
+                _LOG.warning(
+                    "seller_desk_operator_close_failed_again id=%s err=%r", position_id, exc
+                )
+            else:
+                self._operator_close_failure_logged.add(position_id)
+                _LOG.critical(
+                    "seller_desk_operator_close_failed id=%s err=%r -- position kept; retried "
+                    "at most once every %ds; check it at the broker",
+                    position_id,
+                    exc,
+                    _OPERATOR_CLOSE_RETRY_SECONDS,
+                )
+            return
+        self._operator_close_failed_at.pop(position_id, None)
 
     async def sweep_position_manager(
         self,
@@ -2378,9 +2487,8 @@ class SellerDesk:
         # fresh each sweep). Audited, one-shot per id: once closed it is no longer in
         # self.positions, so a leftover id in the file is inert.
         for _op_id in _seller_settings.operator_close_position_ids():
-            if _op_id in self.positions:
-                _LOG.warning("seller_desk_operator_close id=%s reason=OPERATOR_CLOSE", _op_id)
-                await self._close_position(_op_id, reason="OPERATOR_CLOSE")
+            if _op_id in self.positions or _op_id in self.held_positions:
+                await self._operator_close_one(_op_id)
         for _u, _c in chains.items():
             self._observe_chain(_u, _c, today)
         expiry_chains: dict[tuple[str, date], OptionChain | None] = {}
@@ -2409,15 +2517,11 @@ class SellerDesk:
                         _LOG.warning(
                             "seller_desk_peak_persist_failed id=%s err=%s", position_id, exc
                         )
-            if pos.strategy_type == SHORT_PREMIUM_TYPE or is_strangle_position(
+            if pos.strategy_type in SHORT_PREMIUM_TYPES or is_strangle_position(
                 pos, EXPIRY_DAY_TYPE
             ):
                 # Per-leg SL + time exit live in src/options/short_premium.py (own 10s loop; this
                 # 5-minute sweep is far too coarse for a 23% leg stop). No rolls, ever.
-                continue
-            if pos.strategy_type == WEEKLY_CONDOR_TYPE:
-                # Own TP/SL, never rolled (hypothesis B). Expiry guardian still applies.
-                await self._manage_weekly_condor(position_id, pos, unrealized, today, missing)
                 continue
             if pos.strategy_type == EXPIRY_DAY_TYPE:
                 await self._manage_expiry_day(position_id, pos, unrealized, today, missing)
@@ -2544,46 +2648,6 @@ class SellerDesk:
                     position_id, pos, breach, leg_chain, today, unrealized
                 )
 
-    async def _manage_weekly_condor(
-        self,
-        position_id: str,
-        pos: OpenPosition,
-        unrealized: float,
-        today: date,
-        missing_legs: list[str],
-    ) -> None:
-        """Hypothesis B exits: close at profit_target_pct of the credit, or when the
-        loss reaches stop_loss_credit_multiple x credit. No decision on a cycle with
-        an unpriced leg (its move would read as zero) -- the guardian still forces
-        the pre-expiry exit regardless."""
-        cfg = _seller_settings.weekly_condor()
-        credit = abs(pos.entry_premium)
-        tp = float(cfg.get("profit_target_pct", 50)) / 100.0 * credit
-        sl = float(cfg.get("stop_loss_credit_multiple", 2.0)) * credit
-        reason: str | None = None
-        if not missing_legs and credit > 0.0:
-            if unrealized >= tp:
-                reason = f"WEEKLY_CONDOR_TP pnl={unrealized:.0f} >= {tp:.0f}"
-            elif unrealized <= -sl:
-                reason = f"WEEKLY_CONDOR_SL pnl={unrealized:.0f} <= -{sl:.0f}"
-        _LOG.info(
-            "seller_desk_position_check id=%s underlying=%s type=%s dir=%s dte=%d "
-            "unrealized=%.0f pct_of_premium=%.0f tp=%.0f sl=-%.0f missing_legs=%s triggered=%s",
-            position_id,
-            pos.underlying,
-            pos.strategy_type,
-            pos.direction,
-            compute_dte(pos.expiry, today),
-            unrealized,
-            (unrealized / credit * 100.0) if credit > 0.0 else 0.0,
-            tp,
-            sl,
-            missing_legs or None,
-            reason,
-        )
-        if reason is not None:
-            await self._close_position(position_id, reason=reason)
-
     async def _manage_expiry_day(
         self,
         position_id: str,
@@ -2626,6 +2690,21 @@ class SellerDesk:
         )
         if reason is not None:
             await self._close_position(position_id, reason=reason)
+
+    def _open_duplicate_ids(
+        self, underlying: str, strategy_type: str, expiry: date, mode_paper: bool
+    ) -> list[str]:
+        """Ids of open in-memory positions with the same (underlying, strategy_type, expiry,
+        mode). One structure per key, whatever the count caps say -- two identical spreads are
+        the same bet doubled, never a diversification (2026-10-16)."""
+        return [
+            pid
+            for pid, p in self.positions.items()
+            if p.underlying == underlying
+            and p.strategy_type == strategy_type
+            and p.expiry == expiry
+            and (self._is_paper if p.is_paper is None else p.is_paper) == mode_paper
+        ]
 
     def _same_direction_open(self, strategy_type: str) -> list[str]:
         """Ids of open positions on the same directional side as ``strategy_type`` when that
@@ -2758,7 +2837,10 @@ class SellerDesk:
             await self._close_position(position_id, reason=decision.reason)
             return
 
-        rolled = await self._executor.roll_leg(untested_leg, new_leg, position_id)
+        roll_exec = self._executor_for_position(pos)
+        if roll_exec is None:
+            return  # logged CRITICAL; never rolled through another mode's or broker's account
+        rolled = await roll_exec.roll_leg(untested_leg, new_leg, position_id)
         if rolled is None:
             _LOG.warning("seller_desk_adjustment_roll_failed id=%s", position_id)
             return
@@ -2951,12 +3033,17 @@ class SellerDesk:
         except Exception as exc:  # noqa: BLE001 — reporting only
             _LOG.warning("seller_desk_attribution_persist_failed err=%s", exc)
 
-    def _add_realized(self, pnl: float, structure_type: str | None = None) -> None:
+    def _add_realized(
+        self, pnl: float, structure_type: str | None = None, key: str | None = None
+    ) -> None:
         today = datetime.now(_IST).date()
         if self._realized_day != today:
             self._realized_day, self._realized_today = today, 0.0
             self._realized_today_by_strategy = {}
+            self._realized_today_by_key = {}
         self._realized_today += pnl
+        if key is not None:
+            self._realized_today_by_key[key] = self._realized_today_by_key.get(key, 0.0) + pnl
         if structure_type is not None:
             name = _registry_strategy_for(structure_type)
             self._realized_today_by_strategy[name] = (
@@ -2996,16 +3083,23 @@ class SellerDesk:
                     cap,
                 )
 
-    def shared_risk_ceiling_reason(self, candidate_max_loss: float) -> str | None:
+    def shared_risk_ceiling_reason(
+        self, candidate_max_loss: float, *, equity_key: str | None = None
+    ) -> str | None:
         """config/capital.json options.max_share_of_shared_risk (Layer 2, "if every
         open options structure hits its own stop, what's the worst case"): the sum of
         every open structure's own defined max loss, plus this candidate, must fit
         under the ceiling. entry_margin IS each open position's max_loss (set at
-        entry), so this needs no extra bookkeeping. Returns a block reason, or None."""
-        from src.risk.budget import get_budget as _rb_get_budget
-        from src.risk.budget import get_current_equity as _rb_get_equity
+        entry), so this needs no extra bookkeeping. Returns a block reason, or None.
 
-        ceiling = _rb_get_budget().options.max_share_of_shared_risk_rupees(_rb_get_equity())
+        ``equity_key`` (per_broker_equity, a live entry): the ceiling is that broker's own
+        equity share and only that broker's open structures count; unknown equity blocks."""
+        from src.risk.budget import get_budget as _rb_get_budget
+
+        _equity = self._equity_for(equity_key)
+        if equity_key is not None and _equity <= 0:
+            return f"broker_equity_unknown key={equity_key}"
+        ceiling = _rb_get_budget().options.max_share_of_shared_risk_rupees(_equity)
         if ceiling <= 0:
             return None
         # options_intraday_short_premium and the expiry-day fly are exempt from every total/slot
@@ -3014,7 +3108,8 @@ class SellerDesk:
         open_total = sum(
             p.entry_margin
             for p in self.positions.values()
-            if p.strategy_type not in (SHORT_PREMIUM_TYPE, EXPIRY_DAY_TYPE)
+            if p.strategy_type not in (*SHORT_PREMIUM_TYPES, EXPIRY_DAY_TYPE)
+            and (equity_key is None or self._pos_equity_key(p) == equity_key)
         )
         projected = open_total + candidate_max_loss
         if projected > ceiling:
@@ -3039,18 +3134,38 @@ class SellerDesk:
         ONE registry strategy's realized + open MTM loss today reaches its own cap,
         close THAT strategy's open positions only and latch it off until the next
         trading day -- every other strategy keeps trading. Called once per orchestrator
-        sweep, same cadence as sweep_portfolio_risk (the segment-wide backstop)."""
+        sweep, same cadence as sweep_portfolio_risk (the segment-wide backstop).
+
+        per_broker_equity: a strategy's LIVE positions are capped on their broker's own
+        equity; a broker whose equity is unknown is skipped this sweep (its entries are
+        already blocked by CRM G1; positions are never force-closed on missing data)."""
         from src.risk.budget import get_budget as _rb_get_budget
         from src.risk.budget import get_current_equity as _rb_get_equity
 
-        cap = _rb_get_budget().options.max_loss_per_day_per_strategy_rupees(_rb_get_equity())
-        if cap <= 0:
-            return
-        by_strategy: dict[str, list[OpenPosition]] = {}
+        _opt_budget = _rb_get_budget().options
+        legacy_cap = _opt_budget.max_loss_per_day_per_strategy_rupees(_rb_get_equity())
+        by_strategy: dict[tuple[str, str | None], list[OpenPosition]] = {}
         for pos in self.positions.values():
-            by_strategy.setdefault(_registry_strategy_for(pos.strategy_type), []).append(pos)
-        for name, positions in by_strategy.items():
+            by_strategy.setdefault(
+                (_registry_strategy_for(pos.strategy_type), self._pos_equity_key(pos)), []
+            ).append(pos)
+        for (name, key), positions in by_strategy.items():
             if self._strategy_halted_day.get(name) == today:
+                continue
+            if key is None:
+                cap = legacy_cap
+            else:
+                _key_equity = self._equity_for(key)
+                if _key_equity <= 0:
+                    _LOG.warning(
+                        "seller_desk_strategy_daily_loss_skipped strategy=%s key=%s "
+                        "reason=broker_equity_unknown",
+                        name,
+                        key,
+                    )
+                    continue
+                cap = _opt_budget.max_loss_per_day_per_strategy_rupees(_key_equity)
+            if cap <= 0:
                 continue
             unrealized = sum(self._unrealized_pnl(p, current_prices) for p in positions)
             loss_today = self._realized_today_by_strategy.get(name, 0.0) + unrealized
@@ -3109,6 +3224,39 @@ class SellerDesk:
             return "gap_risk_stress_test"
         return None
 
+    def _per_broker_daily_loss_breaker(
+        self, today: date, current_prices: dict[str, float], halt_pct: float
+    ) -> None:
+        """per_broker_equity: the desk's daily-loss breaker per live broker -- that broker's
+        realized (this process) + open MTM against ITS equity. A breach latches entries off
+        for that broker only (checked in _execute_and_record) until the next trading day. The
+        combined breaker above still runs as before."""
+        unrealized_by_key: dict[str, float] = {}
+        for p in self.positions.values():
+            k = self._pos_equity_key(p)
+            if k is not None:
+                unrealized_by_key[k] = unrealized_by_key.get(k, 0.0) + self._unrealized_pnl(
+                    p, current_prices
+                )
+        for key in set(unrealized_by_key) | set(self._realized_today_by_key):
+            if self._entries_halted_keys.get(key) == today:
+                continue
+            equity = self._equity_for(key)
+            if equity <= 0:
+                continue  # unknown equity: CRM G1 already blocks this broker's entries
+            realized = self._realized_today_by_key.get(key, 0.0)
+            unrealized = unrealized_by_key.get(key, 0.0)
+            halted, reason = circuit_breaker_check(realized, unrealized, equity, halt_pct=halt_pct)
+            if halted:
+                self._entries_halted_keys[key] = today
+                _LOG.error(
+                    "seller_desk_daily_loss_halt key=%s %s realized=%.0f unrealized=%.0f",
+                    key,
+                    reason,
+                    realized,
+                    unrealized,
+                )
+
     async def sweep_portfolio_risk(
         self,
         *,
@@ -3135,6 +3283,7 @@ class SellerDesk:
         if self._realized_day != today:
             self._realized_day, self._realized_today = today, 0.0
             self._realized_today_by_strategy = {}
+            self._realized_today_by_key = {}
         unrealized = sum(self._unrealized_pnl(p, current_prices) for p in self.positions.values())
         # 2026-10-07: config/capital.json (src/risk/budget.py) is now the ONE source for
         # this threshold -- was options_settings.json portfolio_risk.daily_loss_halt_pct
@@ -3159,6 +3308,8 @@ class SellerDesk:
                 self._realized_today,
                 unrealized,
             )
+        if self.per_broker_equity:
+            self._per_broker_daily_loss_breaker(today, current_prices, _all_strategies_pct)
 
         self._gap_blocked = False
         for underlying in {p.underlying for p in self.positions.values()}:
@@ -3217,10 +3368,16 @@ class SellerDesk:
         needs, once, here: move it to ``pos.closed_legs`` with its exit price/time/reason, persist it (a
         restart must not re-open it), and send the realised-P&L Telegram alert. False (leg left open, the
         caller retries next tick) when the broker call fails."""
-        executor = self._executor_for(self._pos_is_paper(pos)) or self._executor
+        executor = self._executor_for_position(pos)
+        if executor is None:
+            return False  # logged CRITICAL; the caller retries next tick
         hint = getattr(executor, "hint_prices", None)
+        paper_px: float | None = None
         if ltp is not None and callable(hint):
-            hint({leg.tradingsymbol: ltp})  # paper: fill at the price the decision just saw
+            # Paper: fill at the price the decision saw PLUS modelled slippage (a stop = market order into a
+            # moving book), never at the trigger/LTP itself -- paper must not flatter a stop (see paper_slippage).
+            paper_px = paper_close_price(ltp, leg.direction, stop=trigger is not None)
+            hint({leg.tradingsymbol: paper_px})
         try:
             fill = await executor.close_leg(leg, pos.position_id)
         except Exception as exc:  # noqa: BLE001 -- the caller alerts and retries; never silent
@@ -3248,6 +3405,8 @@ class SellerDesk:
             "reason": reason,
             "trigger": trigger,
         }
+        if paper_px is not None and ltp is not None and self._pos_is_paper(pos):
+            rec["paper_slippage"] = round(paper_px - ltp, 4)
         (pos.income_legs if leg in pos.income_legs else pos.protection_legs).remove(leg)
         pos.closed_legs.append(rec)
         slip = (exit_premium - trigger) if trigger is not None else None
@@ -3291,16 +3450,101 @@ class SellerDesk:
             pass
         return True
 
+    async def _hold_partial_close(
+        self, pos: OpenPosition, failed_leg: OptionLeg, exc: BaseException, *, reason: str
+    ) -> None:
+        """A close failed after some legs were already sent: stop ALL automatic exits of this
+        position (HOLD, persisted, survives a restart) and raise one CRITICAL operator alert. Only
+        the operator close may finish it, and it sends only the legs not yet sent."""
+        if not pos.hold:
+            pos.hold_reason = "partial_close"
+            self.positions.pop(pos.position_id, None)
+            self.held_positions[pos.position_id] = pos
+        pos.meta["hold_reason"] = "partial_close"
+        if self._repo is not None:
+            try:
+                await self._repo.set_legs_meta(pos.position_id, {"hold_reason": "partial_close"})
+            except Exception as perr:  # noqa: BLE001 -- in-memory hold still stops retries
+                _LOG.error(
+                    "seller_desk_partial_close_hold_persist_failed id=%s err=%s",
+                    pos.position_id,
+                    perr,
+                )
+        sent = sorted((pos.meta.get("close_sent") or {}).keys())
+        remaining = [
+            lg.tradingsymbol
+            for lg in pos.income_legs + pos.protection_legs
+            if lg.tradingsymbol not in sent
+        ]
+        _LOG.critical(
+            "seller_desk_partial_close_on_hold id=%s mode=%s broker=%s close_reason=%s "
+            "failed_leg=%s err=%r sent=%s still_open=%s -- ON HOLD, no automatic retries; "
+            "verify at the broker, then close the rest via operator_actions.close_position_ids",
+            pos.position_id,
+            "paper" if self._pos_is_paper(pos) else "live",
+            pos.exec_broker,
+            reason,
+            failed_leg.tradingsymbol,
+            exc,
+            sent,
+            remaining,
+        )
+        try:
+            from src.infrastructure import operator_alerts  # noqa: PLC0415
+
+            operator_alerts.raise_alert(
+                f"Options position {pos.position_id} PARTLY CLOSED ({reason}): close of "
+                f"{failed_leg.tradingsymbol} failed ({exc!r}). Sent: {sent}; still open: "
+                f"{remaining}. ON HOLD -- no automatic retries. Verify at the broker "
+                f"({pos.exec_broker or 'paper'}), then close the rest via "
+                f"operator_actions.close_position_ids.",
+                source=f"options_partial_close:{pos.position_id}",
+                tier="CRITICAL",
+                dedupe_seconds=4 * 3600,
+            )
+        except Exception as aerr:  # noqa: BLE001 -- the CRITICAL log already fired
+            _LOG.error("seller_desk_partial_close_alert_failed err=%s", aerr)
+
     async def _close_position(self, position_id: str, *, reason: str) -> None:
         pos = self.positions.get(position_id)
+        if pos is None and reason == "OPERATOR_CLOSE":
+            pos = self.held_positions.get(position_id)  # the ONLY exit of a held position
         if pos is None:
             return
+        close_exec = self._executor_for_position(pos, allow_held=reason == "OPERATOR_CLOSE")
+        if close_exec is None:
+            return  # logged CRITICAL; kept open so the next sweep tries again
         realized_pnl = 0.0
         pnl_complete = True
         exit_prices: dict[str, float] = {}
-        close_exec = self._executor_for(self._pos_is_paper(pos)) or self._executor
-        for leg in pos.protection_legs + pos.income_legs:
-            exit_price = await close_exec.close_leg(leg, position_id)
+        # Legs whose close order the broker already accepted (this attempt or an earlier one that
+        # failed part-way / a process that died mid-close). Never sent again: a second market
+        # close of a leg that is already flat OPENS a new position (a naked short on a long wing).
+        sent: dict[str, float | None] = dict(pos.meta.get("close_sent") or {})
+        # SHORT (income) legs first: a short is always closed while its long wing is still held,
+        # so a failure part-way can leave a surplus long, never a naked short.
+        for leg in pos.income_legs + pos.protection_legs:
+            if leg.tradingsymbol in sent:
+                exit_price = sent[leg.tradingsymbol]
+            else:
+                try:
+                    exit_price = await close_exec.close_leg(leg, position_id)
+                except Exception as exc:
+                    if sent:
+                        await self._hold_partial_close(pos, leg, exc, reason=reason)
+                    raise
+                sent[leg.tradingsymbol] = exit_price
+                pos.meta["close_sent"] = dict(sent)
+                if self._repo is not None:
+                    try:  # recorded BEFORE the next leg is sent, so a restart never re-sends it
+                        await self._repo.set_legs_meta(position_id, {"close_sent": dict(sent)})
+                    except Exception as exc:  # noqa: BLE001 -- order already placed; memory holds it
+                        _LOG.error(
+                            "seller_desk_close_progress_persist_failed id=%s leg=%s err=%s",
+                            position_id,
+                            leg.tradingsymbol,
+                            exc,
+                        )
             if exit_price is None:
                 pnl_complete = False
                 continue
@@ -3341,7 +3585,12 @@ class SellerDesk:
             # Entry + exit order per leg, legs stopped out earlier included. realized_pnl stays gross.
             from src.risk.real_pnl import active_broker, options_trade_charges
 
-            _broker = active_broker(for_paper=self._pos_is_paper(pos))
+            # The position's own live broker's rate card (as before when it is the legacy one).
+            _broker = (
+                pos.exec_broker
+                if pos.exec_broker and not self._pos_is_paper(pos)
+                else active_broker(for_paper=self._pos_is_paper(pos))
+            )
             charge_legs = [
                 (
                     str(c["direction"]),
@@ -3356,9 +3605,9 @@ class SellerDesk:
                 if lg.tradingsymbol in exit_prices
             ]
             charges = options_trade_charges(charge_legs, _broker).as_dict()
-        del self.positions[position_id]
-        if pnl_complete:
-            self._add_realized(realized_pnl, pos.strategy_type)
+        (self.held_positions if pos.hold else self.positions).pop(position_id, None)
+        if pnl_complete and not pos.hold:  # a held row never feeds the desk's aggregates
+            self._add_realized(realized_pnl, pos.strategy_type, self._pos_equity_key(pos))
         if self._repo is not None:
             try:
                 await self._repo.close_position(

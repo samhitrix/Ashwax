@@ -730,3 +730,50 @@ class TestOHLCVRepositoryFetchDataframe:
         repo = self._repo([])
         df = await repo.fetch_dataframe("CGCL", "1d", limit=10)
         assert df.empty
+
+
+# ── OptionsRepository.insert_position (exec_broker, migration 089) ──────────
+
+
+class TestOptionsInsertPositionExecBroker:
+    async def _insert(self, **kw: object):  # type: ignore[no-untyped-def]
+        from src.db.repositories.options import OptionsRepository
+
+        pool = _pool()
+        await OptionsRepository(pool).insert_position(
+            "POS-1",
+            underlying="NSE:NIFTY",
+            strategy_type="short_strangle",
+            protection_legs=[],
+            income_legs=[],
+            expiry=date(2026, 10, 20),
+            dte_at_entry=5,
+            lot_size_at_entry=65,
+            net_credit=1.0,
+            max_loss=2.0,
+            max_profit=1.0,
+            entry_margin=3.0,
+            entry_greeks=None,
+            opened_at=datetime(2026, 10, 15, tzinfo=UTC),
+            **kw,
+        )
+        conn = pool.acquire.return_value.__aenter__.return_value
+        sql, *params = conn.execute.await_args.args
+        return sql, params
+
+    async def test_exec_broker_is_written_as_the_last_param(self) -> None:
+        import re
+
+        sql, params = await self._insert(exec_broker="angel_one")
+        assert "exec_broker" in sql
+        assert params[-1] == "angel_one"
+        # every placeholder is bound, none skipped: $1..$N matches the param count
+        assert max(int(n) for n in re.findall(r"\$(\d+)", sql)) == len(params)
+        # column list and VALUES tuple have the same arity (the literal 'OPEN' is one value)
+        cols = sql.split("INSERT INTO options_positions (")[1].split(") VALUES")[0]
+        vals = sql.split("VALUES (")[1].split(")\n                ON CONFLICT")[0]
+        assert len(cols.split(",")) == len(vals.split(","))
+
+    async def test_exec_broker_defaults_to_none(self) -> None:
+        _, params = await self._insert()
+        assert params[-1] is None

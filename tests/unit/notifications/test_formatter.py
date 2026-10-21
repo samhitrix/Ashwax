@@ -535,6 +535,19 @@ def test_format_strategy_error_shows_strategy_slot_and_reason() -> None:
     assert "not a genuine 0-idea decision" in text.lower()
 
 
+def test_format_strategy_error_custom_title_replaces_the_llm_wording() -> None:
+    from src.notifications.formatter import format_strategy_error
+
+    ev = NotificationEvent(
+        EventKind.STRATEGY_ERROR,
+        True,
+        payload={"strategy": "options_intraday_short_premium", "reason": "x", "title": "NO ENTRY"},
+    )
+    text = format_strategy_error(ev)
+    assert "NO ENTRY" in text and "options_intraday_short_premium" in text
+    assert "LLM ORIGINATION" not in text and "0-idea" not in text
+
+
 def test_format_strategy_error_tolerates_missing_fields() -> None:
     from src.notifications.formatter import format_strategy_error
 
@@ -666,3 +679,43 @@ def test_single_leg_exit_has_no_redundant_breakdown() -> None:
         payload={"net_pnl": 5.0, "leg_pnls": [{"leg": "CE 1", "pnl": 5.0}]},
     )
     assert "Legs:" not in format_exit(ev)
+
+
+def _live_row(symbol: str, broker: str | None) -> dict[str, object]:
+    row: dict[str, object] = {
+        "is_paper": False,
+        "segment": "SWING",
+        "symbol": symbol,
+        "quantity": 5,
+        "fill_price": 100.0,
+        "ltp": 101.0,
+        "current_sl": 90.0,
+        "current_target": 120.0,
+        "unrealized_pnl": 5.0,
+    }
+    if broker is not None:
+        row["broker"] = broker
+    return row
+
+
+def _position_update(rows: list[dict[str, object]]) -> str:
+    from src.notifications.formatter import format_position_update
+
+    return format_position_update(
+        NotificationEvent(EventKind.POSITION_UPDATE, True, payload={"rows": rows})
+    )
+
+
+def test_position_update_labels_each_broker_when_live_spans_several() -> None:
+    text = _position_update([_live_row("AAA", "kite"), _live_row("BBB", "angel_one")])
+    assert "kite" in text and "angel_one" in text
+    # Brokers are listed alphabetically, each header directly above its own rows.
+    assert text.index("angel_one") < text.index("BBB") < text.index("kite") < text.index("AAA")
+
+
+def test_position_update_single_live_broker_output_is_unchanged() -> None:
+    """One live broker (or rows with no broker key) must render byte-identically to before."""
+    plain = _position_update([_live_row("AAA", None), _live_row("BBB", None)])
+    one_broker = _position_update([_live_row("AAA", "kite"), _live_row("BBB", "kite")])
+    assert one_broker == plain
+    assert "kite" not in one_broker

@@ -283,6 +283,18 @@ class KiteAdapter(BrokerInterface):
         raw: dict[str, Any] = await asyncio.wait_for(self._io(self._kite.ltp, query), timeout=10.0)
         return {orig_by_query.get(k, k): float(v["last_price"]) for k, v in raw.items()}
 
+    async def get_quote(self, symbols: list[str]) -> dict[str, Any]:
+        """Kite quote() rows (last_price, ohlc with the previous session's close, ...) keyed
+        exactly as passed; bare symbols are queried on NSE like get_ltp. Read-only, used by
+        the dashboard for day-change figures via MarketDataRouter.get_quote."""
+        await self._limiter.acquire("quote")
+        query = [s if ":" in s else f"NSE:{s}" for s in symbols]
+        orig_by_query = dict(zip(query, symbols, strict=False))
+        raw: dict[str, Any] = await asyncio.wait_for(
+            self._io(self._kite.quote, query), timeout=10.0
+        )
+        return {orig_by_query.get(k, k): v for k, v in raw.items()}
+
     async def load_instrument_tokens(self, exchange: str = "NSE") -> int:
         """Bulk-load {tradingsymbol: instrument_token} for `exchange` from Kite's
         instrument dump, so get_ohlcv() can skip its per-symbol quote() lookup.

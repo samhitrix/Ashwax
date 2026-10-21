@@ -286,7 +286,11 @@ class PaperTradingEngine:
         return float(best["close"]), best["ts"]
 
     async def daily_risk_counters(
-        self, table: str = "paper_trades", *, product: str | None = None
+        self,
+        table: str = "paper_trades",
+        *,
+        product: str | None = None,
+        exec_broker: str | None = None,
     ) -> dict[str, Any]:
         """Day-scoped CRM counters reconstructed from today's trades (IST).
 
@@ -307,12 +311,22 @@ class PaperTradingEngine:
         kept separate from swing's P&L since swing has NO daily loss limit by design
         and must never be affected by how intraday's day is going (2026-10-07). None
         (default) keeps the existing combined behaviour for callers not yet split.
+
+        `exec_broker` (live `trades` only; per-broker risk, system.per_broker_equity) scopes
+        every query to the rows that broker holds; a NULL stamp means "kite" (Phase 2 rule).
+        None (default) = every live broker combined, exactly as before.
         """
         if table not in ("paper_trades", "trades"):
             raise ValueError(f"daily_risk_counters: unsupported table {table!r}")
         if product is not None and product not in ("MIS", "CNC"):
             raise ValueError(f"daily_risk_counters: unsupported product {product!r}")
+        if exec_broker is not None and table != "trades":
+            raise ValueError("daily_risk_counters: exec_broker applies to live trades only")
         _p = f" AND product = '{product}'" if product else ""
+        _args: tuple[Any, ...] = ()
+        if exec_broker is not None:
+            _p += " AND COALESCE(exec_broker, 'kite') = $1"
+            _args = (exec_broker,)
         counters: dict[str, Any] = {
             "new_trades_today": 0,
             "open_position_count": 0,
@@ -329,20 +343,23 @@ class PaperTradingEngine:
                 f"  COALESCE(sum(pnl_realized) FILTER (WHERE order_state='CLOSED'), 0) AS net_pnl "
                 f"FROM {table} "
                 f"WHERE (entry_timestamp AT TIME ZONE 'Asia/Kolkata')::date "
-                f"= (NOW() AT TIME ZONE 'Asia/Kolkata')::date{_p}"
+                f"= (NOW() AT TIME ZONE 'Asia/Kolkata')::date{_p}",
+                *_args,
             )
             closed = await conn.fetch(
                 f"SELECT pnl_realized FROM {table} "  # noqa: S608
                 f"WHERE order_state='CLOSED' AND exit_timestamp IS NOT NULL "
                 f"AND (entry_timestamp AT TIME ZONE 'Asia/Kolkata')::date "
                 f"= (NOW() AT TIME ZONE 'Asia/Kolkata')::date{_p} "
-                f"ORDER BY exit_timestamp DESC"
+                f"ORDER BY exit_timestamp DESC",
+                *_args,
             )
             per_strat_rows = await conn.fetch(
                 f"SELECT strategy_name, count(*) AS n FROM {table} "  # noqa: S608
                 f"WHERE (entry_timestamp AT TIME ZONE 'Asia/Kolkata')::date "
                 f"= (NOW() AT TIME ZONE 'Asia/Kolkata')::date{_p} "
-                f"GROUP BY strategy_name"
+                f"GROUP BY strategy_name",
+                *_args,
             )
             # Open positions (any entry date, NOT just today) — a swing position can sit
             # open for days, so both the G7 open-position cap and the daily-loss breaker
@@ -353,7 +370,8 @@ class PaperTradingEngine:
                 f"SELECT symbol, direction, quantity, fill_price, strategy_name "  # noqa: S608
                 f"FROM {table} "
                 f"WHERE order_state NOT IN ('CLOSED','REJECTED','CANCELLED','TIMED_OUT') "
-                f"AND fill_price IS NOT NULL{_p}"
+                f"AND fill_price IS NOT NULL{_p}",
+                *_args,
             )
         counters["new_trades_today"] = int(row["placed"] or 0)
         counters["open_position_count"] = len(open_rows)

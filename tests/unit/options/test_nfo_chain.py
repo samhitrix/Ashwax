@@ -349,3 +349,85 @@ def test_index_spot_symbol_case_insensitive() -> None:
     from src.options.nfo_chain import index_spot_symbol
 
     assert index_spot_symbol("banknifty") == "NIFTY BANK"
+
+
+# ── BSE-derivatives (BFO) underlyings: SENSEX ───────────────────────────────
+
+
+class _BfoBroker:
+    """Records which exchange/spot symbols the provider asks for; serves a SENSEX chain on BFO only."""
+
+    def __init__(self) -> None:
+        self.instrument_exchanges: list[str] = []
+        self.ltp_symbols: list[str] = []
+        self.quote_symbols: list[str] = []
+
+    async def get_instruments(self, exchange: str) -> list[Instrument]:
+        self.instrument_exchanges.append(exchange)
+        if exchange != "BFO":
+            return []
+        out: list[Instrument] = []
+        for strike in (74500.0, 74600.0, 74700.0, 74800.0, 74900.0):
+            for kind in ("CE", "PE"):
+                for name in ("SENSEX", "SENSEX50"):  # the decoy shares the SENSEX prefix
+                    out.append(
+                        Instrument(
+                            symbol=f"{name}26O22{int(strike)}{kind}",
+                            exchange="BFO",
+                            instrument_token=f"{name}{int(strike)}{kind}",
+                            instrument_type=kind,
+                            lot_size=20 if name == "SENSEX" else 60,
+                            tick_size=0.05,
+                            expiry=_EXPIRY,
+                            strike=strike,
+                            name=name,
+                        )
+                    )
+        return out
+
+    async def get_ltp(self, symbols: list[str]) -> dict[str, float]:
+        self.ltp_symbols += symbols
+        return {symbols[0]: 74705.99}
+
+    async def get_option_quotes(self, symbols: list[str]) -> dict[str, OptionQuote]:
+        self.quote_symbols += symbols
+        return {
+            s: OptionQuote(symbol=s, ltp=100.0, bid=99.0, ask=101.0, oi=2000, volume=1000)
+            for s in symbols
+        }
+
+
+@pytest.mark.asyncio
+async def test_sensex_chain_uses_bfo_dump_bse_spot_and_bfo_symbols() -> None:
+    broker = _BfoBroker()
+    chain = await NFOChainProvider(broker, risk_free_rate=_R).get_chain(
+        "BSE:SENSEX", min_days_to_expiry=0, now=_NOW
+    )
+    assert chain is not None
+    assert broker.instrument_exchanges == ["BFO"]
+    assert broker.ltp_symbols == ["BSE:SENSEX"]
+    assert chain.underlying == "SENSEX"
+    assert chain.lot_size == 20  # SENSEX50's lot (60) must not leak in
+    assert broker.quote_symbols and all(s.startswith("BFO:SENSEX2") for s in broker.quote_symbols)
+    assert not any("SENSEX50" in s for s in broker.quote_symbols)
+    atm = min(chain.strikes, key=lambda r: abs(r.strike - 74705.99))
+    assert atm.strike == 74700.0
+    assert atm.call_symbol.startswith("BFO:") and atm.put_symbol.startswith("BFO:")
+
+
+@pytest.mark.asyncio
+async def test_nifty_chain_still_reads_the_nfo_dump_and_nse_spot() -> None:
+    broker = _BfoBroker()
+    await NFOChainProvider(broker, risk_free_rate=_R).get_chain(
+        "NSE:NIFTY", min_days_to_expiry=0, now=_NOW
+    )
+    assert broker.instrument_exchanges == ["NFO"]
+
+
+def test_index_spot_quote_symbol_is_exchange_qualified() -> None:
+    from src.options.nfo_chain import index_spot_quote_symbol
+
+    assert index_spot_quote_symbol("SENSEX") == "BSE:SENSEX"
+    assert index_spot_quote_symbol("NIFTY") == "NSE:NIFTY 50"
+    assert index_spot_quote_symbol("BANKNIFTY") == "NSE:NIFTY BANK"
+    assert index_spot_quote_symbol("RELIANCE") == "NSE:RELIANCE"

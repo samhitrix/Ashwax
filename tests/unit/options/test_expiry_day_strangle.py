@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 import pytest
 from src.options import seller_settings as ss
 from src.options import short_premium as st
-from src.options.seller_desk import EXPIRY_DAY_TYPE, SHORT_PREMIUM_TYPE, OpenPosition
+from src.options.seller_desk import EXPIRY_DAY_TYPE, OpenPosition
+from src.options.short_premium import SHORT_PREMIUM_TYPE
 
 from tests.unit.options.test_expiry_day import _chain
 from tests.unit.options.test_options_intraday_short_premium import _PxExecutor, _SRepo

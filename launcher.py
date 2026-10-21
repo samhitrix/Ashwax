@@ -13,6 +13,7 @@ Press Ctrl+C to stop both.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import logging
 import os
@@ -24,6 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from src.infrastructure.logger import _AshwaxAdapter, get_logger, setup_logging
 
@@ -198,6 +200,136 @@ def _kite_login_and_report(log: _AshwaxAdapter) -> bool:
         return False
 
     return True
+
+
+BOOT_LOGIN_TIMEOUT_SECONDS = 90
+
+
+def _in_thread(fn: Any, *args: Any) -> Any:
+    """Run fn on a worker thread and wait: the Angel/Flattrade helpers call asyncio.run(),
+    which must never run on a thread that already has an event loop.
+
+    Waits at most BOOT_LOGIN_TIMEOUT_SECONDS so a stuck SDK can never hold the boot; the
+    abandoned thread is not waited for (shutdown(wait=False))."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(fn, *args).result(timeout=BOOT_LOGIN_TIMEOUT_SECONDS)
+    finally:
+        pool.shutdown(wait=False)
+
+
+def _angel_one_login_and_report(log: _AshwaxAdapter) -> bool:
+    """Refresh/renew the Angel One session (refresh token first, TOTP login as fallback).
+
+    Returns True on a valid session. Never raises."""
+    log.info("angel_one_login_start")
+    try:
+        from src.brokers import angel_one_auth
+
+        _in_thread(angel_one_auth.auto_refresh, ROOT / ".env")
+    except Exception as exc:  # noqa: BLE001 — one broker's failure must not stop boot
+        log.error("angel_one_login_failed", extra={"ctx": {"error": str(exc)[:300]}})
+        return False
+    log.success("angel_one_login_ok")
+    return True
+
+
+def _flattrade_check_and_report(log: _AshwaxAdapter) -> bool:
+    """Validate the stored Flattrade token. It NEVER logs in: Flattrade's daily login is
+    manual-assisted (python -m src.brokers.flattrade_auth). An expired token is a WARNING
+    telling the operator what to run; the orchestrator's _flattrade_token_refresh_loop raises
+    the operator alert (this process has no alert surface). Never raises."""
+    log.info("flattrade_token_check_start")
+    try:
+        from src.brokers import flattrade_auth
+        from src.brokers.adapters.flattrade.client import FlattradeError
+
+        _in_thread(flattrade_auth.auto_refresh, ROOT / ".env")
+    except Exception as exc:  # noqa: BLE001 — one broker's failure must not stop boot
+        expired = isinstance(exc, RuntimeError) and not isinstance(exc, FlattradeError)
+        if expired:
+            log.warning(
+                "flattrade_token_expired",
+                extra={
+                    "ctx": {
+                        "action": "run: python -m src.brokers.flattrade_auth",
+                        "detail": str(exc)[:200],
+                    }
+                },
+            )
+        else:
+            log.error("flattrade_token_check_failed", extra={"ctx": {"error": str(exc)[:300]}})
+        return False
+    log.success("flattrade_token_ok")
+    return True
+
+
+# Looked up by name at call time so each login can be replaced on its own (tests).
+_BOOT_LOGINS: dict[str, str] = {
+    "kite": "_kite_login_and_report",
+    "angel_one": "_angel_one_login_and_report",
+    "flattrade": "_flattrade_check_and_report",
+}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    import json
+
+    try:
+        return dict(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001 — a missing/broken file just means "nothing configured"
+        return {}
+
+
+def _boot_broker_logins(log: _AshwaxAdapter) -> dict[str, bool]:
+    """Log in every broker this run can use (credentials present AND a market-data provider,
+    the legacy broker.name, or a live strategy's broker); see src/brokers/boot_login.py.
+
+    A broker with no credentials is skipped with an INFO line. Each login is isolated: one
+    broker failing never affects another, and nothing here can block startup.
+    Returns {broker: logged_in} for the brokers that were attempted."""
+    from dotenv import load_dotenv
+    from src.brokers.boot_login import select_boot_logins
+
+    # The children inherit this environment; Kite's auto_refresh used to be the thing that
+    # loaded .env here, and it no longer always runs.
+    load_dotenv(ROOT / ".env", override=True)
+    registry = _read_json(ROOT / "config" / "strategies_registry.json").get("strategies", [])
+    to_login, skipped, problem = select_boot_logins(
+        _read_json(ROOT / "config" / "global.json"),
+        [e for e in registry if isinstance(e, dict)],
+        os.environ,
+    )
+    if problem:
+        log.warning("boot_login_config_invalid", extra={"ctx": {"error": problem[:300]}})
+    for name, reason in skipped.items():
+        log.info("broker_login_skipped", extra={"ctx": {"broker": name, "reason": reason}})
+    results: dict[str, bool] = {}
+    for name in to_login:
+        try:
+            results[name] = bool(globals()[_BOOT_LOGINS[name]](log))
+        except Exception as exc:  # noqa: BLE001 — defensive: the helpers never raise
+            log.error("broker_login_failed", extra={"ctx": {"broker": name, "error": str(exc)}})
+            results[name] = False
+    return results
+
+
+def _safe_boot_broker_logins(log: _AshwaxAdapter) -> dict[str, bool]:
+    """_boot_broker_logins that can never stop the launcher: boot logins are best-effort, and
+    a bad config or a broken import here must not keep the API/dashboard/orchestrator down."""
+    try:
+        return _boot_broker_logins(log)
+    except Exception as exc:  # noqa: BLE001 — services must start whatever happens here
+        log.error(
+            "boot_login_failed",
+            extra={
+                "ctx": {
+                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                    "action": "starting services anyway",
+                }
+            },
+        )
+        return {}
 
 
 def _kill_stale_processes(log: logging.LoggerAdapter[logging.Logger]) -> None:
@@ -447,8 +579,8 @@ def main() -> None:
     _free_port(API_PORT, log)
     _free_port(DASHBOARD_PORT, log)
 
-    # Auto-login to Kite and report real funds before bringing services up
-    if not _kite_login_and_report(log):
+    # Log in each usable broker (Kite reports real funds) before bringing services up
+    if _safe_boot_broker_logins(log).get("kite") is False:
         log.warning("kite_login_unavailable", extra={"ctx": {"action": "starting services anyway"}})
 
     try:

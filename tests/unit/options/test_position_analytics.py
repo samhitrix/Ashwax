@@ -105,10 +105,10 @@ def test_pop_calibrated_for_bull_put_spread():
 
 
 def test_pop_uses_crude_proxy_for_uncalibrated_strategy_type():
-    # weekly_condor_simple has no backtested calibration -> calibrated_pop falls
+    # iron_butterfly has no backtested calibration -> calibrated_pop falls
     # back to its own crude 1-|delta| proxy, still a real (if less precise) number.
     legs = [_leg("S", "PE", 22150, "SELL", 32.33, delta=-0.15)]
-    pop = compute_pop("weekly_condor_simple", legs)
+    pop = compute_pop("iron_butterfly", legs)
     assert pop == pytest.approx(1.0 - 0.15)
 
 
@@ -130,9 +130,6 @@ def _patch_settings(monkeypatch, **blocks):
 
     monkeypatch.setattr(
         seller_settings, "profit_and_stop", lambda settings=None: blocks.get("pas", {})
-    )
-    monkeypatch.setattr(
-        seller_settings, "weekly_condor", lambda settings=None: blocks.get("wc", {})
     )
     monkeypatch.setattr(seller_settings, "expiry_day", lambda settings=None: blocks.get("ed", {}))
 

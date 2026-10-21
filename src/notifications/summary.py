@@ -15,6 +15,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from src.brokers.stack_keys import PAPER_KEY, primary_live_key, stack_broker, stack_is_paper
 from src.market import sessions
 from src.market.calendar import holiday_name, is_holiday, is_trading_day
 from src.notifications.config import load_notification_config
@@ -45,7 +46,7 @@ async def build_position_snapshot(stacks: dict[str, dict[str, Any]]) -> list[dic
     per-stack (one get_ltp call per broker, not per symbol)."""
     rows: list[dict[str, Any]] = []
     for stack_key, stack in stacks.items():
-        is_paper = stack_key == "paper"
+        is_paper = stack_is_paper(stack_key)
         order_monitor = stack.get("order_monitor")
         broker = stack.get("broker")
         if order_monitor is None:
@@ -67,6 +68,9 @@ async def build_position_snapshot(stacks: dict[str, dict[str, Any]]) -> list[dic
             rows.append(
                 {
                     "is_paper": is_paper,
+                    # Which broker holds it (None for paper / the legacy bare "live" key);
+                    # the formatter only shows it once live spans two or more brokers.
+                    "broker": stack_broker(stack_key),
                     "segment": segment_for_product(pos.product).value,
                     "symbol": pos.symbol,
                     "quantity": pos.quantity,
@@ -135,7 +139,13 @@ async def collect_open_rows(shared: dict[str, Any]) -> list[dict[str, Any]]:
     _desk = (shared.get("seller_options") or {}).get("desk")
     if _desk is not None:
         _opt_is_paper = bool(getattr(_desk, "_is_paper", True))
-        _picked_stack = stacks.get("paper" if _opt_is_paper else "live")
+        # Options desk is single-broker: paper, else the primary live stack.
+        _opt_key = (
+            PAPER_KEY
+            if _opt_is_paper
+            else primary_live_key(stacks, shared.get("legacy_live_broker"))
+        )
+        _picked_stack = stacks.get(_opt_key) if _opt_key else None
         _opt_stack: dict[str, Any] = (
             _picked_stack if _picked_stack is not None else next(iter(stacks.values()), {})
         )

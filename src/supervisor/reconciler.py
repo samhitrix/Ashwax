@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from src.market.calendar import is_trading_day
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from src.brokers.base import BrokerInterface
 
 _IST = ZoneInfo("Asia/Kolkata")
@@ -102,9 +104,22 @@ def _cnc_unsettled(ts: Any) -> bool:
 class Reconciler:
     """Compares broker positions with open trades in DB."""
 
-    def __init__(self, broker: BrokerInterface, pool: Any = None) -> None:
+    def __init__(
+        self,
+        broker: BrokerInterface,
+        pool: Any = None,
+        broker_name: str | None = None,
+        known_brokers: Sequence[str] | None = None,
+    ) -> None:
+        """`broker_name` (multi-broker phase 2): reconcile only the live `trades` rows this
+        broker holds (exec_broker; NULL means "kite") and key the orphan tracker by it. None =
+        every live row, the legacy single-broker behaviour. `known_brokers` (the kite
+        reconciler only) also gives it rows whose exec_broker names no registered broker --
+        the same ownership rule as the order-monitor reseed."""
         self._broker = broker
         self._pool = pool
+        self._broker_name = broker_name
+        self._known_brokers = list(known_brokers) if known_brokers else []
 
     async def reconcile(
         self, db_open_trades: dict[str, list[dict[str, Any]]] | None = None
@@ -273,7 +288,12 @@ class Reconciler:
                 for g in gaps
                 if g.kind == "ORPHANED_BROKER_POSITION"
             ]
-            sync = await ExternalPositionRepository(self._pool).sync(orphans)
+            _repo = ExternalPositionRepository(self._pool)
+            sync = (
+                await _repo.sync(orphans)
+                if self._broker_name is None
+                else await _repo.sync(orphans, exec_broker=self._broker_name)
+            )
         except Exception as exc:
             _LOG.warning("external_positions_sync_failed err=%s -- reporting all gaps", exc)
             return gaps
@@ -308,13 +328,7 @@ class Reconciler:
             return {}
         try:
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT symbol, quantity, fill_price, agent_trade_id, product, entry_timestamp
-                    FROM trades
-                    WHERE order_state = 'FILLED'
-                    """
-                )
+                rows = await self._fetch_open_rows(conn)
                 grouped: dict[str, list[dict[str, Any]]] = {}
                 for r in rows:
                     grouped.setdefault(r["symbol"], []).append(
@@ -330,3 +344,28 @@ class Reconciler:
         except Exception as exc:
             _LOG.error("reconcile_db_fetch err=%s", exc)
             return {}
+
+    async def _fetch_open_rows(self, conn: Any) -> list[Any]:
+        sql = """
+                    SELECT symbol, quantity, fill_price, agent_trade_id, product, entry_timestamp
+                    FROM trades
+                    WHERE order_state = 'FILLED'
+                    """
+        if self._broker_name is None:
+            return list(await conn.fetch(sql))
+        args: list[Any] = [self._broker_name]
+        own = "COALESCE(exec_broker, 'kite') = $1"
+        if self._broker_name == "kite" and self._known_brokers:
+            args.append(self._known_brokers)
+            own = f"({own} OR COALESCE(exec_broker, 'kite') <> ALL($2::text[]))"
+        try:
+            return list(await conn.fetch(f"{sql} AND {own}", *args))
+        except Exception as exc:
+            if "exec_broker" not in str(exc) or "does not exist" not in str(exc):
+                raise
+            # Pre-089 database: every live row predates routing (placed through Kite).
+            _LOG.warning(
+                "reconcile_exec_broker_missing broker=%s -- migration 089 not applied",
+                self._broker_name,
+            )
+            return list(await conn.fetch(sql)) if self._broker_name == "kite" else []

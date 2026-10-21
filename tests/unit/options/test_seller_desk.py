@@ -188,6 +188,14 @@ class _FakeRepo:
         self.breached: list[str] = []
         self.peaks: list[tuple[str, float]] = []
         self.attribution: list[dict] = []
+        self.open_duplicates: list[str] = []
+        self.open_duplicates_error: Exception | None = None
+        self.insert_error: Exception | None = None
+
+    async def open_duplicate_ids(self, *, underlying, strategy_type, expiry, is_paper):  # type: ignore[no-untyped-def]
+        if self.open_duplicates_error is not None:
+            raise self.open_duplicates_error
+        return self.open_duplicates
 
     async def insert_learning_finding(self, position_id, question, finding, confidence):  # type: ignore[no-untyped-def]
         self.findings.append((position_id, question, finding, confidence))
@@ -202,6 +210,8 @@ class _FakeRepo:
         self.attribution.append({"day": day, **kwargs})
 
     async def insert_position(self, position_id, **kwargs):  # type: ignore[no-untyped-def]
+        if self.insert_error is not None:
+            raise self.insert_error
         self.inserted.append({"position_id": position_id, **kwargs})
 
     async def close_position(
@@ -237,9 +247,17 @@ class _FakeRepo:
         return {}
 
     async def delete_duplicate_open_positions(  # type: ignore[no-untyped-def]
-        self, *, is_paper, keep_per_underlying=1, exclude_strategy_types=()
+        self,
+        *,
+        is_paper,
+        keep_per_underlying=1,
+        exclude_strategy_types=(),
+        exclude_position_ids=(),
     ):
-        self.dedupe_kwargs = {"exclude_strategy_types": exclude_strategy_types}
+        self.dedupe_kwargs = {
+            "exclude_strategy_types": exclude_strategy_types,
+            "exclude_position_ids": list(exclude_position_ids),
+        }
         self.deleted.extend(self.duplicate_ids_to_return)
         return self.duplicate_ids_to_return
 
@@ -2331,3 +2349,215 @@ async def test_g9_review_records_answering_provider(monkeypatch: pytest.MonkeyPa
     )
     assert ok is True
     assert sig.meta["llm_provider"] == "anthropic"
+
+
+# ── duplicate-entry defence-in-depth (2026-10-16 incident) ────────────────────
+# Two identical NIFTY bull_put_spreads (same expiry, same 22400/22650 strikes) opened 5 minutes
+# apart because the only guard was a "same-direction" count cap of 2. Each layer below must stop a
+# duplicate ON ITS OWN, so a bug or race in one layer can never let a second structure through.
+
+
+async def _entry_call(desk, chain, *, underlying="NSE:NIFTY", strategy="bull_put_spread"):  # type: ignore[no-untyped-def]
+    protection, income = build_structure(strategy, chain, lots=1)
+    max_loss, max_profit, net_premium, direction = estimate_economics(
+        strategy, protection, income, chain.lot_size, 1
+    )
+    return await desk._execute_and_record(
+        underlying=underlying,
+        strategy_type=strategy,
+        protection_legs=protection,
+        income_legs=income,
+        lots=1,
+        chain=chain,
+        net_premium=net_premium,
+        max_loss=max_loss,
+        max_profit=max_profit,
+        direction=direction,
+        signal_id="SIG-T",
+        regime="LOW_VOL_TRENDING",
+        today=_TODAY,
+        now=datetime.now(_IST),
+        skip_shared_risk=True,
+    )
+
+
+def _open_same_key(desk, chain, position_id="OPT-EXISTING"):  # type: ignore[no-untyped-def]
+    pos = _bull_put_spread_position(position_id)
+    pos.expiry = chain.expiry.date()
+    desk.positions[position_id] = pos
+    return pos
+
+
+async def test_layer1_run_cycle_skips_a_candidate_identical_to_an_open_structure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.options import seller_desk as sdm
+    from src.risk import budget as budget_module
+
+    monkeypatch.setattr(budget_module, "_current_equity", 100_000_000.0)
+    # caps wide open -- only the identity guard may stop the 2nd one (the 2026-10-16 config)
+    monkeypatch.setattr(sdm._seller_settings, "max_same_direction_strategies", lambda *a, **k: 5)
+    monkeypatch.setattr(sdm._seller_settings, "max_strategies_per_index", lambda *a, **k: 5)
+    chain = _rich_chain()
+    executor = _FakeExecutor()
+    desk = SellerDesk(
+        StrategySelector(),
+        _FakeEventCalendar(),
+        executor,
+        _FakeChainFetcher(chain),
+        options_capital=1_000_000.0,
+        risk_per_trade_pct=2.0,
+        margin_safety_pct=0.90,
+        greeks_budget=_budget(),
+        min_rom_pct=0.0,
+        enabled_strategy_types={"bear_call_spread"},
+    )
+    calendar = {"NIFTY": [chain.expiry.date() + timedelta(days=i) for i in range(-2, 3)]}
+
+    async def _cycle():  # type: ignore[no-untyped-def]
+        return await desk.run_cycle(
+            "NSE:NIFTY",
+            regime="HIGH_VOL_RANGE_BOUND",
+            ivr=65.0,
+            term_structure="contango",
+            today=_TODAY,
+            now=datetime.now(_IST),
+            expiry_calendar=calendar,
+            available_margin=1_000_000.0,
+            crm=_APPROVE_ALL_CRM,
+            crm_ctx=_DUMMY_CTX,
+        )
+
+    first = await _cycle()
+    assert first is not None and len(executor.executed) == 1
+    with caplog.at_level("INFO", logger="options.seller_desk"):
+        second = await _cycle()
+    assert second is None
+    assert len(executor.executed) == 1  # nothing placed the second time
+    assert any("duplicate_open_structure" in r.message for r in caplog.records)
+
+
+async def test_layer2_execute_refuses_when_same_structure_open_in_memory() -> None:
+    chain = _rich_chain()
+    desk, executor = _desk(chain)
+    _open_same_key(desk, chain)
+    assert await _entry_call(desk, chain) is None
+    assert executor.executed == []
+
+
+async def test_layer2_concurrent_identical_entries_place_exactly_one() -> None:
+    import asyncio
+
+    chain = _rich_chain()
+    desk, executor = _desk(chain)
+    results = await asyncio.gather(_entry_call(desk, chain), _entry_call(desk, chain))
+    assert sum(r is not None for r in results) == 1
+    assert len(executor.executed) == 1
+
+
+async def test_layer3_db_truth_blocks_when_memory_has_drifted() -> None:
+    chain = _rich_chain()
+    repo = _FakeRepo()
+    repo.open_duplicates = ["OPT-IN-DB-ONLY"]  # in the DB, not in self.positions
+    desk, executor = _desk(chain, repo=repo)
+    assert await _entry_call(desk, chain) is None
+    assert executor.executed == []
+
+
+async def test_layer3_db_check_failure_fails_closed() -> None:
+    chain = _rich_chain()
+    repo = _FakeRepo()
+    repo.open_duplicates_error = RuntimeError("db down")
+    desk, executor = _desk(chain, repo=repo)
+    assert await _entry_call(desk, chain) is None
+    assert executor.executed == []
+
+
+async def test_duplicate_guard_does_not_block_other_underlying_strategy_or_expiry() -> None:
+    chain = _rich_chain()
+    desk, executor = _desk(chain, repo=_FakeRepo())
+    other = _open_same_key(desk, chain)
+    other.underlying = "NSE:BANKNIFTY"
+    assert await _entry_call(desk, chain) is not None
+    other.underlying = "NSE:NIFTY"
+    other.strategy_type = "bear_call_spread"
+    desk.positions.pop(next(p for p in desk.positions if p != other.position_id), None)
+    other.expiry = other.expiry + timedelta(days=7)
+    assert await _entry_call(desk, chain) is not None  # different expiry + strategy
+
+
+async def test_layer4_unique_index_violation_flattens_the_structure_just_placed() -> None:
+    from asyncpg.exceptions import UniqueViolationError
+
+    chain = _rich_chain()
+    repo = _FakeRepo()
+    repo.insert_error = UniqueViolationError("duplicate key value violates unique constraint")
+
+    class _FillStateExecutor(_FakeExecutor):
+        async def execute_structure(self, protection_legs, income_legs, signal_id):  # type: ignore[no-untyped-def]
+            from src.options.options_leg_executor import ExecutionResult, LegFillState
+
+            await super().execute_structure(protection_legs, income_legs, signal_id)
+            return ExecutionResult(
+                position_id="OPT-1",
+                outcome="ALL_FILLED",
+                protection_legs=[LegFillState(leg, "O", filled=True) for leg in protection_legs],
+                income_legs=[LegFillState(leg, "O", filled=True) for leg in income_legs],
+            )
+
+    desk, executor = _desk(chain, executor=_FillStateExecutor(), repo=repo)
+    assert await _entry_call(desk, chain) is None
+    assert desk.positions == {}  # not tracked as a live position
+    assert len(executor.closed) == 2  # both legs flattened, shorts first
+    assert executor.closed[0][0].direction == "SELL"
+
+
+# ── R1: the desk's own strategy, when LIVE, trades only through a usable route ──
+
+
+async def _live_run_cycle(route):  # type: ignore[no-untyped-def]
+    from src.options.seller_desk import DESK_OWN_STRATEGY_NAME
+
+    chain = _rich_chain()
+    desk, executor = _desk(chain)
+    desk._is_paper = False  # live desk (registry options_seller_desk_v3: "live")
+    calendar = {"NIFTY": [chain.expiry.date() + timedelta(days=i) for i in range(-2, 3)]}
+    ctx = SimpleNamespace(
+        llm_gate_required={},
+        strategy_routes={} if route is None else {DESK_OWN_STRATEGY_NAME: route},
+    )
+    position = await desk.run_cycle(
+        "NSE:NIFTY",
+        regime="HIGH_VOL_RANGE_BOUND",
+        ivr=65.0,
+        term_structure="contango",
+        today=_TODAY,
+        now=datetime.now(_IST),
+        expiry_calendar=calendar,
+        available_margin=1_000_000.0,
+        crm=_APPROVE_ALL_CRM,
+        crm_ctx=ctx,
+    )
+    return position, executor
+
+
+async def test_live_desk_cycle_with_an_unusable_route_places_nothing(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    from src.brokers.routing import BrokerRoute
+
+    with caplog.at_level(logging.WARNING, logger="options.seller_desk"):
+        position, executor = await _live_run_cycle(
+            BrokerRoute(None, "live strategy has no 'broker' field")
+        )
+    assert position is None and executor.executed == []
+    assert "broker_route_rejected strategy=options_seller_desk_v3 segment=options" in caplog.text
+
+
+async def test_live_desk_cycle_with_a_usable_route_matches_the_inherit_path() -> None:
+    from src.brokers.routing import BrokerRoute
+
+    routed, routed_exec = await _live_run_cycle(BrokerRoute("kite", None))
+    legacy, legacy_exec = await _live_run_cycle(None)
+    assert routed is not None and legacy is not None
+    assert len(routed_exec.executed) == len(legacy_exec.executed) == 1

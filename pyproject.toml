@@ -120,4 +120,5 @@ markers = [
   "unit: fast, isolated, no network",
   "integration: requires DB / Redis / broker sandbox",
   "chaos: fault injection",
+  "real_broker_access: API test opts out of tests/unit/api/conftest.py's Kite-backed fake",
 ]

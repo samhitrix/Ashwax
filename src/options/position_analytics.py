@@ -5,8 +5,8 @@ is computed exactly once, the same way, everywhere it's used.
 
 Breakeven and POP are computed only for short-premium (credit) structures --
 verticals, condors, butterflies -- which is everything this desk actually trades
-(bull_put_spread, bear_call_spread, iron_condor, iron_butterfly, weekly_condor_simple,
-options_expiry_day). A structure with no SELL leg (a pure debit buy, not currently
+(bull_put_spread, bear_call_spread, iron_condor, iron_butterfly,
+options_expiry_day, options_intraday_short_premium{,2}). A structure with no SELL leg (a pure debit buy, not currently
 traded by this desk) returns no breakeven/POP rather than guessing with a different,
 unvalidated formula -- see project rule against inventing unvalidated figures.
 """
@@ -96,7 +96,7 @@ def compute_exit_levels(
     """Rupee P&L at which the desk auto-exits (target) and stops out (stop, a positive
     loss magnitude), for the dashboard. Reads the SAME config accessors and applies the SAME
     formulas as the exit code (position_manager.check_profit_target/check_stop_loss,
-    SellerDesk._manage_weekly_condor/_manage_expiry_day, short_premium._check_target and its
+    SellerDesk._manage_expiry_day, short_premium._check_target and its
     per-leg stops), so a config edit shows here exactly when the exit logic picks it up.
 
     ``targetPct`` = target as % of max profit, ``stopPct`` = stop as % of margin; each None when
@@ -105,8 +105,10 @@ def compute_exit_levels(
     from src.options import seller_settings
     from src.options.short_premium import (
         EXPIRY_STRANGLE_TYPE,
+        SHORT_PREMIUM2_TYPE,
         SHORT_PREMIUM_TYPE,
         load_cfg,
+        load_cfg2,
         load_expiry_cfg,
     )
 
@@ -117,8 +119,10 @@ def compute_exit_levels(
     # The expiry-day strategy is a per-leg-stop strangle (short_premium engine) when its config says so,
     # else the legacy butterfly with a credit-multiple stop (branch below).
     is_strangle = strategy_type == EXPIRY_STRANGLE_TYPE and load_expiry_cfg() is not None
-    if strategy_type == SHORT_PREMIUM_TYPE or is_strangle:
-        cfg = load_cfg() if strategy_type == SHORT_PREMIUM_TYPE else load_expiry_cfg()
+    if strategy_type in (SHORT_PREMIUM_TYPE, SHORT_PREMIUM2_TYPE) or is_strangle:
+        cfg = {SHORT_PREMIUM_TYPE: load_cfg, SHORT_PREMIUM2_TYPE: load_cfg2}.get(
+            strategy_type, load_expiry_cfg
+        )()
         if cfg is not None:
             # Same rule as short_premium._check_target: measured on the legs still open (all of them,
             # until one is stopped out -- then the target shrinks to what the remaining legs can earn).
@@ -140,12 +144,8 @@ def compute_exit_levels(
                 for leg in legs
                 if leg.get("direction") == "SELL"
             )
-    elif strategy_type in ("weekly_condor_simple", "options_expiry_day"):
-        block = (
-            seller_settings.weekly_condor()
-            if strategy_type == "weekly_condor_simple"
-            else seller_settings.expiry_day()
-        )
+    elif strategy_type == "options_expiry_day":
+        block = seller_settings.expiry_day()
         target = float(block.get("profit_target_pct", 50)) / 100.0 * credit
         stop = float(block.get("stop_loss_credit_multiple", 2.0)) * credit
     elif credit > 0:
@@ -180,7 +180,7 @@ def compute_pop(strategy_type: str, legs: list[dict[str, Any]]) -> float | None:
     backtested anchors for bull_put_spread/bear_call_spread (the only two
     scripts/backtest_options_seller_regime.py has actually measured), falling
     back to the crude 1-sum(|short_delta|) touch-probability proxy for every
-    other type (iron_condor, iron_butterfly, weekly_condor_simple,
+    other type (iron_condor, iron_butterfly,
     options_expiry_day, ...) -- a standard, honest approximation, just a less
     precise one than the calibrated model. None only when there is no SELL leg
     at all (a pure debit buy -- no short-delta-based formula applies)."""

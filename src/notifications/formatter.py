@@ -116,12 +116,15 @@ def format_strategy_error(ev: NotificationEvent) -> str:
     strategy = escape_html(ev.get("strategy") or "")
     reason = escape_html(ev.get("reason") or "")
     slot = escape_html(ev.get("slot") or "")
-    lines = [f"🛑 <b>LLM ORIGINATION FAILED</b> — {strategy}"]
+    # Non-LLM strategies (e.g. the options short-premium missed-entry report) pass their own title.
+    title = escape_html(ev.get("title") or "")
+    lines = [f"🛑 <b>{title or 'LLM ORIGINATION FAILED'}</b> — {strategy}"]
     if slot:
         lines.append(f"Slot: {slot}")
     if reason:
         lines.append(reason)
-    lines.append("No candidates could be evaluated this pass — not a genuine 0-idea decision.")
+    if not title:
+        lines.append("No candidates could be evaluated this pass — not a genuine 0-idea decision.")
     return _clip("\n".join(lines))
 
 
@@ -363,6 +366,24 @@ def _segment_group_lines(rows: list[dict[str, object]]) -> list[str]:
     return lines
 
 
+def _broker_group_lines(rows: list[dict[str, object]]) -> list[str]:
+    """One mode's rows. With open positions on two or more brokers each broker gets a
+    header (rows with no broker, e.g. the options desk, come first, unlabelled); with at most
+    one broker the output is exactly _segment_group_lines, unchanged."""
+    brokers = sorted({str(r["broker"]) for r in rows if r.get("broker")})
+    if len(brokers) < 2:
+        return _segment_group_lines(rows)
+    lines = (
+        _segment_group_lines([r for r in rows if not r.get("broker")])
+        if any(not r.get("broker") for r in rows)
+        else []
+    )
+    for broker in brokers:
+        lines.append(f"  🏦 <b>{escape_html(broker)}</b>")
+        lines.extend(_segment_group_lines([r for r in rows if r.get("broker") == broker]))
+    return lines
+
+
 def format_position_update(ev: NotificationEvent) -> str:
     rows: list[dict[str, object]] = ev.get("rows", []) or []
     dropped = ev.get("dropped_count")
@@ -400,7 +421,7 @@ def format_position_update(ev: NotificationEvent) -> str:
         open_count = f"{len(group)} open" if group else "no open positions"
         lines.append(f"\n{tag} {mode_dot} {open_count}")
         if group:
-            lines.extend(_segment_group_lines(group))
+            lines.extend(_broker_group_lines(group))
         lines.append(f"  💰 Booked (realized): {_fmt_money(realized)}")
         lines.append(f"  📈 Open (unrealized): {_fmt_money(unrealized)}")
         lines.append(f"  <b>Total today: {_fmt_money(mode_total)}</b>")
