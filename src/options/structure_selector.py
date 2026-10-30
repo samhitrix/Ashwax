@@ -58,6 +58,10 @@ class OptionLeg:
     lot_size: int
     premium: float  # per share
     delta: float = 0.0
+    # Canonical product: "MARGIN" (Kite NRML) | "INTRADAY" (Kite MIS). Persisted with the leg so
+    # every exit uses the entry's product -- an NRML order against an MIS short opens a new
+    # position instead of closing it. Rows saved before this field existed were NRML.
+    product: str = "MARGIN"
 
     @property
     def quantity(self) -> int:

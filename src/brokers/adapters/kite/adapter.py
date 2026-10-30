@@ -161,6 +161,10 @@ def _margin_from_kite(data: dict[str, Any]) -> Margin:
         available_cash=cash,
         used_margin=float(equity.get("utilised", {}).get("debits", 0.0)),
         collateral=float(available.get("collateral", 0.0)),
+        # Kite's `net` is the "available margin" it shows: cash + collateral - utilised. Usable
+        # for F&O (found live 2026-10-29: SENSEX straddle refused "need 258513 have 31024" --
+        # the cash figure -- with 5L+ of collateral available).
+        fno_available=float(equity.get("net", 0.0)),
     )
 
 

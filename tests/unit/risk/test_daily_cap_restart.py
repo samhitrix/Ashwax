@@ -519,3 +519,40 @@ async def test_intraday_breaker_zero_cap_is_a_noop() -> None:
         {}, _intraday_breaker_ctx(10_000.0, cap=0.0), "paper", pe
     )
     assert pe.calls == []
+
+
+# ── Failed refresh fails the CRM closed (2026-10-26 scan) ──────────────────────
+# Each of these failures used to be `except Exception: pass`, leaving the caps on 0
+# after a restart -- the 2026-09-22 cap-breach class.
+
+
+class _BrokenPaperEngine:
+    async def daily_risk_counters(self, **_kw: object) -> dict[str, float]:
+        raise RuntimeError("db down")
+
+
+def test_open_risk_recompute_failure_is_reported() -> None:
+    from src.orchestrator import _update_open_risk_and_sector_exposure
+
+    ctx = SimpleNamespace(open_risk_rupees=0.0, sector_open_exposure_rupees={})
+    bad = SimpleNamespace(symbol="X", quantity=None, fill_price=None, sl_price=None)
+    assert _update_open_risk_and_sector_exposure(ctx, [bad]) != ""
+    assert _update_open_risk_and_sector_exposure(ctx, []) == ""
+
+
+async def test_counter_reseed_failure_flags_then_clears() -> None:
+    ctx = _ctx()
+    await _refresh_daily_counters({"paper_ledger": _BrokenPaperEngine()}, ctx)
+    assert "db down" in ctx.risk_inputs_unverified
+
+    good = _PaperEngine(
+        {
+            "new_trades_today": 1,
+            "open_position_count": 0,
+            "daily_loss_so_far": 0.0,
+            "consecutive_losses": 0,
+        }
+    )
+    await _refresh_daily_counters({"paper_ledger": good}, ctx)
+    assert ctx.risk_inputs_unverified == ""
+    assert ctx.new_trades_today == 1

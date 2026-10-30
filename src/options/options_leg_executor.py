@@ -89,6 +89,15 @@ class OptionsLegExecutor:
         if callable(hint):
             hint(prices)
 
+    async def net_quantities(self) -> dict[str, int]:
+        """The broker's own net position per instrument, keyed "EXCH:SYMBOL", signed (+ long,
+        - short). Read-only; the broker is the truth used to reconcile a partial close."""
+        net: dict[str, int] = {}
+        for p in await self._broker.get_positions():
+            key = f"{p.exchange}:{p.symbol}"
+            net[key] = net.get(key, 0) + (p.quantity if p.direction == "long" else -p.quantity)
+        return net
+
     def lock_for(self, position_id: str) -> asyncio.Lock:
         """Shared per-position lock (options_spec.md §19) — also used by
         margin_monitor and position_manager so exactly one actor handles any
@@ -105,7 +114,7 @@ class OptionsLegExecutor:
             direction=leg.direction,
             quantity=leg.quantity,
             order_type="MARKET",
-            product="MARGIN",
+            product=leg.product,
             validity="DAY",
             agent_trade_id=f"{signal_id}-{leg.instrument_type}-{int(leg.strike)}"[:32],
             signal_id=signal_id,
@@ -197,7 +206,7 @@ class OptionsLegExecutor:
                 direction=exit_dir,
                 quantity=leg.quantity,
                 order_type="MARKET",
-                product="MARGIN",
+                product=leg.product,
                 validity="DAY",
                 agent_trade_id=f"{signal_id}-CLOSE-{int(leg.strike)}"[:32],
                 signal_id=signal_id,

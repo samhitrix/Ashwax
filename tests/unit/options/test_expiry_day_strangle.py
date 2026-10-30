@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from src.market import sessions
 from src.options import seller_settings as ss
 from src.options import short_premium as st
 from src.options.seller_desk import EXPIRY_DAY_TYPE, OpenPosition
@@ -132,7 +133,9 @@ def test_the_real_config_file_loads_as_the_frozen_strangle() -> None:
     assert raw["structure"] == "strangle"
     assert (cfg.ce_offset, cfg.pe_offset, cfg.sl_pct_ce, cfg.sl_pct_pe) == (100, -100, 60, 50)
     assert (cfg.wing_points, cfg.lots) == (0, 1)
-    assert (cfg.entry_time.strftime("%H:%M"), cfg.exit_time.strftime("%H:%M")) == ("10:00", "15:10")
+    assert cfg.entry_time.strftime("%H:%M") == "10:00"
+    # exit_time is the operator's own setting (2026-10-27): only its validity is pinned.
+    assert cfg.entry_time < cfg.exit_time < sessions.regular_close("nse_fo")
 
 
 def test_strategy_type_constants_agree() -> None:
@@ -414,3 +417,33 @@ def test_dashboard_exit_levels_fall_back_to_the_butterfly_when_that_is_the_struc
     assert out["targetAmount"] == pytest.approx(2000.0) and out["stopAmount"] == pytest.approx(
         8000.0
     )
+
+
+# ---------------------------------------------------------------- operator-defined exit time
+
+
+def test_exit_time_is_whatever_the_operator_sets_until_the_fo_close(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # 2026-10-27: no hard 15:10 cap -- the only bound is that the F&O market is still open.
+    for t in ("15:15", "15:25"):
+        monkeypatch.setattr(ss, "expiry_day", lambda settings=None, t=t: {**_CFG, "exit_time": t})
+        cfg = st.load_expiry_cfg()
+        assert cfg is not None and cfg.exit_time.strftime("%H:%M") == t
+    close = sessions.regular_close("nse_fo").strftime("%H:%M")
+    monkeypatch.setattr(ss, "expiry_day", lambda settings=None: {**_CFG, "exit_time": close})
+    assert st.load_expiry_cfg() is None  # at/after the close it could never be filled
+
+
+async def test_a_15_20_exit_is_honoured_and_the_guardian_waits_for_it(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(ss, "expiry_day", lambda settings=None: {**_CFG, "exit_time": "15:20"})
+    desk, _ = _new_desk()
+    pos = await _open(desk)
+    assert pos.meta["exit_time"] == "15:20"
+    # the guardian's 15:15 stage must not pre-empt the operator's own exit
+    await desk.sweep_expiry_guardian(_EXP, datetime(2026, 10, 13, 15, 16, tzinfo=_IST))
+    assert pos.position_id in desk.positions
+    flat = _prices(pos, ce=1.0, pe=1.0)
+    await _manage(desk, flat, datetime(2026, 10, 13, 15, 19, 59, tzinfo=_IST))
+    assert pos.position_id in desk.positions
+    await _manage(desk, flat, datetime(2026, 10, 13, 15, 20, tzinfo=_IST))
+    assert pos.position_id not in desk.positions
+    assert desk._repo.closed[0]["exit_reason"].startswith("SHORT_PREMIUM_TIME_EXIT")

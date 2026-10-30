@@ -311,6 +311,25 @@ def test_g2_passes_below_limit() -> None:
     assert crm.evaluate(_sig(), _ctx(consecutive_losses=2)).approved is True
 
 
+def test_g2_blocks_when_risk_inputs_unverified() -> None:
+    # A failed counter/open-risk refresh must not let the caps judge 0 / stale figures.
+    decision = crm.evaluate(_sig(), _ctx(risk_inputs_unverified="daily_counters: db down"))
+    assert decision.approved is False
+    assert decision.blocking_gate == "G2"
+    assert "db down" in decision.blocking_reason
+
+
+def test_g2_risk_inputs_unverified_never_blocks_options() -> None:
+    # The unverified inputs are equity-only; the daily expiry/premium trades must still go.
+    ctx = _ctx(risk_inputs_unverified="daily_counters: db down")
+    decision = crm.evaluate(_sig(asset_class="options"), ctx)
+    assert decision.blocking_gate != "G2"
+
+
+def test_g2_passes_when_risk_inputs_verified() -> None:
+    assert crm.evaluate(_sig(), _ctx(risk_inputs_unverified="")).approved is True
+
+
 def test_g2_consecutive_losses_independent_per_mode() -> None:
     ctx = _ctx(mode_consecutive_losses={"paper": 3, "live": 0})
     assert crm.evaluate(_sig(engine="swing"), ctx).approved is False

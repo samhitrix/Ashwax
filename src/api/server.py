@@ -45,6 +45,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from kiteconnect import KiteConnect
 
@@ -135,6 +136,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# The control routes (strategy live toggle, force-exit, settings) have no auth and rely on
+# the localhost bind. Reject any other Host header so a DNS-rebinding web page cannot reach
+# them through the browser. The Vite proxy targets localhost:3000, so the dashboard passes.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
 
 _kite_client: KiteConnect | None = None
@@ -3016,6 +3021,17 @@ def _flat_option_legs(raw_legs: Any) -> list[dict[str, Any]]:
     return list(legs.get("protection", [])) + list(legs.get("income", []))
 
 
+def _option_product_label(raw_legs: Any) -> str:
+    """Kite product the structure was placed with: "MIS" or "NRML". Legs saved before they
+    carried a product were all NRML."""
+    try:
+        legs = json.loads(raw_legs) if isinstance(raw_legs, str) else (raw_legs or {})
+    except (TypeError, ValueError):
+        return "NRML"
+    every = [*legs.get("protection", []), *legs.get("income", []), *legs.get("closed", [])]
+    return "MIS" if any(leg.get("product") == "INTRADAY" for leg in every) else "NRML"
+
+
 @app.get("/api/options_positions")
 async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
     """Every options structure (open + last 30 days closed), paper AND live, for
@@ -3085,6 +3101,7 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
         compute_exit_levels,
         compute_pop,
     )
+    from src.options.seller_desk import _registry_strategy_for
 
     today: date = datetime.now(_ZI("Asia/Kolkata")).date()
 
@@ -3213,6 +3230,8 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
                 "positionId": r["position_id"],
                 "underlying": r["underlying"],
                 "strategy": r["strategy_type"],
+                # The registry strategy (its own paper/live switch) the structure trades under.
+                "registryStrategy": _registry_strategy_for(str(r["strategy_type"])),
                 "status": r["status"],
                 "legs": leg_out,
                 "expiry": str(expiry) if expiry else "",
@@ -3235,6 +3254,7 @@ async def get_options_positions(closed: str = "all") -> list[dict[str, Any]]:
                 "openedAt": str(r["opened_at"]) if r["opened_at"] else "",
                 "closedAt": str(r["closed_at"]) if r["closed_at"] else "",
                 "isPaper": bool(r["is_paper"]),
+                "product": _option_product_label(r["legs"]),
                 "exec_broker": _exec_broker_label(r, bool(r["is_paper"])),
             }
         )

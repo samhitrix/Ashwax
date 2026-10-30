@@ -192,8 +192,9 @@ class OpenPosition:
     # High-water mark of unrealized P&L (rupees), persisted (migration 082) so a restart
     # does not forget it. Feeds position_manager.check_breakeven_lock (debit structures).
     peak_unrealized_pnl: float | None = None
-    # Own paper/live mode. None = the desk's mode. B and options_expiry_day carry their
-    # registry execution_mode here, so going live is ONE registry switch per strategy.
+    # Own paper/live mode, fixed for the position's life (desk entries and restore always set
+    # it explicitly, so flipping the desk's mode never reinterprets an open position).
+    # None = the desk's mode (legacy callers/tests only).
     is_paper: bool | None = None
     # options_intraday_short_premium only: legs already closed one at a time (per-leg SL), as the persisted
     # dicts (premium, exit_premium, lots, lot_size, direction ...), and the rules frozen at
@@ -203,10 +204,12 @@ class OpenPosition:
     # Live broker whose executor placed it (options_positions.exec_broker); None for paper
     # (and for a live row restored before migration 089 = "kite"). Exits use ONLY this broker.
     exec_broker: str | None = None
-    # Restored live position whose broker has no executor this process (never rerouted).
+    # Restored live position whose broker has no executor this process (never rerouted). Still
+    # fully managed: every exit is evaluated and a CRITICAL alert fires when one cannot be sent.
     broker_unwired: bool = False
-    # Restored ON HOLD (monitoring only; see SellerDesk.held_positions): why. None = managed.
-    # "restored_unaudited_live_row" | "expired_live_row" | "broker_unwired" | "partial_close".
+    # ON HOLD (see SellerDesk.held_positions): why. None = managed. Only states where no order
+    # can safely be sent: "partial_close" (resolved automatically each sweep, see
+    # _resolve_held_positions) | "expired_live_row" (contract already settled by the exchange).
     hold_reason: str | None = None
 
     @property
@@ -808,9 +811,9 @@ class SellerDesk:
         # Serialises "check for a duplicate -> place orders -> register position" so two entries
         # for the same structure can never interleave (2026-10-16 duplicate bull_put_spread).
         self._entry_lock = asyncio.Lock()
-        # Restored live positions held for MONITORING ONLY (restore_positions): kept OUT of
-        # self.positions, so no sweep/monitor/aggregate (slots, Greeks, margin, P&L) ever sees
-        # them; the ONLY exit is the operator close (operator_actions.close_position_ids).
+        # Positions where no order may be sent blindly (OpenPosition.hold_reason): kept OUT of
+        # self.positions so no normal sweep acts on them. _resolve_held_positions reconciles a
+        # partial close each sweep and resumes it; the operator close also still works.
         self.held_positions: dict[str, OpenPosition] = {}
         self._no_executor_logged: set[str] = set()  # CRITICAL once per position per process
         # Failed operator closes: id -> monotonic time of the last attempt (retry throttle) and
@@ -826,19 +829,19 @@ class SellerDesk:
         self._g9_malformed = 0
         # Portfolio-level safety state (options_spec.md 11 / 11.5) -- see
         # sweep_portfolio_risk(). Realized-today is re-seeded from the DB on
-        # restore so a restart can't reset the daily-loss breaker.
+        # restore so a restart can't reset the daily-loss breaker. Every figure and latch here
+        # is PER MODE (key: is_paper): a paper loss never halts live entries, and vice versa.
         self._realized_day: date | None = None
-        self._realized_today = 0.0
-        self._entries_halted_day: date | None = None
-        self._margin_blocked = False
-        self._gap_blocked = False
+        self._realized_today_by_mode: dict[bool, float] = {}
+        self._entries_halted_by_mode: dict[bool, date] = {}
+        self._margin_blocked_by_mode: dict[bool, bool] = {}
+        self._gap_blocked_by_mode: dict[bool, bool] = {}
         # Per-STRATEGY daily-loss kill (config/capital.json options.max_loss_per_day_per_strategy,
-        # 2026-10-07): today's realized loss per registry strategy (see
-        # _registry_strategy_for), and which strategies are halted for today. Both are
-        # re-derived from the DB on restore (restore_positions), same pattern as
-        # _realized_today above -- never a silently-forgotten latch.
-        self._realized_today_by_strategy: dict[str, float] = {}
-        self._strategy_halted_day: dict[str, date] = {}
+        # 2026-10-07): today's realized loss per (registry strategy, is_paper) (see
+        # _registry_strategy_for), and which are halted for today. Both are re-derived from the
+        # DB on restore (restore_positions) -- never a silently-forgotten latch.
+        self._realized_today_by_strategy: dict[tuple[str, bool], float] = {}
+        self._strategy_halted_day: dict[tuple[str, bool], date] = {}
         # Latest market observations per underlying (from chains seen in run_cycle /
         # sweeps): spot, ATM IV, last regime, and the day's first spot/IV for the
         # end-of-day Greeks P&L attribution.
@@ -956,6 +959,20 @@ class SellerDesk:
                 "paper" if self._pos_is_paper(pos) else "live",
                 pos.exec_broker,
             )
+            try:
+                from src.infrastructure import operator_alerts  # noqa: PLC0415
+
+                operator_alerts.raise_alert(
+                    f"Options position {pos.position_id} ({pos.strategy_type}) needs an order "
+                    f"but broker {pos.exec_broker or 'paper'} has no executor in this process. "
+                    f"Its exits are still evaluated every sweep and are sent as soon as that "
+                    f"broker is wired (restart after fixing its login), or close it at the broker.",
+                    source=f"options_no_executor:{pos.position_id}",
+                    tier="CRITICAL",
+                    dedupe_seconds=4 * 3600,
+                )
+            except Exception as exc:  # noqa: BLE001 -- the CRITICAL log already fired
+                _LOG.error("seller_desk_no_executor_alert_failed err=%s", exc)
         return executor
 
     @staticmethod
@@ -1011,8 +1028,7 @@ class SellerDesk:
         positions can draw it down too), so the caller-supplied real value
         is used unchanged."""
         if self._is_paper:
-            committed = sum(p.entry_margin for p in self.positions.values())
-            return max(0.0, self._options_capital - committed)
+            return self.paper_sleeve_margin()  # live positions never draw on the paper sleeve
         return float(broker_available_cash) if broker_available_cash is not None else 0.0
 
     def paper_sleeve_margin(self) -> float:
@@ -1021,14 +1037,17 @@ class SellerDesk:
         committed = sum(p.entry_margin for p in self.positions.values() if self._pos_is_paper(p))
         return max(0.0, self._options_capital - committed)
 
-    def portfolio_greeks(self) -> PortfolioGreeks:
+    def portfolio_greeks(self, is_paper: bool | None = None) -> PortfolioGreeks:
         """Sum of every open position's entry-time Greeks (per-lot x lots), on the
         RUPEE scale the budgets use (delta x spot/100, gamma x spot^2/100) —
         used as `current` in the pre-trade Greeks budget check. Entry-time,
         not live: positions don't retain refreshed per-leg Greeks. Each position
-        is scaled by its own underlying's latest spot."""
+        is scaled by its own underlying's latest spot. ``is_paper`` = only that mode's
+        book (a candidate's budget never counts the other mode's positions)."""
         total = PortfolioGreeks()
         for pos in self.positions.values():
+            if is_paper is not None and self._pos_is_paper(pos) != is_paper:
+                continue
             rs = to_rupees(self._native_greeks(pos), self._spot_for(pos))
             total.net_delta += rs.net_delta
             total.net_gamma += rs.net_gamma
@@ -1068,19 +1087,13 @@ class SellerDesk:
         if self._repo is None:
             return 0
         # Every LIVE row comes back, whatever the desk's default mode and whichever broker holds
-        # it (a real position must never be forgotten after a restart); paper rows keep the old
-        # rule (the desk's own mode, or a desk-hosted strategy with its own mode). A live row the
-        # OLD rule dropped (never audited), an expired live row, or one whose broker has no
-        # executor comes back ON HOLD: monitoring only, operator close only (_hold_reason).
+        # it, and every PAPER row too: each comes back in its OWN mode (the row's is_paper),
+        # never the desk's, so flipping the desk paper<->live never orphans an open position.
+        # Only a partial close or an already-expired live contract comes back ON HOLD
+        # (_hold_reason); everything else is fully managed.
         today = datetime.now(_IST).date()
         held: list[OpenPosition] = []
-        rows = [
-            r
-            for r in await self._repo.load_open_positions(is_paper=None)
-            if not bool(r.get("is_paper", self._is_paper))
-            or bool(r.get("is_paper", self._is_paper)) == self._is_paper
-            or r.get("strategy_type") in HOSTED_OWN_MODE_TYPES
-        ]
+        rows = list(await self._repo.load_open_positions(is_paper=None))
         for row in rows:
             raw_legs: Any = row["legs"]
             legs: dict[str, Any] = json.loads(raw_legs) if isinstance(raw_legs, str) else raw_legs
@@ -1106,11 +1119,7 @@ class SellerDesk:
                 entry_short_delta=_opt_float(row.get("entry_short_delta")),
                 was_breached=bool(row.get("was_breached", False)),
                 peak_unrealized_pnl=_opt_float(row.get("peak_unrealized_pnl")),
-                is_paper=(
-                    None
-                    if bool(row.get("is_paper", self._is_paper)) == self._is_paper
-                    else bool(row.get("is_paper"))
-                ),
+                is_paper=bool(row.get("is_paper", self._is_paper)),
                 closed_legs=list(legs.get("closed", [])),
                 meta=dict(legs.get("meta", {})),
                 entry_greeks=PortfolioGreeks(
@@ -1133,9 +1142,10 @@ class SellerDesk:
                 held.append(pos)
         self._alert_held(held)
         try:
-            self._realized_today = await self._repo.realized_pnl_closed_on(
-                today, is_paper=self._is_paper
-            )
+            for _mode in (True, False):
+                self._realized_today_by_mode[_mode] = await self._repo.realized_pnl_closed_on(
+                    today, is_paper=_mode
+                )
             self._realized_day = today
         except Exception as exc:  # noqa: BLE001 — breaker seed is best-effort
             _LOG.warning("seller_desk_realized_seed_failed err=%s", exc)
@@ -1148,23 +1158,18 @@ class SellerDesk:
         return len(rows)
 
     def _hold_reason(self, row: dict[str, Any], pos: OpenPosition, today: date) -> str | None:
-        """Why a restored row must not be auto-managed, else None. Rows the old restore rule
-        kept (the desk's own mode, or a hosted strategy) and that are tradeable keep today's
-        behaviour exactly."""
+        """Why a restored row must not get normal automatic orders, else None (fully managed,
+        whatever the desk's mode). A position whose broker has no executor is still managed:
+        its exits are evaluated and alerted (_executor_for_position), never held."""
         if self._executor_for(self._pos_is_paper(pos), pos.exec_broker) is None:
             pos.broker_unwired = True
         if pos.meta.get("hold_reason") == "partial_close" or pos.meta.get("close_sent"):
-            # A close failed part-way, or the process died mid-close: which legs are still open
-            # is uncertain -- operator only (the operator close never re-sends a sent leg).
+            # A close failed part-way, or the process died mid-close: the close is resumed by
+            # _resolve_held_positions once the open legs are known (never re-sends a sent leg).
             return "partial_close"
-        row_paper = bool(row.get("is_paper", self._is_paper))
-        if row_paper:
-            return "broker_unwired" if pos.broker_unwired else None
-        if row_paper != self._is_paper and row.get("strategy_type") not in HOSTED_OWN_MODE_TYPES:
-            return "restored_unaudited_live_row"  # the old filter dropped it: never audited
-        if pos.expiry < today:
-            return "expired_live_row"  # cannot be exited by a normal market order
-        return "broker_unwired" if pos.broker_unwired else None
+        if not bool(row.get("is_paper", self._is_paper)) and pos.expiry < today:
+            return "expired_live_row"  # settled by the exchange: no order can exit it
+        return None
 
     def _alert_held(self, held: list[OpenPosition]) -> None:
         """CRITICAL log per held position, and ONE operator alert per restore summarising them."""
@@ -1173,7 +1178,8 @@ class SellerDesk:
         for pos in held:
             _LOG.critical(
                 "seller_desk_position_restored_on_hold id=%s type=%s mode=%s broker=%s "
-                "expiry=%s reason=%s -- MONITORING ONLY, no automatic exits",
+                "expiry=%s reason=%s -- no blind orders: a partial close is reconciled with "
+                "the broker and resumed automatically; an expired live row needs settling",
                 pos.position_id,
                 pos.strategy_type,
                 "paper" if self._pos_is_paper(pos) else "live",
@@ -1191,9 +1197,10 @@ class SellerDesk:
             from src.infrastructure import operator_alerts  # noqa: PLC0415
 
             operator_alerts.raise_alert(
-                f"{len(held)} options positions restored for MONITORING ONLY -- no "
-                f"automatic exits; verify against the broker and close manually or via "
-                f"operator_actions.close_position_ids: {items}",
+                f"{len(held)} options positions restored ON HOLD -- partial closes are "
+                f"reconciled with the broker and resumed automatically each sweep; an expired "
+                f"live row is already settled by the exchange: verify at the broker and close "
+                f"it via operator_actions.close_position_ids: {items}",
                 source="options_positions_on_hold",
                 tier="CRITICAL",
                 dedupe_seconds=4 * 3600,
@@ -1305,7 +1312,9 @@ class SellerDesk:
         _open_here = sum(
             1
             for p in self.positions.values()
-            if p.underlying == underlying and p.strategy_type != EXPIRY_DAY_TYPE
+            if p.underlying == underlying
+            and p.strategy_type != EXPIRY_DAY_TYPE
+            and self._pos_is_paper(p) == self._is_paper  # slots are per mode
         ) + sum(
             1
             for p in self.held_positions.values()
@@ -1323,13 +1332,13 @@ class SellerDesk:
             )
             return None
 
-        blocked_reason = self.entries_blocked_reason(today, available_margin)
+        blocked_reason = self.entries_blocked_reason(today, available_margin, self._is_paper)
         if blocked_reason is not None:
             _LOG.warning(
                 "seller_desk_entries_blocked underlying=%s reason=%s", underlying, blocked_reason
             )
             return None
-        _strat_halted = self.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, today)
+        _strat_halted = self.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, today, self._is_paper)
         if _strat_halted is not None:
             _LOG.warning(
                 "seller_desk_entries_blocked underlying=%s reason=%s", underlying, _strat_halted
@@ -1431,7 +1440,7 @@ class SellerDesk:
                     risk_per_trade_pct=_risk_pct,
                     margin_safety_pct=self._margin_safety_pct,
                     available_margin=available_margin,
-                    current_greeks=self.portfolio_greeks(),
+                    current_greeks=self.portfolio_greeks(self._is_paper),
                     greeks_budget=self._greeks_budget,
                     directional_bias=directional_bias,
                     executor=executor,
@@ -1515,7 +1524,7 @@ class SellerDesk:
                 risk_per_trade_pct=_risk_pct * size_mult,
                 margin_safety_pct=self._margin_safety_pct,
                 available_margin=available_margin,
-                current_greeks=self.portfolio_greeks(),
+                current_greeks=self.portfolio_greeks(self._is_paper),
                 greeks_budget=self._greeks_budget,
                 dte_value=strategy_dte,
                 min_rom_pct=self._min_rom_pct,
@@ -1704,7 +1713,9 @@ class SellerDesk:
         value (meant as a day-level stop) blocked every strategy outright, since even one
         trade's own max loss (Rs 1,700-19,000 depending on strategy) exceeded it."""
         if hasattr(crm_ctx, "options_daily_loss_so_far"):
-            crm_ctx.options_daily_loss_so_far = max(0.0, -self._realized_today)
+            crm_ctx.options_daily_loss_so_far = max(
+                0.0, -self._realized_today_by_mode.get(self._is_paper, 0.0)
+            )
 
     def _crm_precheck(
         self, crm: Any, crm_signal: Any, crm_ctx: Any, lots: int, underlying: str
@@ -2092,7 +2103,7 @@ class SellerDesk:
             entry_atm_iv=chain.atm_iv(),
             entry_spot=chain.spot,
             entry_short_delta=abs(income_legs[0].delta) if income_legs else None,
-            is_paper=None if mode_paper == self._is_paper else mode_paper,
+            is_paper=mode_paper,
             exec_broker=exec_broker,
         )
         self.positions[position.position_id] = position
@@ -2221,11 +2232,11 @@ class SellerDesk:
         # 2026-10-07 fix -- found live 2026-10-08 (3/3 NIFTY open blocked the fly). It gets
         # one attempt per expiry and already_open above caps it at one concurrent fly, so
         # that is its own slot; CRM G7 exempts it too (_HOSTED_OPTIONS_STRATEGIES).
-        blocked_reason = self.entries_blocked_reason(today, available_margin)
+        blocked_reason = self.entries_blocked_reason(today, available_margin, mode_paper)
         if blocked_reason is not None:
             _LOG.warning("%s skipped reason=entries_blocked detail=%s", tag, blocked_reason)
             return None
-        _strat_halted = self.strategy_halted_reason(name, today)
+        _strat_halted = self.strategy_halted_reason(name, today, mode_paper)
         if _strat_halted is not None:
             _LOG.warning("%s skipped reason=%s", tag, _strat_halted)
             return None
@@ -2292,7 +2303,7 @@ class SellerDesk:
             max_loss_1lot,
             margin_per_lot=margin_1lot.total_margin,
             available_margin=available_margin,
-            current_greeks=self.portfolio_greeks(),
+            current_greeks=self.portfolio_greeks(mode_paper),
             per_lot_greeks=to_rupees(_per_lot_greeks(chain, prot1, inc1, 1), chain.spot),
             greeks_budget=budget,
             margin_safety_pct=self._margin_safety_pct,
@@ -2489,6 +2500,7 @@ class SellerDesk:
         for _op_id in _seller_settings.operator_close_position_ids():
             if _op_id in self.positions or _op_id in self.held_positions:
                 await self._operator_close_one(_op_id)
+        await self._resolve_held_positions()
         for _u, _c in chains.items():
             self._observe_chain(_u, _c, today)
         expiry_chains: dict[tuple[str, date], OptionChain | None] = {}
@@ -2703,7 +2715,7 @@ class SellerDesk:
             if p.underlying == underlying
             and p.strategy_type == strategy_type
             and p.expiry == expiry
-            and (self._is_paper if p.is_paper is None else p.is_paper) == mode_paper
+            and self._pos_is_paper(p) == mode_paper
         ]
 
     def _same_direction_open(self, strategy_type: str) -> list[str]:
@@ -2719,6 +2731,7 @@ class SellerDesk:
             pid
             for pid, p in self.positions.items()
             if _DIRECTIONAL_SIDE.get(p.strategy_type) == side
+            and self._pos_is_paper(p) == self._is_paper  # desk-own entries: per mode
         ]
         return open_ids if len(open_ids) >= limit else []
 
@@ -3033,21 +3046,32 @@ class SellerDesk:
         except Exception as exc:  # noqa: BLE001 — reporting only
             _LOG.warning("seller_desk_attribution_persist_failed err=%s", exc)
 
+    def _reset_realized_day(self, today: date) -> None:
+        self._realized_day = today
+        self._realized_today_by_mode = {}
+        self._realized_today_by_strategy = {}
+        self._realized_today_by_key = {}
+
     def _add_realized(
-        self, pnl: float, structure_type: str | None = None, key: str | None = None
+        self,
+        pnl: float,
+        structure_type: str | None = None,
+        key: str | None = None,
+        *,
+        is_paper: bool | None = None,
     ) -> None:
+        """Book a closed position's realized P&L in ITS mode (``is_paper``; None = the desk's)."""
+        mode = self._is_paper if is_paper is None else is_paper
         today = datetime.now(_IST).date()
         if self._realized_day != today:
-            self._realized_day, self._realized_today = today, 0.0
-            self._realized_today_by_strategy = {}
-            self._realized_today_by_key = {}
-        self._realized_today += pnl
+            self._reset_realized_day(today)
+        self._realized_today_by_mode[mode] = self._realized_today_by_mode.get(mode, 0.0) + pnl
         if key is not None:
             self._realized_today_by_key[key] = self._realized_today_by_key.get(key, 0.0) + pnl
         if structure_type is not None:
-            name = _registry_strategy_for(structure_type)
-            self._realized_today_by_strategy[name] = (
-                self._realized_today_by_strategy.get(name, 0.0) + pnl
+            sk = (_registry_strategy_for(structure_type), mode)
+            self._realized_today_by_strategy[sk] = (
+                self._realized_today_by_strategy.get(sk, 0.0) + pnl
             )
 
     async def _seed_strategy_daily_loss(self, today: date) -> None:
@@ -3056,29 +3080,31 @@ class SellerDesk:
         already past its per-strategy daily-loss cap on realized alone -- so a restart
         can never hand a killed strategy a fresh chance just because the in-memory
         latch was forgotten. Open-position unrealized loss is picked up by the very
-        next sweep_strategy_daily_loss() cycle, same limitation _realized_today itself
+        next sweep_strategy_daily_loss() cycle, same limitation _realized_today_by_mode itself
         already has on restore."""
         if self._repo is None:
             return
-        by_structure = await self._repo.realized_pnl_by_structure_closed_on(
-            today, is_paper=self._is_paper
-        )
-        by_strategy: dict[str, float] = {}
-        for structure_type, pnl in by_structure.items():
-            name = _registry_strategy_for(structure_type)
-            by_strategy[name] = by_strategy.get(name, 0.0) + pnl
+        by_strategy: dict[tuple[str, bool], float] = {}
+        for mode in (True, False):
+            by_structure = await self._repo.realized_pnl_by_structure_closed_on(
+                today, is_paper=mode
+            )
+            for structure_type, pnl in by_structure.items():
+                sk = (_registry_strategy_for(structure_type), mode)
+                by_strategy[sk] = by_strategy.get(sk, 0.0) + pnl
         self._realized_today_by_strategy = by_strategy
         from src.risk.budget import get_budget as _rb_get_budget
         from src.risk.budget import get_current_equity as _rb_get_equity
 
         cap = _rb_get_budget().options.max_loss_per_day_per_strategy_rupees(_rb_get_equity())
-        for name, pnl in by_strategy.items():
+        for sk, pnl in by_strategy.items():
             if cap > 0 and -pnl >= cap:
-                self._strategy_halted_day[name] = today
+                self._strategy_halted_day[sk] = today
                 _LOG.error(
-                    "seller_desk_strategy_daily_loss_halt_restored strategy=%s "
+                    "seller_desk_strategy_daily_loss_halt_restored strategy=%s mode=%s "
                     "realized=%.0f cap=%.0f",
-                    name,
+                    sk[0],
+                    "paper" if sk[1] else "live",
                     pnl,
                     cap,
                 )
@@ -3119,11 +3145,14 @@ class SellerDesk:
             )
         return None
 
-    def strategy_halted_reason(self, name: str, today: date) -> str | None:
+    def strategy_halted_reason(
+        self, name: str, today: date, is_paper: bool | None = None
+    ) -> str | None:
         """Why `name` (a registry strategy) may NOT open a new position right now, or
         None. Mirrors entries_blocked_reason's segment-wide version, scoped to one
         strategy; checked by each hosted/desk entry path before building a candidate."""
-        if self._strategy_halted_day.get(name) == today:
+        mode = self._is_paper if is_paper is None else is_paper
+        if self._strategy_halted_day.get((name, mode)) == today:
             return "strategy_daily_loss_cap"
         return None
 
@@ -3144,13 +3173,13 @@ class SellerDesk:
 
         _opt_budget = _rb_get_budget().options
         legacy_cap = _opt_budget.max_loss_per_day_per_strategy_rupees(_rb_get_equity())
-        by_strategy: dict[tuple[str, str | None], list[OpenPosition]] = {}
+        by_strategy: dict[tuple[tuple[str, bool], str | None], list[OpenPosition]] = {}
         for pos in self.positions.values():
-            by_strategy.setdefault(
-                (_registry_strategy_for(pos.strategy_type), self._pos_equity_key(pos)), []
-            ).append(pos)
-        for (name, key), positions in by_strategy.items():
-            if self._strategy_halted_day.get(name) == today:
+            sk = (_registry_strategy_for(pos.strategy_type), self._pos_is_paper(pos))
+            by_strategy.setdefault((sk, self._pos_equity_key(pos)), []).append(pos)
+        for (sk, key), positions in by_strategy.items():
+            name = sk[0]
+            if self._strategy_halted_day.get(sk) == today:
                 continue
             if key is None:
                 cap = legacy_cap
@@ -3168,15 +3197,16 @@ class SellerDesk:
             if cap <= 0:
                 continue
             unrealized = sum(self._unrealized_pnl(p, current_prices) for p in positions)
-            loss_today = self._realized_today_by_strategy.get(name, 0.0) + unrealized
+            loss_today = self._realized_today_by_strategy.get(sk, 0.0) + unrealized
             if -loss_today < cap:
                 continue
-            self._strategy_halted_day[name] = today
+            self._strategy_halted_day[sk] = today
             _LOG.error(
-                "seller_desk_strategy_daily_loss_halt strategy=%s realized=%.0f "
+                "seller_desk_strategy_daily_loss_halt strategy=%s mode=%s realized=%.0f "
                 "unrealized=%.0f cap=%.0f positions=%d",
                 name,
-                self._realized_today_by_strategy.get(name, 0.0),
+                "paper" if sk[1] else "live",
+                self._realized_today_by_strategy.get(sk, 0.0),
                 unrealized,
                 cap,
                 len(positions),
@@ -3184,7 +3214,9 @@ class SellerDesk:
             for pos in positions:
                 await self._close_position(pos.position_id, reason="STRATEGY_DAILY_LOSS")
 
-    def entries_blocked_reason(self, today: date, available_margin: float) -> str | None:
+    def entries_blocked_reason(
+        self, today: date, available_margin: float, is_paper: bool | None = None
+    ) -> str | None:
         """Why NEW entries are blocked right now, or None. Existing positions are
         never touched by these blocks -- only new risk is refused.
 
@@ -3194,32 +3226,36 @@ class SellerDesk:
           ``margin.margin_cushion_minimum_pct``.
         - gap stress test: only when ``portfolio_risk.gap_risk_enforce`` is true.
         """
-        if self._entries_halted_day == today:
+        mode = self._is_paper if is_paper is None else is_paper  # every check is per mode
+        if self._entries_halted_by_mode.get(mode) == today:
             _LOG.debug("entries_blocked_reason_found reason=daily_pnl_circuit_breaker")
             return "daily_pnl_circuit_breaker"
-        committed = sum(p.entry_margin for p in self.positions.values())
+        committed = sum(
+            p.entry_margin for p in self.positions.values() if self._pos_is_paper(p) == mode
+        )
         block_pct = float(_seller_settings.margin_settings().get("margin_cushion_minimum_pct", 20))
-        self._margin_blocked, margin_reason = new_entries_blocked(
+        margin_blocked, margin_reason = new_entries_blocked(
             available_margin,
             committed,
-            currently_blocked=self._margin_blocked,
+            currently_blocked=self._margin_blocked_by_mode.get(mode, False),
             block_cushion_pct=block_pct,
         )
+        self._margin_blocked_by_mode[mode] = margin_blocked
         _LOG.debug(
             "entries_blocked_reason_received available_margin=%.0f committed=%.0f "
             "block_cushion_pct=%.1f margin_blocked=%s gap_blocked=%s",
             available_margin,
             committed,
             block_pct,
-            self._margin_blocked,
-            self._gap_blocked,
+            margin_blocked,
+            self._gap_blocked_by_mode.get(mode, False),
         )
-        if self._margin_blocked:
+        if margin_blocked:
             _LOG.debug(
                 "entries_blocked_reason_found reason=margin_cushion detail=%s", margin_reason
             )
             return f"margin_cushion ({margin_reason})"
-        if self._gap_blocked:
+        if self._gap_blocked_by_mode.get(mode, False):
             _LOG.debug("entries_blocked_reason_found reason=gap_risk_stress_test")
             return "gap_risk_stress_test"
         return None
@@ -3281,10 +3317,7 @@ class SellerDesk:
         self._log_greeks_advisories()
         await self._maybe_record_attribution(today, now)
         if self._realized_day != today:
-            self._realized_day, self._realized_today = today, 0.0
-            self._realized_today_by_strategy = {}
-            self._realized_today_by_key = {}
-        unrealized = sum(self._unrealized_pnl(p, current_prices) for p in self.positions.values())
+            self._reset_realized_day(today)
         # 2026-10-07: config/capital.json (src/risk/budget.py) is now the ONE source for
         # this threshold -- was options_settings.json portfolio_risk.daily_loss_halt_pct
         # x options_capital_rupees, which had silently drifted from the (also now
@@ -3294,25 +3327,37 @@ class SellerDesk:
 
         _equity = _rb_get_equity()
         _all_strategies_pct = _rb_get_budget().options.max_loss_per_day_all_strategies_pct
-        halted, reason = circuit_breaker_check(
-            self._realized_today,
-            unrealized,
-            _equity,
-            halt_pct=_all_strategies_pct,
-        )
-        if halted and self._entries_halted_day != today:
-            self._entries_halted_day = today
-            _LOG.error(
-                "seller_desk_daily_loss_halt %s realized=%.0f unrealized=%.0f",
-                reason,
-                self._realized_today,
-                unrealized,
+        # One breaker PER MODE: that mode's realized + that mode's open MTM. A paper loss never
+        # halts live entries (and vice versa).
+        for mode in (True, False):
+            realized = self._realized_today_by_mode.get(mode, 0.0)
+            unrealized = sum(
+                self._unrealized_pnl(p, current_prices)
+                for p in self.positions.values()
+                if self._pos_is_paper(p) == mode
             )
+            halted, reason = circuit_breaker_check(
+                realized,
+                unrealized,
+                _equity,
+                halt_pct=_all_strategies_pct,
+            )
+            if halted and self._entries_halted_by_mode.get(mode) != today:
+                self._entries_halted_by_mode[mode] = today
+                _LOG.error(
+                    "seller_desk_daily_loss_halt mode=%s %s realized=%.0f unrealized=%.0f",
+                    "paper" if mode else "live",
+                    reason,
+                    realized,
+                    unrealized,
+                )
         if self.per_broker_equity:
             self._per_broker_daily_loss_breaker(today, current_prices, _all_strategies_pct)
 
-        self._gap_blocked = False
-        for underlying in {p.underlying for p in self.positions.values()}:
+        self._gap_blocked_by_mode = {}
+        for underlying, mode in {
+            (p.underlying, self._pos_is_paper(p)) for p in self.positions.values()
+        }:
             chain = chains.get(underlying)
             if chain is None:
                 continue
@@ -3322,7 +3367,11 @@ class SellerDesk:
                     "seller_desk_gap_stress_skipped underlying=%s reason=no_atm_iv", underlying
                 )
                 continue
-            book = [p for p in self.positions.values() if p.underlying == underlying]
+            book = [
+                p
+                for p in self.positions.values()
+                if p.underlying == underlying and self._pos_is_paper(p) == mode
+            ]
             results = run_gap_stress_test(
                 chain.spot,
                 net_delta=sum(self._native_greeks(p).net_delta for p in book),
@@ -3334,15 +3383,17 @@ class SellerDesk:
                 results, self._options_capital, is_banknifty="BANKNIFTY" in underlying.upper()
             )
             _LOG.info(
-                "seller_desk_gap_stress underlying=%s worst5=%.0f worst10=%.0f blocked=%s (%s)",
+                "seller_desk_gap_stress underlying=%s mode=%s worst5=%.0f worst10=%.0f "
+                "blocked=%s (%s)",
                 underlying,
+                "paper" if mode else "live",
                 min((r.pnl for r in results if r.gap_pct == 0.05), default=0.0),
                 min((r.pnl for r in results if r.gap_pct == 0.10), default=0.0),
                 blocked,
                 gap_reason,
             )
             if blocked and bool(cfg.get("gap_risk_enforce", False)):
-                self._gap_blocked = True
+                self._gap_blocked_by_mode[mode] = True
 
     def _unrealized_pnl(self, pos: OpenPosition, current_prices: dict[str, float]) -> float:
         total = 0.0
@@ -3400,6 +3451,7 @@ class SellerDesk:
             "lot_size": leg.lot_size,
             "premium": leg.premium,
             "delta": leg.delta,
+            "product": leg.product,
             "exit_premium": exit_premium,
             "exit_at": now.isoformat(),
             "reason": reason,
@@ -3453,9 +3505,10 @@ class SellerDesk:
     async def _hold_partial_close(
         self, pos: OpenPosition, failed_leg: OptionLeg, exc: BaseException, *, reason: str
     ) -> None:
-        """A close failed after some legs were already sent: stop ALL automatic exits of this
-        position (HOLD, persisted, survives a restart) and raise one CRITICAL operator alert. Only
-        the operator close may finish it, and it sends only the legs not yet sent."""
+        """A close failed after some legs were already sent: HOLD the position (persisted,
+        survives a restart) and raise one CRITICAL operator alert. _resolve_held_positions
+        finishes the close each sweep (live: after reconciling with the broker); it, like the
+        operator close, sends only the legs not yet sent."""
         if not pos.hold:
             pos.hold_reason = "partial_close"
             self.positions.pop(pos.position_id, None)
@@ -3478,8 +3531,8 @@ class SellerDesk:
         ]
         _LOG.critical(
             "seller_desk_partial_close_on_hold id=%s mode=%s broker=%s close_reason=%s "
-            "failed_leg=%s err=%r sent=%s still_open=%s -- ON HOLD, no automatic retries; "
-            "verify at the broker, then close the rest via operator_actions.close_position_ids",
+            "failed_leg=%s err=%r sent=%s still_open=%s -- ON HOLD; the close resumes "
+            "automatically each sweep (live: once the broker's positions confirm the open legs)",
             pos.position_id,
             "paper" if self._pos_is_paper(pos) else "live",
             pos.exec_broker,
@@ -3495,9 +3548,9 @@ class SellerDesk:
             operator_alerts.raise_alert(
                 f"Options position {pos.position_id} PARTLY CLOSED ({reason}): close of "
                 f"{failed_leg.tradingsymbol} failed ({exc!r}). Sent: {sent}; still open: "
-                f"{remaining}. ON HOLD -- no automatic retries. Verify at the broker "
-                f"({pos.exec_broker or 'paper'}), then close the rest via "
-                f"operator_actions.close_position_ids.",
+                f"{remaining}. ON HOLD -- the close of the rest resumes automatically each "
+                f"sweep (live: once {pos.exec_broker or 'paper'}'s positions confirm which "
+                f"legs are still open).",
                 source=f"options_partial_close:{pos.position_id}",
                 tier="CRITICAL",
                 dedupe_seconds=4 * 3600,
@@ -3505,13 +3558,106 @@ class SellerDesk:
         except Exception as aerr:  # noqa: BLE001 -- the CRITICAL log already fired
             _LOG.error("seller_desk_partial_close_alert_failed err=%s", aerr)
 
+    async def _resolve_held_positions(self) -> None:
+        """Every sweep: finish each partial close automatically. Paper: the ledger is exact, so
+        the legs not yet sent are closed. Live: each unsent leg is first checked against the
+        broker's own net position (Kite = truth); a leg the broker already shows flat is marked
+        sent, an open one is closed. A broker position that matches neither (e.g. a manual
+        trade in the same strike) stays on hold with a CRITICAL alert -- never a blind order."""
+        for position_id, pos in list(self.held_positions.items()):
+            if pos.hold_reason != "partial_close":
+                continue
+            try:
+                if not self._pos_is_paper(pos) and not await self._reconcile_unsent_legs(pos):
+                    continue
+                await self._close_position(position_id, reason="PARTIAL_CLOSE_RESUMED")
+            except Exception as exc:  # noqa: BLE001 -- isolate; retried next sweep
+                _LOG.error("seller_desk_partial_close_resume_failed id=%s err=%r", position_id, exc)
+
+    async def _reconcile_unsent_legs(self, pos: OpenPosition) -> bool:
+        """Live partial close: mark legs the broker already shows closed as sent. True = every
+        unsent leg is known (resume the close); False = unknown, stays held (alerted)."""
+        executor = self._executor_for_position(pos, allow_held=True)
+        if executor is None:
+            return False
+        try:
+            net = await executor.net_quantities()
+        except Exception as exc:  # noqa: BLE001 -- unknown: never send blindly
+            _LOG.error(
+                "seller_desk_partial_close_reconcile_failed id=%s err=%r", pos.position_id, exc
+            )
+            return False
+
+        def _key(sym: str) -> str:
+            return sym if ":" in sym else f"NFO:{sym}"
+
+        def _signed(leg: OptionLeg) -> int:
+            return leg.quantity if leg.direction == "BUY" else -leg.quantity
+
+        # What OUR open legs say the broker should hold, per instrument, for this broker only.
+        expected: dict[str, int] = {}
+        for other in (*self.positions.values(), *self.held_positions.values()):
+            if self._pos_is_paper(other) or other.exec_broker != pos.exec_broker:
+                continue
+            other_sent = other.meta.get("close_sent") or {}
+            for leg in other.income_legs + other.protection_legs:
+                if leg.tradingsymbol not in other_sent:
+                    k = _key(leg.tradingsymbol)
+                    expected[k] = expected.get(k, 0) + _signed(leg)
+        sent: dict[str, float | None] = dict(pos.meta.get("close_sent") or {})
+        for leg in pos.income_legs + pos.protection_legs:
+            if leg.tradingsymbol in sent:
+                continue
+            k = _key(leg.tradingsymbol)
+            ours = expected.get(k, 0)
+            # Absent from the broker's book = UNKNOWN, never "flat": an empty/failed positions
+            # response must not mark a short leg closed (that would leave it naked).
+            at_broker = net.get(k)
+            if at_broker is None:
+                pass  # falls through to the unreconciled hold below
+            elif at_broker == ours:
+                continue  # still open at the broker: the resumed close sends it
+            elif at_broker == ours - _signed(leg):
+                sent[leg.tradingsymbol] = None  # already closed at the broker; fill unknown
+                expected[k] = ours - _signed(leg)
+                continue
+            _LOG.critical(
+                "seller_desk_partial_close_unreconciled id=%s leg=%s broker_net=%s expected=%d "
+                "-- stays ON HOLD, no order sent",
+                pos.position_id,
+                leg.tradingsymbol,
+                at_broker,
+                ours,
+            )
+            try:
+                from src.infrastructure import operator_alerts  # noqa: PLC0415
+
+                operator_alerts.raise_alert(
+                    f"Options position {pos.position_id}: cannot reconcile leg "
+                    f"{leg.tradingsymbol} with {pos.exec_broker} (broker net {at_broker}, "
+                    f"expected {ours} or {ours - _signed(leg)}). ON HOLD, no order sent -- fix "
+                    f"at the broker; it resumes automatically once the numbers match.",
+                    source=f"options_partial_close_unreconciled:{pos.position_id}",
+                    tier="CRITICAL",
+                    dedupe_seconds=4 * 3600,
+                )
+            except Exception as aerr:  # noqa: BLE001 -- the CRITICAL log already fired
+                _LOG.error("seller_desk_partial_close_alert_failed err=%s", aerr)
+            return False
+        if sent != (pos.meta.get("close_sent") or {}):
+            pos.meta["close_sent"] = dict(sent)
+            if self._repo is not None:
+                await self._repo.set_legs_meta(pos.position_id, {"close_sent": dict(sent)})
+        return True
+
     async def _close_position(self, position_id: str, *, reason: str) -> None:
         pos = self.positions.get(position_id)
-        if pos is None and reason == "OPERATOR_CLOSE":
-            pos = self.held_positions.get(position_id)  # the ONLY exit of a held position
+        held_ok = reason in ("OPERATOR_CLOSE", "PARTIAL_CLOSE_RESUMED")
+        if pos is None and held_ok:
+            pos = self.held_positions.get(position_id)  # a held position exits ONLY this way
         if pos is None:
             return
-        close_exec = self._executor_for_position(pos, allow_held=reason == "OPERATOR_CLOSE")
+        close_exec = self._executor_for_position(pos, allow_held=held_ok)
         if close_exec is None:
             return  # logged CRITICAL; kept open so the next sweep tries again
         realized_pnl = 0.0
@@ -3606,8 +3752,13 @@ class SellerDesk:
             ]
             charges = options_trade_charges(charge_legs, _broker).as_dict()
         (self.held_positions if pos.hold else self.positions).pop(position_id, None)
-        if pnl_complete and not pos.hold:  # a held row never feeds the desk's aggregates
-            self._add_realized(realized_pnl, pos.strategy_type, self._pos_equity_key(pos))
+        if pnl_complete:  # booked in the position's OWN mode (a held row is still ours)
+            self._add_realized(
+                realized_pnl,
+                pos.strategy_type,
+                self._pos_equity_key(pos),
+                is_paper=self._pos_is_paper(pos),
+            )
         if self._repo is not None:
             try:
                 await self._repo.close_position(

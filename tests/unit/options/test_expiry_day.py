@@ -247,9 +247,8 @@ async def test_take_profit_and_stop(prices, closed, prefix, monkeypatch) -> None
 
 
 async def test_restore_keeps_other_mode_rows_for_hosted_strategies_and_every_live_row() -> None:
-    # Phase 2 task 7: a LIVE desk-own row (B) is restored too, not dropped because the desk's
-    # default mode is paper -- but ON HOLD (monitoring only, never auto-exited: the old filter
-    # never audited such rows); paper rows keep the old rule.
+    # 2026-10-27: every row comes back in its OWN mode and is fully managed -- a LIVE desk-own
+    # row (B) on a paper desk is no longer held. Only an already-expired live contract is.
     import json as _j
 
     def row(pid, stype, is_paper):  # type: ignore[no-untyped-def]
@@ -278,13 +277,13 @@ async def test_restore_keeps_other_mode_rows_for_hosted_strategies_and_every_liv
     repo.realized_pnl_closed_on = _realized
     desk, _ = _desk(_chain(), repo=repo)  # paper desk
     await desk.restore_positions()
-    # C (hosted, live) is restored in its own mode too; its _EXP is already past, so it comes
-    # back on hold as an expired live row (and this desk has no live executor anyway).
+    # B and C are both live and _EXP is already past: expired live contracts (settled by the
+    # exchange) are the one case held. A (paper) is managed, with its mode explicit.
     assert set(desk.positions) == {"A"} and set(desk.held_positions) == {"B", "C"}
-    assert desk.positions["A"].is_paper is None
+    assert desk.positions["A"].is_paper is True
     held = desk.held_positions["B"]
     assert held.is_paper is False and held.exec_broker == "kite"
-    assert held.hold_reason == "restored_unaudited_live_row"
+    assert held.hold_reason == "expired_live_row"
     assert desk.held_positions["C"].is_paper is False
     assert desk.held_positions["C"].hold_reason == "expired_live_row"
 
@@ -350,7 +349,7 @@ def test_crm_precheck_ignores_g9_and_writes_no_journal_row() -> None:
 
 async def test_strategy_halt_blocks_a_new_expiry_day_entry() -> None:
     desk, executor = _desk(_chain(), repo=_Repo())
-    desk._strategy_halted_day[_NAME] = _EXP
+    desk._strategy_halted_day[(_NAME, True)] = _EXP
     pos = await _run(desk)
     assert pos is None
     assert executor.executed == []

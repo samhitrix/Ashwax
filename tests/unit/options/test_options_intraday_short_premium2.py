@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from src.market import sessions
 from src.options import seller_desk as sd
 from src.options import seller_settings as ss
 from src.options import short_premium as st
@@ -82,7 +83,7 @@ def test_shipped_block_is_the_agreed_sensex_straddle(monkeypatch: pytest.MonkeyP
     # SL %, entry/exit time and lots are the user's tuning knobs (edited in the block, no code change), so only
     # their validity is pinned here -- not their current values.
     assert 0 < cfg.sl_pct_ce <= 500 and 0 < cfg.sl_pct_pe <= 500
-    assert cfg.entry_time < cfg.exit_time <= time(15, 10)
+    assert cfg.entry_time < cfg.exit_time < sessions.regular_close("nse_fo")
     assert cfg.skip_weekdays == frozenset()  # test N traded every day
     assert cfg.wing_points == 0 and cfg.allow_naked
 
@@ -260,3 +261,22 @@ def test_each_instance_manages_only_its_own_positions() -> None:
     _open_premium2(desk)
     assert st.is_strangle_position(desk.positions["OPT-S2"], SHORT_PREMIUM2_TYPE)
     assert not st.is_strangle_position(desk.positions["OPT-S2"], SHORT_PREMIUM_TYPE)
+
+
+async def test_live_margin_input_counts_collateral_not_just_cash() -> None:
+    """2026-10-29: the live SENSEX straddle was refused 'need 258513 have 31024' because the
+    margin input was the cash-only figure; the broker accepts collateral for F&O."""
+    from src.brokers.base import Margin
+    from src.orchestrator import _hosted_margin
+
+    class _Broker:
+        async def get_margins(self) -> Margin:
+            return Margin(
+                equity=531024.0,
+                available_cash=31024.0,
+                used_margin=0.0,
+                collateral=500000.0,
+                fno_available=531024.0,
+            )
+
+    assert await _hosted_margin({}, None, _Broker(), is_paper=False) == 531024.0

@@ -59,14 +59,17 @@ def test_add_realized_buckets_by_registry_strategy_and_resets_on_new_day(monkeyp
     desk._add_realized(-500.0, SHORT_PREMIUM_TYPE)
     desk._add_realized(200.0, "iron_condor")  # same bucket as bull_put_spread
     assert desk._realized_today_by_strategy == {
-        DESK_OWN_STRATEGY_NAME: -800.0,
-        SHORT_PREMIUM_TYPE: -500.0,
+        (DESK_OWN_STRATEGY_NAME, True): -800.0,
+        (SHORT_PREMIUM_TYPE, True): -500.0,
     }
-    assert desk._realized_today == -1300.0
+    assert desk._realized_today_by_mode == {True: -1300.0}
+    desk._add_realized(-50.0, "bull_put_spread", is_paper=False)  # a LIVE close: own buckets
+    assert desk._realized_today_by_mode == {True: -1300.0, False: -50.0}
+    assert desk._realized_today_by_strategy[(DESK_OWN_STRATEGY_NAME, False)] == -50.0
 
     _FixedDT._now = datetime(2026, 10, 8, 9, 20, tzinfo=_IST)  # next trading day
     desk._add_realized(-100.0, EXPIRY_DAY_TYPE)
-    assert desk._realized_today_by_strategy == {EXPIRY_DAY_TYPE: -100.0}  # old buckets wiped
+    assert desk._realized_today_by_strategy == {(EXPIRY_DAY_TYPE, True): -100.0}  # old wiped
 
 
 # ── sweep_strategy_daily_loss ───────────────────────────────────────────────────────
@@ -112,13 +115,13 @@ async def test_sweep_closes_only_the_breached_strategy_others_keep_trading(monke
     monkeypatch.setattr(budget_module, "_current_equity", 2_000_000.0)  # cap = Rs 5,000
     desk.positions["A1"] = _pos("A1", "bull_put_spread")
     desk.positions["B1"] = _pos("B1", SHORT_PREMIUM_TYPE)
-    desk._realized_today_by_strategy = {DESK_OWN_STRATEGY_NAME: -6_000.0}  # breached
-    desk._realized_today = -6_000.0
+    desk._realized_today_by_strategy = {(DESK_OWN_STRATEGY_NAME, True): -6_000.0}  # breached
+    desk._realized_today_by_mode = {True: -6_000.0}
     await desk.sweep_strategy_daily_loss(_TODAY, current_prices={})
     assert "A1" not in desk.positions  # breached strategy's position closed
     assert "B1" in desk.positions  # unrelated strategy untouched
-    assert desk._strategy_halted_day[DESK_OWN_STRATEGY_NAME] == _TODAY
-    assert SHORT_PREMIUM_TYPE not in desk._strategy_halted_day
+    assert desk._strategy_halted_day[(DESK_OWN_STRATEGY_NAME, True)] == _TODAY
+    assert (SHORT_PREMIUM_TYPE, True) not in desk._strategy_halted_day
     assert executor.closed  # real close path ran, not a silent drop
 
 
@@ -129,7 +132,9 @@ async def test_sweep_includes_open_unrealized_loss_not_just_realized() -> None:
     budget_module._current_equity = 2_000_000.0  # cap = Rs 5,000
     try:
         desk.positions["A1"] = _pos("A1", "iron_condor")
-        desk._realized_today_by_strategy = {DESK_OWN_STRATEGY_NAME: -2_000.0}  # under cap alone
+        desk._realized_today_by_strategy = {
+            (DESK_OWN_STRATEGY_NAME, True): -2_000.0
+        }  # under cap alone
         # Prices that push the open position's unrealized loss past the remaining cap.
         prices = {"A1LP": 0.5, "A1LC": 0.5, "A1SP": 200.0, "A1SC": 200.0}
         await desk.sweep_strategy_daily_loss(_TODAY, current_prices=prices)
@@ -144,9 +149,9 @@ async def test_sweep_does_not_reclose_an_already_halted_strategy() -> None:
 
     budget_module._current_equity = 2_000_000.0
     try:
-        desk._strategy_halted_day[DESK_OWN_STRATEGY_NAME] = _TODAY
+        desk._strategy_halted_day[(DESK_OWN_STRATEGY_NAME, True)] = _TODAY
         desk.positions["A1"] = _pos("A1", "bull_put_spread")  # opened AFTER the halt somehow
-        desk._realized_today_by_strategy = {DESK_OWN_STRATEGY_NAME: -6_000.0}
+        desk._realized_today_by_strategy = {(DESK_OWN_STRATEGY_NAME, True): -6_000.0}
         await desk.sweep_strategy_daily_loss(_TODAY, current_prices={})
         assert "A1" in desk.positions  # sweep skips an already-halted strategy; no double action
         assert executor.closed == []
@@ -157,7 +162,7 @@ async def test_sweep_does_not_reclose_an_already_halted_strategy() -> None:
 async def test_sweep_is_a_noop_when_no_strategy_cap_is_configured() -> None:
     desk, executor = _desk(_rich_chain(), repo=_FakeRepo())
     desk.positions["A1"] = _pos("A1", "bull_put_spread")
-    desk._realized_today_by_strategy = {DESK_OWN_STRATEGY_NAME: -1_000_000.0}
+    desk._realized_today_by_strategy = {(DESK_OWN_STRATEGY_NAME, True): -1_000_000.0}
     # No set_current_equity call -> falls back to capital.json's configured fallback,
     # which is a real positive number, so this proves the gate is live by default too:
     await desk.sweep_strategy_daily_loss(_TODAY, current_prices={})
@@ -169,10 +174,12 @@ async def test_sweep_is_a_noop_when_no_strategy_cap_is_configured() -> None:
 
 def test_strategy_halted_reason_is_scoped_to_one_strategy() -> None:
     desk, _ = _desk(_rich_chain())
-    desk._strategy_halted_day[DESK_OWN_STRATEGY_NAME] = _TODAY
+    desk._strategy_halted_day[(DESK_OWN_STRATEGY_NAME, True)] = _TODAY
     assert desk.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, _TODAY) == "strategy_daily_loss_cap"
     assert desk.strategy_halted_reason(SHORT_PREMIUM_TYPE, _TODAY) is None
     assert desk.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, date(2026, 10, 8)) is None  # new day
+    # per mode: the PAPER halt never blocks the same strategy's LIVE entries
+    assert desk.strategy_halted_reason(DESK_OWN_STRATEGY_NAME, _TODAY, False) is None
 
 
 # ── _seed_strategy_daily_loss (restart restore) ────────────────────────────────────
@@ -184,7 +191,7 @@ class _SeedRepo(_FakeRepo):
         self._by_structure = by_structure
 
     async def realized_pnl_by_structure_closed_on(self, day, *, is_paper):  # type: ignore[no-untyped-def]
-        return dict(self._by_structure)
+        return dict(self._by_structure) if is_paper else {}  # paper closes only
 
 
 async def test_seed_restores_per_strategy_totals_and_halts_if_already_breached() -> None:
@@ -197,11 +204,11 @@ async def test_seed_restores_per_strategy_totals_and_halts_if_already_breached()
     try:
         await desk._seed_strategy_daily_loss(_TODAY)
         assert desk._realized_today_by_strategy == {
-            DESK_OWN_STRATEGY_NAME: -6_000.0,
-            SHORT_PREMIUM_TYPE: -500.0,
+            (DESK_OWN_STRATEGY_NAME, True): -6_000.0,
+            (SHORT_PREMIUM_TYPE, True): -500.0,
         }
-        assert desk._strategy_halted_day.get(DESK_OWN_STRATEGY_NAME) == _TODAY
-        assert SHORT_PREMIUM_TYPE not in desk._strategy_halted_day
+        assert desk._strategy_halted_day.get((DESK_OWN_STRATEGY_NAME, True)) == _TODAY
+        assert (SHORT_PREMIUM_TYPE, True) not in desk._strategy_halted_day
     finally:
         budget_module._current_equity = None
 
@@ -209,7 +216,7 @@ async def test_seed_restores_per_strategy_totals_and_halts_if_already_breached()
 async def test_restore_positions_calls_the_strategy_seed(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     desk, _ = _desk(_rich_chain(), repo=_SeedRepo({"bull_put_spread": -100.0}))
     await desk.restore_positions()
-    assert desk._realized_today_by_strategy.get(DESK_OWN_STRATEGY_NAME) == -100.0
+    assert desk._realized_today_by_strategy.get((DESK_OWN_STRATEGY_NAME, True)) == -100.0
 
 
 # ── shared_risk_ceiling_reason (Layer 2) ───────────────────────────────────────────

@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from typing import TYPE_CHECKING, Any
@@ -53,9 +53,6 @@ EXPIRY_STRANGLE_TYPE = "options_expiry_day"
 _IST = ZoneInfo("Asia/Kolkata")
 _LOG = logging.getLogger("options.short_premium")
 _WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-# The expiry guardian's first force-close stage is 15:15 (config/market_hours.json); the strategy's own
-# exit must come first or the guardian, not the strategy, would be doing the exit.
-_LATEST_EXIT = dtime(15, 10)
 _MAX_ENTRY_ATTEMPTS = 2
 _MISSING_LTP_ALERT_TICKS = 6
 
@@ -136,8 +133,13 @@ def parse_cfg(
     )
     if not cfg.entry_time < cfg.exit_time:
         raise ValueError("entry_time must be before exit_time")
-    if cfg.exit_time > _LATEST_EXIT:
-        raise ValueError(f"exit_time must be <= {_LATEST_EXIT:%H:%M} (guardian stage is 15:15)")
+    # The operator's exit_time is the exit (the expiry guardian defers to it, see
+    # SellerDesk._guardian_one); the only hard bound is that the market is still open to fill it.
+    from src.market import sessions  # noqa: PLC0415
+
+    fo_close = sessions.regular_close("nse_fo")
+    if cfg.exit_time >= fo_close:
+        raise ValueError(f"exit_time must be before the F&O close {fo_close:%H:%M}")
     if not (0 < cfg.sl_pct_ce <= 500 and 0 < cfg.sl_pct_pe <= 500):
         raise ValueError(
             "sl_pct must be in (0, 500] -- a short-premium leg must always have a stop"
@@ -539,11 +541,11 @@ async def run_entry(
     if attempts >= _MAX_ENTRY_ATTEMPTS:
         return None
     # ONLY the real safety breakers apply -- no open-position / trade-count / exposure / slot caps.
-    blocked = desk.entries_blocked_reason(today, available_margin)
+    blocked = desk.entries_blocked_reason(today, available_margin, mode_paper)
     if blocked is not None:
         _LOG.warning("%s skipped reason=entries_blocked detail=%s", tag, blocked)
         return None
-    halted = desk.strategy_halted_reason(name, today)
+    halted = desk.strategy_halted_reason(name, today, mode_paper)
     if halted is not None:
         _LOG.warning("%s skipped reason=%s", tag, halted)
         return None
@@ -569,7 +571,7 @@ async def run_entry(
     live_chain: OptionChain = chain  # narrowed above; a closure loses mypy's narrowing
 
     def _build(n_lots: int) -> tuple[list[OptionLeg], list[OptionLeg]] | None:
-        return build_short_premium_legs(
+        built = build_short_premium_legs(
             live_chain,
             n_lots,
             ce_offset=cfg.ce_offset,
@@ -580,6 +582,15 @@ async def run_entry(
             max_spread_pct=cfg.max_spread_pct,
             max_spread_points=cfg.max_spread_points,
             why=why,
+        )
+        if built is None:
+            return None
+        # Every position of this engine is flat by its same-day exit_time, so it goes as MIS:
+        # same F&O margin as NRML, plus the broker's own square-off if our exit never happens.
+        protection, income = built
+        return (
+            [replace(leg, product="INTRADAY") for leg in protection],
+            [replace(leg, product="INTRADAY") for leg in income],
         )
 
     probe = _build(1)

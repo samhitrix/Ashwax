@@ -30,6 +30,7 @@ interface OptionPosition {
   positionId: string;
   underlying: string;
   strategy: string;
+  registryStrategy?: string;
   status: string;
   legs: OptionLegRow[];
   expiry: string;
@@ -55,6 +56,7 @@ interface OptionPosition {
   openedAt: string;
   closedAt: string;
   isPaper: boolean;
+  product?: 'MIS' | 'NRML';
 }
 
 interface FundsMarginsSide {
@@ -282,6 +284,60 @@ function FundsMarginsPanel({ positions, modeFilter }: { positions: OptionPositio
           </div>
         </div>
       </div>
+      <StrategyBreakdown open={open} closedToday={closedToday} />
+    </div>
+  );
+}
+
+// Per registry strategy AND mode: each strategy has its own paper/live switch, so one strategy
+// can hold old paper positions while it trades live. Paper rows share the paper sleeve, live
+// rows the broker's cash (the cards above).
+function StrategyBreakdown({ open, closedToday }: { open: OptionPosition[]; closedToday: OptionPosition[] }) {
+  const rows = new Map<string, { strategy: string; isPaper: boolean; open: number; margin: number; today: number }>();
+  const row = (p: OptionPosition) => {
+    const strategy = p.registryStrategy ?? p.strategy;
+    const key = `${strategy}|${p.isPaper}`;
+    if (!rows.has(key)) rows.set(key, { strategy, isPaper: p.isPaper, open: 0, margin: 0, today: 0 });
+    return rows.get(key)!;
+  };
+  for (const p of open) {
+    const r = row(p);
+    r.open += 1;
+    r.margin += p.entryMargin ?? 0;
+    r.today += p.todayPnl ?? p.pnl ?? 0;
+  }
+  for (const p of closedToday) row(p).today += p.bookedPnl ?? p.pnl ?? 0;
+  if (rows.size === 0) return null;
+  const sorted = [...rows.values()].sort((a, b) => a.strategy.localeCompare(b.strategy) || Number(a.isPaper) - Number(b.isPaper));
+
+  return (
+    <div className="mt-3.5 bg-[#161b22] border border-gray-800 rounded-xl overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-xs text-gray-500 border-b border-gray-800">
+            <th className="text-left font-normal px-4 py-2">Strategy</th>
+            <th className="text-left font-normal px-4 py-2">Mode</th>
+            <th className="text-right font-normal px-4 py-2">Open</th>
+            <th className="text-right font-normal px-4 py-2">Margin Used</th>
+            <th className="text-right font-normal px-4 py-2">Today's P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((r) => (
+            <tr key={`${r.strategy}|${r.isPaper}`} className="border-b border-gray-800/50 last:border-0">
+              <td className="px-4 py-2 font-mono text-gray-200">{r.strategy}</td>
+              <td className={cn('px-4 py-2 text-xs font-semibold', r.isPaper ? 'text-blue-400' : 'text-amber-400')}>
+                {r.isPaper ? 'PAPER' : 'LIVE'}
+              </td>
+              <td className="px-4 py-2 text-right font-mono text-gray-300">{r.open}</td>
+              <td className="px-4 py-2 text-right font-mono text-gray-300">{fmtRupees(r.margin)}</td>
+              <td className={cn('px-4 py-2 text-right font-mono', r.today >= 0 ? 'text-green-400' : 'text-red-400')}>
+                {r.today >= 0 ? '+' : ''}{fmtRupees(r.today)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -372,6 +428,19 @@ export function OptionsTrading() {
                 >
                   {p.isPaper ? 'Paper' : 'Live'}
                 </span>
+                {p.product && (
+                  <span
+                    className={cn(
+                      'px-2 py-0.5 rounded text-xs font-medium border',
+                      p.product === 'MIS'
+                        ? 'text-amber-400 bg-amber-500/10 border-amber-500/30'
+                        : 'text-gray-300 bg-gray-500/10 border-gray-600'
+                    )}
+                    title={p.product === 'MIS' ? 'Intraday (MIS) - broker squares off near close' : 'Carry-forward (NRML)'}
+                  >
+                    {p.product}
+                  </span>
+                )}
               </div>
 
               <div className="flex gap-5">

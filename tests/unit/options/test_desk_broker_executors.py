@@ -261,39 +261,39 @@ def _capture_alerts(monkeypatch) -> list[dict[str, Any]]:  # type: ignore[no-unt
     return alerts
 
 
-async def test_restore_reattaches_every_brokers_positions_and_keeps_paper_paper(
+async def test_restore_reattaches_every_row_in_its_own_mode_and_manages_all(
     monkeypatch, caplog
 ) -> None:  # type: ignore[no-untyped-def]
+    # 2026-10-27 rule: every open position, paper or live, is fully managed whatever the
+    # desk's mode. Nothing is held for being "the other mode" or for a missing executor.
     alerts = _capture_alerts(monkeypatch)
     repo = _FakeRepo(
         open_rows=[
             _row("P", "iron_condor", True, None),  # paper desk-own
-            _row("K", "iron_condor", False, None),  # live desk-own on a paper desk: unaudited
-            _row("A", EXPIRY_DAY_TYPE, False, "angel_one"),  # hosted: managed as before
-            _row("F", "iron_condor", False, "flattrade"),  # unaudited AND no executor
+            _row("K", "iron_condor", False, None),  # live desk-own on a paper desk
+            _row("A", EXPIRY_DAY_TYPE, False, "angel_one"),  # hosted live
+            _row("F", "iron_condor", False, "flattrade"),  # live, broker has no executor
         ]
     )
     desk, paper, kite, ang = _mdesk(_adjustment_chain(), is_paper=True, repo=repo)
-    with caplog.at_level(logging.CRITICAL, logger="options.seller_desk"):
-        assert await desk.restore_positions() == 4
-    p, h = desk.positions, desk.held_positions
-    assert set(p) == {"P", "A"} and set(h) == {"K", "F"}
-    assert desk._pos_is_paper(p["P"]) and p["P"].exec_broker is None and not p["P"].hold
-    assert not desk._pos_is_paper(p["A"]) and p["A"].exec_broker == "angel_one"
-    assert not p["A"].hold
-    assert h["K"].exec_broker == "kite" and h["K"].hold_reason == "restored_unaudited_live_row"
-    assert h["F"].exec_broker == "flattrade" and h["F"].broker_unwired and h["F"].hold
-    assert "seller_desk_position_restored_on_hold" in caplog.text
-    assert len(alerts) == 1 and alerts[0]["tier"] == "CRITICAL"
-    assert "MONITORING ONLY" in alerts[0]["msg"]
-    assert "K" in alerts[0]["msg"] and "flattrade" in alerts[0]["msg"]
+    assert await desk.restore_positions() == 4
+    p = desk.positions
+    assert set(p) == {"P", "K", "A", "F"} and not desk.held_positions
+    assert p["P"].is_paper is True and p["P"].exec_broker is None
+    assert p["K"].is_paper is False and p["K"].exec_broker == "kite"
+    assert p["A"].exec_broker == "angel_one" and p["F"].broker_unwired
+    assert alerts == []  # nothing on hold
 
-    await desk._close_position("A", reason="t")
-    await desk._close_position("P", reason="t")
-    await desk._close_position("K", reason="t")  # not an operator close: held, untouched
+    for pid in ("A", "P", "K"):
+        await desk._close_position(pid, reason="t")
     assert {s for _leg, s in ang.closed} == {"A"}
     assert {s for _leg, s in paper.closed} == {"P"}
-    assert kite.closed == [] and "K" in desk.held_positions
+    assert {s for _leg, s in kite.closed} == {"K"}  # live row on a paper desk: managed
+    with caplog.at_level(logging.CRITICAL, logger="options.seller_desk"):
+        await desk._close_position("F", reason="t")
+    assert "F" in desk.positions  # no executor: kept, never rerouted, alerted
+    assert "seller_desk_no_executor_for_position id=F" in caplog.text
+    assert [a["source"] for a in alerts] == ["options_no_executor:F"]
 
 
 def _op_close(monkeypatch, ids: list[str]) -> None:  # type: ignore[no-untyped-def]
@@ -316,27 +316,19 @@ def _calls(*exes: _FakeExecutor) -> int:
     return sum(len(e.executed) + len(e.closed) + len(e.rolled) for e in exes)
 
 
-async def test_unaudited_live_row_on_a_paper_desk_is_held_through_a_full_sweep(
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
-    alerts = _capture_alerts(monkeypatch)
+async def test_live_row_on_a_paper_desk_is_exited_by_the_normal_sweep(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _capture_alerts(monkeypatch)
     _op_close(monkeypatch, [])
-    monkeypatch.setattr(
-        sd._seller_settings, "adjustment_settings", lambda *a, **kw: {"execute_rolls": True}
-    )
     today = datetime.now(_IST).date()
-    # expiring tomorrow: the expiry guardian WOULD force-close a managed position
+    # expiring tomorrow at 15:25: the expiry guardian force-closes a managed position
     rows = [_row("K", "iron_condor", False, "kite", expiry=today + timedelta(days=1))]
     desk, paper, kite, ang = _mdesk(_adjustment_chain(), is_paper=True, repo=_FakeRepo(rows))
     await desk.restore_positions()
-    for _ in range(2):
-        await _full_sweep(desk, today)
-    assert _calls(paper, kite, ang) == 0
-    assert "K" in desk.held_positions and "K" not in desk.positions
-    assert desk.available_margin() == desk._options_capital  # no paper-sleeve consumption
-    assert desk.paper_sleeve_margin() == desk._options_capital
-    assert desk.portfolio_greeks().net_delta == 0.0
-    assert len(alerts) == 1
+    assert desk.paper_sleeve_margin() == desk._options_capital  # live never uses paper sleeve
+    assert desk.available_margin() == desk._options_capital
+    await _full_sweep(desk, today)
+    assert {s for _leg, s in kite.closed} == {"K"} and "K" not in desk.positions
+    assert _calls(paper, ang) == 0
 
 
 async def test_expired_live_row_is_held_even_when_the_old_filter_kept_it(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -352,38 +344,37 @@ async def test_expired_live_row_is_held_even_when_the_old_filter_kept_it(monkeyp
     assert "L" in desk.positions and not desk.positions["L"].hold
 
 
-async def test_operator_close_of_a_held_row_uses_its_own_brokers_executor(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+async def test_close_of_a_live_row_on_a_paper_desk_books_pnl_in_live_mode(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     _capture_alerts(monkeypatch)
     repo = _FakeRepo([_row("H", "iron_condor", False, "angel_one")])
     desk, paper, kite, ang = _mdesk(_adjustment_chain(), is_paper=True, repo=repo)
     await desk.restore_positions()
-    assert "H" in desk.held_positions
     _op_close(monkeypatch, ["H"])
     await desk.sweep_position_manager(
         today=_TODAY, blackout_active=False, current_prices={}, current_ivs={}, chains={}
     )
     assert {s for _leg, s in ang.closed} == {"H"} and _calls(paper, kite) == 0
-    assert "H" not in desk.held_positions and "H" not in desk.positions
-    assert repo.closed[0]["broker"] == "angel_one"
-    assert desk._realized_today == 0.0  # a held live row never feeds the desk's aggregates
+    assert "H" not in desk.positions and repo.closed[0]["broker"] == "angel_one"
+    assert desk._realized_today_by_mode.get(True, 0.0) == 0.0  # paper P&L untouched
+    assert False in desk._realized_today_by_mode  # booked in LIVE
 
 
-async def test_held_row_without_executor_stays_flagged_without_reroute_or_spam(
+async def test_row_without_executor_is_managed_alerted_once_and_never_rerouted(
     monkeypatch, caplog
 ) -> None:  # type: ignore[no-untyped-def]
     alerts = _capture_alerts(monkeypatch)
     repo = _FakeRepo([_row("F", "iron_condor", False, "flattrade")])
     desk, paper, kite, ang = _mdesk(_adjustment_chain(), is_paper=False, repo=repo)
     await desk.restore_positions()
-    assert desk.held_positions["F"].hold_reason == "broker_unwired"
+    assert "F" in desk.positions and desk.positions["F"].broker_unwired
     _op_close(monkeypatch, ["F"])
     with caplog.at_level(logging.CRITICAL, logger="options.seller_desk"):
         for _ in range(3):
             await _full_sweep(desk, datetime.now(_IST).date())
     assert _calls(paper, kite, ang) == 0
-    assert "F" in desk.held_positions and desk.held_positions["F"].broker_unwired
+    assert "F" in desk.positions
     assert caplog.text.count("seller_desk_no_executor_for_position") == 1
-    assert len(alerts) == 1
+    assert [a["source"] for a in alerts] == ["options_no_executor:F"]
 
 
 class _RaisingExecutor(_FakeExecutor):
@@ -406,19 +397,25 @@ async def test_one_failing_position_does_not_stop_the_expiry_guardian(caplog) ->
     assert "seller_desk_guardian_position_failed id=A" in caplog.text
 
 
-async def test_live_desk_still_does_not_restore_paper_desk_own_rows() -> None:
+async def test_flipping_the_desk_live_keeps_managing_open_paper_desk_own_rows() -> None:
+    # The 2026-10-27 report: options paper_mode true -> false with two paper spreads open
+    # used to DROP them on restore (never exited, frozen OPEN in the DB).
     repo = _FakeRepo(
         open_rows=[
-            _row("P", "iron_condor", True, None),
+            _row("P", "bear_call_spread", True, None),
             _row("K", "iron_condor", False, "kite"),
-            _row("W", EXPIRY_DAY_TYPE, True, None),  # hosted: own mode, restored
+            _row("W", EXPIRY_DAY_TYPE, True, None),
         ]
     )
-    desk, *_ = _mdesk(_adjustment_chain(), is_paper=False, repo=repo)
+    desk, paper, kite, _ang = _mdesk(_adjustment_chain(), is_paper=False, repo=repo)
     await desk.restore_positions()
-    assert set(desk.positions) == {"K", "W"} and not desk.held_positions
-    assert not desk.positions["K"].hold  # the old filter kept it: managed exactly as before
-    assert desk._pos_is_paper(desk.positions["W"]) and desk.positions["W"].exec_broker is None
+    assert set(desk.positions) == {"P", "K", "W"} and not desk.held_positions
+    assert desk._pos_is_paper(desk.positions["P"]) and desk.positions["P"].exec_broker is None
+    assert desk.available_margin(5_000.0) == 5_000.0  # live desk: broker cash, not the sleeve
+    assert desk.paper_sleeve_margin() == desk._options_capital - 2_000.0  # P + W only
+    await desk._close_position("P", reason="STOP_LOSS")
+    assert {s for _leg, s in paper.closed} == {"P"} and kite.closed == []
+    assert repo.closed[0]["position_id"] == "P"
 
 
 async def test_single_broker_restore_without_exec_broker_column_is_kite() -> None:
@@ -712,7 +709,7 @@ async def test_held_row_of_the_desks_own_mode_blocks_the_index_slot(monkeypatch,
 
 async def test_held_row_of_the_other_mode_does_not_use_the_desks_slot(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     desk, ex, chain = _slot_desk(True, monkeypatch)  # paper desk, held unaudited LIVE row
-    desk.held_positions["OLD"] = _held("OLD", live=True, reason="restored_unaudited_live_row")
+    desk.held_positions["OLD"] = _held("OLD", live=True, reason="partial_close")
     assert await _slot_cycle(desk, chain) is not None
     assert len(ex.executed) == 1
 
@@ -789,19 +786,15 @@ async def test_operator_close_does_not_swallow_cancellation(monkeypatch) -> None
 
 async def test_on_hold_alert_names_mode_and_broker_per_row(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     alerts = _capture_alerts(monkeypatch)
-    repo = _FakeRepo(
-        open_rows=[
-            _row("K", "iron_condor", False, "kite"),  # live, unaudited on a paper desk
-            _row("Q", "iron_condor", True, None),  # paper row without a paper executor
-        ]
-    )
-    desk, *_ = _mdesk(_adjustment_chain(), is_paper=True, repo=repo)
-    desk._executors.pop("paper")
+    partial = _row("K", "iron_condor", False, "kite")
+    partial["legs"]["meta"] = {"close_sent": {"NFO:NIFTY23400PE": 50.0}}
+    expired = _row("X", "iron_condor", False, "kite", expiry=_TODAY - timedelta(days=400))
+    desk, *_ = _mdesk(_adjustment_chain(), is_paper=True, repo=_FakeRepo([partial, expired]))
     await desk.restore_positions()
     msg = alerts[0]["msg"]
-    assert msg.startswith("2 options positions restored for MONITORING ONLY")
-    assert "K (iron_condor, mode=live broker=kite," in msg
-    assert "Q (iron_condor, mode=paper broker=-," in msg
+    assert msg.startswith("2 options positions restored ON HOLD")
+    assert "K (iron_condor, mode=live broker=kite, partial_close)" in msg
+    assert "X (iron_condor, mode=live broker=kite, expired_live_row)" in msg
 
 
 @pytest.mark.skipif(not _DB or "scratch" not in (_DB or ""), reason="scratch DB_URL not set")
@@ -919,7 +912,7 @@ async def test_close_failing_on_third_leg_holds_and_retry_never_resends_closed_l
     }
     assert any(a["source"] == "options_partial_close:K" for a in alerts)
 
-    # Automatic sweeps never touch it (held = monitoring only).
+    # The broker's positions cannot be read: the resume never sends a blind order.
     await _full_sweep(desk, _TODAY)
     assert len(ex.closed) == 2
 
@@ -961,3 +954,144 @@ async def test_first_leg_failure_with_nothing_sent_is_not_held(monkeypatch) -> N
     with pytest.raises(RuntimeError):
         await desk._close_position("K", reason="STOP_LOSS")
     assert "K" in desk.positions and desk.positions["K"].hold_reason is None
+
+
+# ── 2026-10-27: partial closes resume automatically; risk state is per mode ──────────────
+
+
+class _Reconciling(_FailOnNth):
+    """A live broker that also reports its own net positions (Kite = truth)."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__(n)
+        self.net: dict[str, int] = {}
+        self.net_calls = 0
+
+    async def net_quantities(self) -> dict[str, int]:
+        self.net_calls += 1
+        return dict(self.net)
+
+
+def _signed(leg: Any) -> int:
+    return leg.quantity if leg.direction == "BUY" else -leg.quantity
+
+
+async def _fail_third_leg(monkeypatch) -> tuple[Any, Any, Any, Any]:  # type: ignore[no-untyped-def]
+    alerts = _capture_alerts(monkeypatch)
+    _op_close(monkeypatch, [])
+    repo = _MetaRepo()
+    desk, *_ = _mdesk(_adjustment_chain(), is_paper=False, repo=repo)
+    ex = _Reconciling(3)
+    desk._executors["live:kite"] = ex
+    pos = _iron_condor_position("K")
+    pos.exec_broker = "kite"
+    pos.is_paper = False
+    desk.positions["K"] = pos
+    with pytest.raises(RuntimeError):
+        await desk._close_position("K", reason="STOP_LOSS")
+    assert desk.held_positions["K"].hold_reason == "partial_close"
+    ex.fail = False
+    return desk, ex, repo, alerts
+
+
+async def test_live_partial_close_resumes_once_the_broker_confirms_the_open_legs(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    desk, ex, repo, _alerts = await _fail_third_leg(monkeypatch)
+    pos = desk.held_positions["K"]
+    ex.net = {lg.tradingsymbol: _signed(lg) for lg in pos.protection_legs}  # longs still open
+    await desk.sweep_position_manager(
+        today=_TODAY, blackout_active=False, current_prices={}, current_ivs={}, chains={}
+    )
+    assert ex.net_calls == 1
+    assert sorted(lg.tradingsymbol for lg, _ in ex.closed[2:]) == [
+        "NFO:NIFTY23200PE",
+        "NFO:NIFTY24200CE",
+    ]
+    assert "K" not in desk.held_positions and repo.closed[0]["exit_reason"] == (
+        "PARTIAL_CLOSE_RESUMED"
+    )
+    assert repo.closed[0]["realized_pnl"] is not None
+
+
+async def test_live_partial_close_never_resends_a_leg_the_broker_shows_flat(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    desk, ex, repo, _alerts = await _fail_third_leg(monkeypatch)
+    # The "failed" 23200PE close actually reached the exchange (e.g. a timeout after accept).
+    ex.net = {
+        "NFO:NIFTY23200PE": 0,
+        "NFO:NIFTY24200CE": _signed(desk.held_positions["K"].protection_legs[1]),
+    }
+    await desk.sweep_position_manager(
+        today=_TODAY, blackout_active=False, current_prices={}, current_ivs={}, chains={}
+    )
+    assert [lg.tradingsymbol for lg, _ in ex.closed[2:]] == ["NFO:NIFTY24200CE"]
+    assert "K" not in desk.held_positions
+    assert repo.closed[0]["realized_pnl"] is None  # that leg's fill is unknown: never invented
+
+
+async def test_live_partial_close_stays_held_when_the_broker_disagrees(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    desk, ex, repo, alerts = await _fail_third_leg(monkeypatch)
+    ex.net = {"NFO:NIFTY23200PE": 999}  # e.g. a manual trade in the same strike
+    for _ in range(2):
+        await desk.sweep_position_manager(
+            today=_TODAY, blackout_active=False, current_prices={}, current_ivs={}, chains={}
+        )
+    assert len(ex.closed) == 2 and "K" in desk.held_positions  # no blind order
+    assert any(a["source"] == "options_partial_close_unreconciled:K" for a in alerts)
+
+
+async def test_paper_partial_close_resumes_on_the_next_sweep(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _capture_alerts(monkeypatch)
+    _op_close(monkeypatch, [])
+    repo = _MetaRepo()
+    desk, *_ = _mdesk(_adjustment_chain(), is_paper=False, repo=repo)  # live desk
+    ex = _FailOnNth(3)
+    desk._executors["paper"] = ex
+    pos = _iron_condor_position("P")
+    pos.is_paper = True
+    desk.positions["P"] = pos
+    with pytest.raises(RuntimeError):
+        await desk._close_position("P", reason="STOP_LOSS")
+    ex.fail = False
+    await desk.sweep_position_manager(
+        today=_TODAY, blackout_active=False, current_prices={}, current_ivs={}, chains={}
+    )
+    assert len(ex.closed) == 4 and "P" not in desk.held_positions
+    assert repo.closed[0]["position_id"] == "P"
+
+
+async def test_paper_loss_breaker_never_halts_live_entries_and_vice_versa() -> None:
+    from src.risk.budget import get_budget
+
+    now = datetime.now(_IST)
+    desk, *_ = _mdesk(is_paper=False)
+    pct = get_budget().options.max_loss_per_day_all_strategies_pct
+    from src.risk.budget import get_current_equity
+
+    desk._add_realized(-get_current_equity() * pct / 100.0 * 2, "iron_condor", is_paper=True)
+    await desk.sweep_portfolio_risk(today=now.date(), current_prices={}, chains={}, now=now)
+    assert desk.entries_blocked_reason(now.date(), 1e12, True) == "daily_pnl_circuit_breaker"
+    assert desk.entries_blocked_reason(now.date(), 1e12, False) is None
+    assert desk.entries_blocked_reason(now.date(), 1e12) is None  # live desk default
+
+
+async def test_a_paper_position_does_not_use_the_live_desks_index_slot(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    desk, ex, chain = _slot_desk(False, monkeypatch)  # live desk
+    paper_pos = _iron_condor_position("OLDP")
+    paper_pos.is_paper = True
+    desk.positions["OLDP"] = paper_pos
+    assert await _slot_cycle(desk, chain) is not None
+    assert len(ex.executed) == 1
+
+
+async def test_live_partial_close_stays_held_when_the_broker_returns_no_rows(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # An empty/failed positions response must read as UNKNOWN, never "flat": treating the
+    # absent short as already closed would leave it naked at the broker.
+    desk, ex, repo, alerts = await _fail_third_leg(monkeypatch)
+    ex.net = {}
+    await desk.sweep_position_manager(
+        today=_TODAY, blackout_active=False, current_prices={}, current_ivs={}, chains={}
+    )
+    assert len(ex.closed) == 2 and "K" in desk.held_positions
+    assert "NFO:NIFTY23200PE" not in (desk.held_positions["K"].meta.get("close_sent") or {})
+    assert any(a["source"] == "options_partial_close_unreconciled:K" for a in alerts)

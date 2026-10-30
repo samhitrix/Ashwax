@@ -571,10 +571,13 @@ def _position_open_risk(p: Any) -> float:
     return max(0.0, per_share) * qty
 
 
-def _update_open_risk_and_sector_exposure(crm_ctx: Any, positions: list[Any]) -> None:
+def _update_open_risk_and_sector_exposure(crm_ctx: Any, positions: list[Any]) -> str:
     """Recompute CRMContext.open_risk_rupees / sector_open_exposure_rupees from
     the currently-monitored open positions (spec §6.3/§6.4 portfolio-level caps).
     Runs every cycle alongside open_exposure_rupees — same data, same cadence.
+
+    Returns "" on success, else the failure reason -- the caller fails the CRM closed
+    (risk_inputs_unverified) rather than letting the caps read 0 / stale exposure.
     """
     try:
         crm_ctx.open_risk_rupees = sum(_position_open_risk(p) for p in positions)
@@ -587,8 +590,10 @@ def _update_open_risk_and_sector_exposure(crm_ctx: Any, positions: list[Any]) ->
                 p.fill_price
             )
         crm_ctx.sector_open_exposure_rupees = sector_totals
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.error("open_risk_recompute_failed err=%s", exc)
+        return f"open_risk: {str(exc)[:120]}"
+    return ""
 
 
 async def _update_regime_phase(
@@ -2441,6 +2446,37 @@ def _exit_window_start_min(shared: dict[str, Any]) -> int:
 
 
 async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
+    """Refresh the CRM counters / open risk, then fail the CRM closed if any part failed.
+
+    Every failure below used to be swallowed, leaving the caps on 0 (after a restart) or
+    stale figures -- the 2026-09-22 cap breach class. Now it sets
+    crm_ctx.risk_inputs_unverified (G2 blocks new entries) until the next good cycle;
+    exits are unaffected. One Telegram alert per IST day when it first trips."""
+    risk_fail: list[str] = []
+    await _refresh_daily_counters_unchecked(shared, crm_ctx, risk_fail)
+    reason = "; ".join(risk_fail)
+    if reason and not getattr(crm_ctx, "risk_inputs_unverified", ""):
+        try:
+            from datetime import datetime as _ru_dt
+            from zoneinfo import ZoneInfo as _ru_tz
+
+            from src.notifications import EventKind, notify
+
+            _day = _ru_dt.now(_ru_tz("Asia/Kolkata")).date().isoformat()
+            notify(
+                EventKind.STRATEGY_ERROR,
+                is_paper=False,
+                dedupe_key=f"risk_inputs_unverified:{_day}",
+                reason=f"CRM risk inputs unverified -- new entries blocked: {reason}",
+            )
+        except Exception:  # notify() must never break the trade path
+            pass
+    crm_ctx.risk_inputs_unverified = reason
+
+
+async def _refresh_daily_counters_unchecked(
+    shared: dict[str, Any], crm_ctx: Any, risk_fail: list[str]
+) -> None:
     """Refresh day-scoped CRM counters from the DB on every scan cycle.
 
     new_trades_today / open_position_count / daily_loss_so_far / consecutive_losses
@@ -2462,7 +2498,8 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
         crm_ctx.open_exposure_rupees = sum(
             float(p.quantity) * float(p.fill_price) for p in _monitored_all
         )
-        _update_open_risk_and_sector_exposure(crm_ctx, _monitored_all)
+        if _fail := _update_open_risk_and_sector_exposure(crm_ctx, _monitored_all):
+            risk_fail.append(_fail)
         # Open risk is a risk budget, so it IS mode-split (paper never uses live's).
         try:
             _mor: dict[str, float] = {}
@@ -2485,8 +2522,9 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
                         _mor[_lb] = _mor.get(_lb, 0.0) + _r
                         _mor[f"{_lb}:{_eng}"] = _mor.get(f"{_lb}:{_eng}", 0.0) + _r
             crm_ctx.mode_open_risk_rupees = _mor
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.error("mode_open_risk_recompute_failed err=%s", exc)
+            risk_fail.append(f"mode_open_risk: {str(exc)[:120]}")
     else:
         om = shared.get("order_monitor")
         if om is not None:
@@ -2494,7 +2532,8 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
             crm_ctx.open_exposure_rupees = sum(
                 float(p.quantity) * float(p.fill_price) for p in _monitored_all
             )
-            _update_open_risk_and_sector_exposure(crm_ctx, _monitored_all)
+            if _fail := _update_open_risk_and_sector_exposure(crm_ctx, _monitored_all):
+                risk_fail.append(_fail)
 
     pe = shared.get("paper_ledger")
     if pe is not None:
@@ -2587,8 +2626,9 @@ async def _refresh_daily_counters(shared: dict[str, Any], crm_ctx: Any) -> None:
             _li_counts = shared.setdefault("llm_intraday_traded", {})
             _li_counts[_li_day] = max(int(_li_counts.get(_li_day, 0)), _llm_intraday_db_count)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.error("daily_counter_reseed_failed err=%s", exc)
+            risk_fail.append(f"daily_counters: {str(exc)[:120]}")
     _om_fallback = shared.get("order_monitor")
     if _om_fallback is not None:
         crm_ctx.open_position_count = len(_om_fallback.get_monitored())
@@ -4621,8 +4661,26 @@ async def _expectancy_loop(
                             message=f"Strategy {strat} E negative {result.consecutive_negative} consecutive — auto-paused",
                             remediation_hint="walk-forward backtest required before resume",
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # The pause above already happened; only the incident record failed.
+                        # Without this the operator never learns a strategy was auto-paused.
+                        _log.error("strategy_decay_incident_failed strat=%s err=%s", strat, exc)
+                        try:
+                            from src.notifications import EventKind, notify
+
+                            notify(
+                                EventKind.STRATEGY_ERROR,
+                                is_paper=False,
+                                strategy=strat,
+                                dedupe_key=f"strategy_decay:{strat}",
+                                reason=(
+                                    f"Strategy {strat} auto-paused (E negative "
+                                    f"{result.consecutive_negative} consecutive); "
+                                    f"incident write failed: {str(exc)[:120]}"
+                                ),
+                            )
+                        except Exception:  # notify() must never break the trade path
+                            pass
                 shared.setdefault("backtest_queue", set()).add(strat)
             elif result.status == "WARNING" and _sup_repo is not None:
                 # §8.4: 20-trade E < 50% of all-time E
@@ -12700,12 +12758,12 @@ def _refresh_options_risk_budget(crm_ctx: Any) -> None:
 
 async def _hosted_margin(shared: dict[str, Any], desk: Any, broker: Any, is_paper: bool) -> float:
     """Margin input for a desk-hosted strategy in ITS OWN mode: the paper sleeve when paper,
-    the live broker's real free cash when live."""
+    the live broker's F&O-usable margin (cash + collateral) when live."""
     if is_paper:
         return float(desk.paper_sleeve_margin())
     # Primary live stack: the options desk is single-broker until its executors are keyed.
     live_broker = (_pick_stack(shared, False) or {}).get("broker") or broker
-    return float((await live_broker.get_margins()).available_cash)
+    return float((await live_broker.get_margins()).fno_usable)
 
 
 async def _hosted_options_step(
@@ -13021,7 +13079,7 @@ async def _seller_desk_loop(shared: dict[str, Any], stop: asyncio.Event) -> None
                             else:
                                 _margins = await broker.get_margins()
                                 _available_margin = desk.available_margin(
-                                    float(_margins.available_cash)
+                                    float(_margins.fno_usable)
                                 )
                             await desk.run_cycle(
                                 f"NSE:{root}",

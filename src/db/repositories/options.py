@@ -29,6 +29,7 @@ def _serialize_leg(leg: OptionLeg) -> dict[str, object]:
         "lot_size": leg.lot_size,
         "premium": leg.premium,
         "delta": leg.delta,
+        "product": leg.product,
     }
 
 

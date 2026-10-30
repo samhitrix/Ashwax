@@ -379,6 +379,9 @@ class CRMContext:
     quality_raise: float = 0.0  # cost erosion override: 5=HIGH, 10=CRITICAL
     capital_critical: bool = False  # CRITICAL capital drift — halt new trades
     halt_trading_weeks: bool = False  # consecutive negative weeks >= halt_after_negative_weeks
+    # Non-empty = the last counter/open-risk refresh failed, so the caps below would be
+    # judged on 0 or stale figures. Blocks new entries until the next good refresh.
+    risk_inputs_unverified: str = ""
 
     # Phase 4 — calibration-raised min confidence thresholds per strategy (set by calibration_loop)
     calibration_thresholds: dict[str, float] = field(default_factory=dict)
@@ -962,6 +965,16 @@ class CentralRiskManager:
                 "G2",
                 GateDecision.BLOCK,
                 "Trading halted: consecutive negative weeks exceeded limit",
+            )
+
+        # Equity inputs only (equity open risk + paper_trades/trades counters); options
+        # risk is refreshed separately, so a failure here must not skip the daily
+        # options premium entries.
+        if ctx.risk_inputs_unverified and signal.asset_class != "options":
+            return GateResult(
+                "G2",
+                GateDecision.BLOCK,
+                f"Risk inputs unverified: {ctx.risk_inputs_unverified}",
             )
 
         if ctx.correlation_block:

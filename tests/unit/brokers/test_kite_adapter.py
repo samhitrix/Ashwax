@@ -785,6 +785,34 @@ def test_margins_prefers_explicit_cash_when_present() -> None:
     assert m.available_cash == pytest.approx(750.0)
 
 
+def test_fno_margin_counts_collateral_but_cash_stays_cash_only() -> None:
+    """Found live 2026-10-29: the SENSEX straddle needed 258513 and was refused against
+    'have 31024' -- the cash-only figure -- with lakhs of pledged collateral the broker
+    accepts for F&O. Kite's `net` (cash + collateral - utilised) is the F&O figure;
+    available_cash stays cash-only for CNC."""
+    from src.brokers.adapters.kite.adapter import _margin_from_kite
+
+    m = _margin_from_kite(
+        {
+            "equity": {
+                "net": 531024.0,
+                "available": {"cash": 31024.0, "live_balance": 31024.0, "collateral": 500000.0},
+                "utilised": {"debits": 0},
+            }
+        }
+    )
+
+    assert m.available_cash == pytest.approx(31024.0)
+    assert m.fno_usable == pytest.approx(531024.0)
+    assert m.fno_usable > 258513  # today's SENSEX straddle fits
+
+
+def test_fno_usable_falls_back_to_cash_when_broker_reports_no_fno_figure() -> None:
+    from src.brokers.base import Margin
+
+    assert Margin(equity=100.0, available_cash=40.0, used_margin=0.0).fno_usable == 40.0
+
+
 # ── GTT modify: full-spec rebuild (2026-08-28) ────────────────────────────────
 
 

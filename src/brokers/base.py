@@ -160,6 +160,15 @@ class Margin:
     available_cash: float
     used_margin: float
     collateral: float = 0.0
+    # Margin usable for F&O: free cash + pledged collateral, net of margin already used. None when
+    # the broker doesn't report it (fno_usable then falls back to available_cash).
+    fno_available: float | None = None
+
+    @property
+    def fno_usable(self) -> float:
+        """Margin an F&O order may draw on. available_cash alone is cash-only (right for CNC
+        delivery) and wrongly ignores collateral, which the broker does accept for F&O."""
+        return self.fno_available if self.fno_available is not None else self.available_cash
 
 
 @dataclass

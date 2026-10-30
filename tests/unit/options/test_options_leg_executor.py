@@ -317,3 +317,38 @@ async def test_close_leg_returns_none_when_broker_get_ltp_raises() -> None:
     exit_price = await ex.close_leg(leg, "SIG1")
     assert exit_price is None
     assert len(broker.placed) == 1  # close still proceeds despite the LTP failure
+
+
+async def test_mis_leg_enters_and_closes_as_mis_never_nrml() -> None:
+    """An NRML close against an MIS short opens a new position instead of flattening it, so
+    every order for a leg must carry that leg's own product."""
+    from dataclasses import replace
+
+    leg = replace(_leg(24400, "SELL", "CE"), product="INTRADAY")
+    broker = _FakeBroker(fills_after=1, ltp={leg.tradingsymbol: 10.0})
+    ex = _executor(broker)
+    await ex.execute_structure(protection_legs=[], income_legs=[leg], signal_id="SIG1")
+    await ex.close_leg(leg, "SIG1")
+    assert [o.product for o in broker.placed] == ["INTRADAY", "INTRADAY"]
+
+
+async def test_legs_default_to_nrml() -> None:
+    broker = _FakeBroker(fills_after=1)
+    ex = _executor(broker)
+    await ex.execute_structure(
+        protection_legs=[_leg(23600, "BUY", "PE")],
+        income_legs=[_leg(24400, "SELL", "CE")],
+        signal_id="SIG1",
+    )
+    assert {o.product for o in broker.placed} == {"MARGIN"}
+
+
+def test_product_survives_db_round_trip() -> None:
+    """Restart restores legs from the stored JSON; losing the product would make the
+    restored MIS leg close with an NRML order."""
+    from dataclasses import replace
+
+    from src.db.repositories.options import _serialize_leg
+
+    leg = replace(_leg(24400, "SELL", "CE"), product="INTRADAY")
+    assert OptionLeg(**_serialize_leg(leg)) == leg

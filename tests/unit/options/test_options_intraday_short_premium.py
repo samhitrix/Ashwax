@@ -130,7 +130,7 @@ def test_defaults_are_the_users_tested_strangle() -> None:
     "bad",
     [
         {"allow_naked": False},  # wing_points 0 + not opted in
-        {"exit_time": "15:11"},
+        {"exit_time": "16:00"},  # after the F&O close: could never fill
         {"entry_time": "15:00", "exit_time": "14:00"},
         {"sl_pct": 0},
         {"sl_pct": 600},
@@ -201,6 +201,7 @@ async def test_enters_inside_window_with_own_name_and_sl_defined_risk() -> None:
     assert ex.executed and ex.executed[0][0] == []  # no protection legs: naked by opt-in
     assert pos.meta["sl_pct"] == {"CE": 23.0, "PE": 23.0} and pos.meta["exit_time"] == "15:01"
     assert desk._repo.metas  # rules frozen at entry were persisted
+    assert {leg.product for leg in pos.income_legs} == {"INTRADAY"}  # sent as MIS
 
 
 @pytest.mark.parametrize(
@@ -264,10 +265,10 @@ async def test_not_blocked_by_other_open_positions_or_per_index_cap(
 
 async def test_strategy_halt_and_entry_breaker_still_apply() -> None:
     desk, ex = _new_desk()
-    desk._strategy_halted_day[_NAME] = _MON
+    desk._strategy_halted_day[(_NAME, True)] = _MON
     assert await _enter(desk) is None
     desk2, ex2 = _new_desk()
-    desk2._entries_halted_day = _MON
+    desk2._entries_halted_by_mode[True] = _MON
     assert await _enter(desk2) is None and ex2.executed == [] and ex.executed == []
 
 
@@ -548,6 +549,8 @@ async def test_restart_restores_closed_leg_and_frozen_rules() -> None:
         "SP"
     ]  # the stopped leg is NOT re-opened
     assert pos.closed_pnl == pytest.approx(-(9.5 * 65)) and pos.meta["exit_time"] == "15:01"
+    # A row saved before legs carried a product was placed NRML -- it must close as NRML.
+    assert pos.income_legs[0].product == "MARGIN"
 
 
 async def test_open_short_premium_is_not_counted_against_the_desks_g7_cap() -> None:

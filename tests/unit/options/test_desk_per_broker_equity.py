@@ -138,7 +138,7 @@ async def test_desk_breaker_halts_only_the_broker_that_breached(caplog) -> None:
     desk._add_realized(-(2_000_000.0 * halt_pct / 100.0) * 1.5, "iron_condor", "live:angel_one")
     await desk.sweep_portfolio_risk(today=now.date(), current_prices={}, chains={}, now=now)
     assert desk._entries_halted_keys == {"live:angel_one": now.date()}
-    assert desk._entries_halted_day != now.date()  # the combined (primary) breaker did not trip
+    assert desk._entries_halted_by_mode.get(False) != now.date()  # live breaker did not trip
 
     # The expiry-day fly routed to angel is refused at execution; routed to kite it trades.
     desk._entries_halted_keys["live:angel_one"] = _EXP
