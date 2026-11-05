@@ -1,0 +1,50 @@
+{
+  "_held_at_shadow_2026_09_23": "Operator request: NO learning key is 'live' — every mechanism runs and logs but changes no decision. The '_note' fields below that say 'Safe to flip' describe the earlier live setting and are historical.",
+  "_comment": "Every mode is off|shadow|live. off = mechanism doesn't run. shadow = runs, computes, logs (incl. comparison vs current live behavior where one exists) but never affects a live decision. live = its output actually affects the live decision. See prompt.md (Learning section) and the wiring plan for what each key gates.",
+  "signal_ranker": {
+    "mode": "shadow",
+    "mode_intraday": "shadow",
+    "mode_swing": "shadow",
+    "_swing_note": "HELD at shadow, not live, on purpose: config/global.json swing.paper_mode is false — swing trades REAL MONEY today, and this ranker has zero live track record (built this session, never run even once outside unit tests). Flipping this specific key is the one change in this file that directly changes which real-money trade gets picked. Flip to \"live\" only after you've reviewed some shadow-mode logs (swing_sqs_shadow) and are satisfied the SQS picks look sane vs the legacy ranker."
+  },
+  "promotion": {
+    "mode": "off",
+    "_note": "HELD at off, not live, on purpose: live mode lets the weekly evolution loop automatically WRITE a mutated parameter set into a real strategy's live config (config/strategy_{NAME}.json), with no human review step — and this can apply to real-money swing strategies, not just paper ones. This is exactly the kind of automated live-behavior change this project's own CLAUDE.md rules require validation before (\"never modify live trading behavior without validation\"). Recommend: run a few weekly cycles at \"off\" first, manually review logs/evolution_report.json's would_promote entries, and only then flip to live once you trust a specific promotion."
+  },
+  "apply_promoted_overrides": {
+    "mode": "off",
+    "_note": "HELD at off for the same reason as promotion.mode above — this is the second half of the same real-money-strategy-mutation risk (this one applies an already-promoted override at strategy load time). Flip together with promotion.mode, not independently."
+  },
+  "expectancy_resume": {
+    "mode": "shadow",
+    "_note": "Safe to flip: this makes resume-from-pause STRICTER (requires a passing walk-forward backtest, not just live win-rate recovery) — the risk direction is \"a struggling strategy stays paused longer than before\", never \"trades more than before\"."
+  },
+  "failure_scorer": {
+    "mode": "shadow",
+    "_note": "Safe to flip: only biases which PARAM gets mutated during the weekly evolution loop's candidate generation — doesn't affect live trading directly, and promotion.mode is still off so no mutation reaches a real strategy regardless."
+  },
+  "strategy_selector": {
+    "mode": "shadow",
+    "_note": "Safe to flip: a bounded 0.5x-1.0x tie-break multiplier on top of the SQS ranking score — never zeroes out a candidate, only reorders among already-qualifying ones."
+  },
+  "universe_adapter": {
+    "mode": "shadow",
+    "_note": "By explicit design decision this layer never enforces regardless of mode value — no code path exists that actually filters the tradeable universe (see the learning-engine wiring plan, decision #4/#3). \"shadow\" here is just for clean logging; there is no \"live\" behavior to opt into yet."
+  },
+  "causal_memory": {
+    "mode": "off",
+    "_note": "HELD at off on purpose: the 2026-08-20 LLM-backfill failure this flag originally guarded against (real causal analysis failing on every trade despite an isolated raw LLM call succeeding) was never re-verified as fixed in this session (no live LLM/DB access here). Flipping this blind risks silently repeating that exact failure. Verify with a manual analyse_and_store() test run first (see PR6 in the wiring plan), then flip."
+  },
+  "options_ev_calibration": {
+    "mode": "shadow",
+    "_note": "Safe to flip — options is paper-only today (config/global.json options.paper_mode=true) regardless. Currently a NO-OP either way: config/options_settings.json's ev_calibration block is still unpopulated (every structure_type is null) since populating it needs a real backtest run against your DB, which this session couldn't do (no DB access here). Run scripts/backtest_options_seller_regime.py --all-structures --backfill against your real NIFTY/BANKNIFTY/FINNIFTY history, review the output, then hand-fill the config block — this mode is already ready and waiting for that data."
+  },
+  "options_structure_exit_tracking": {
+    "mode": "shadow",
+    "_note": "Safe to flip — paper-only broker regardless of mode. This is the one that actually needs to be live now: it's what starts producing real closed-structure outcomes (realized_pnl/entry_conviction), which options_conviction_calibration below depends on. Nothing useful happens until this runs for a while."
+  },
+  "options_conviction_calibration": {
+    "mode": "shadow",
+    "_note": "Safe to flip — paper-only regardless, and depends on options_structure_exit_tracking (above) to actually produce data first. Will sit idle (0 closed structures) until enough buyer-first options trades close."
+  }
+}

@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+config/.machine_secrets.dat
+
+# Logs
+logs/
+*.log
+*.log.gz
+
+# Market data (re-fetchable, large)
+data/ohlcv/
+data/parquet/
+*.parquet
+
+# Wheel verification scratch (created by TASK.md Phase 0 script)
+.wheel-check/
+
+# Local scratch / experiments
+scratch/
+tmp/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Build / dist
+dist/
+build/
+*.egg
+
+# Dashboard (React)
+dashboard_react/node_modules/
+dashboard_react/dist/
+dashboard_react/.vite/
+
+# Backups
+backups/
+config/.backups/
+*.bak
+*.dump
+
+# Playwright MCP scratch artifacts
+.playwright-mcp/
+
+graphify-out/
+
+# Runtime state / personal trade records
+data/deleted_trades/
+data/.backfill_done
+
+# Internal design / working docs -- kept locally, not published.
+# (README.md, LICENSE and config/examples/README.md are the public docs.)
+/prompt.md
+/options_spec.md
+/ORB.md
+/claude.md
+/CLAUDE.md
+/docs/
+
+# py-spy binary used by launcher hang-dump (copy of the pip py-spy.exe; see launcher._find_pyspy)
+tools/bin/
+
+# Internal design / working docs -- kept locally, not published.
+/prompt.md
+/options_spec.md
+/ORB.md
+/claude.md
+/CLAUDE.md
+/changes.md
+/docs/

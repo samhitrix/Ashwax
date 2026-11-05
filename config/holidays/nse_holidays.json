@@ -1,0 +1,23 @@
+{
+  "year": 2026,
+  "exchange": "NSE",
+  "holidays": [
+    {"date": "2026-01-15", "name": "Maharashtra Municipal Elections"},
+    {"date": "2026-01-26", "name": "Republic Day"},
+    {"date": "2026-03-03", "name": "Holi"},
+    {"date": "2026-03-26", "name": "Shri Ram Navami"},
+    {"date": "2026-03-31", "name": "Mahavir Jayanti"},
+    {"date": "2026-04-03", "name": "Good Friday"},
+    {"date": "2026-04-14", "name": "Dr. Ambedkar Jayanti"},
+    {"date": "2026-05-01", "name": "Maharashtra Day"},
+    {"date": "2026-05-28", "name": "Bakri Id"},
+    {"date": "2026-06-26", "name": "Muharram"},
+    {"date": "2026-09-14", "name": "Ganesh Chaturthi"},
+    {"date": "2026-10-02", "name": "Mahatma Gandhi Jayanti"},
+    {"date": "2026-10-20", "name": "Dussehra"},
+    {"date": "2026-11-10", "name": "Diwali Balipratipada"},
+    {"date": "2026-11-24", "name": "Guru Nanak Jayanti"},
+    {"date": "2026-12-25", "name": "Christmas"}
+  ],
+  "note": "NSE equity-segment full trading holidays (weekday closures only). Weekend-falling festivals and the Diwali Muhurat special session are excluded. Verify against the official NSE circular before each year: https://www.nseindia.com/resources/exchange-communication-holidays"
+}

@@ -1,0 +1,46 @@
+{
+  "_options": {
+    "_note": "LLM-originated discretionary swing agent -- NOT a chart-pattern strategy evaluated through the normal per-bar USS compiler. Real signal generation lives entirely in src/strategies/llm_swing/pipeline.py (once-daily pre-market reasoning pass over regime/RS/sector-rotation technicals, plus fundamentals_snapshot once available) and src/orchestrator.py's _llm_swing_scan_loop, which reuses _execute_swing_signal for the full CRM/cash/dedup/order-placement pipeline -- identical reuse to vcp_swing_pipeline. The entry_conditions below are deliberately impossible (RSI can never exceed 1000) so this spec is inert if evaluated through the normal per-bar scan -- it exists ONLY so this strategy is visible/toggleable in strategies_registry.json like every other strategy. stop_loss/target here are NOT used by the real pipeline -- the LLM proposes its own entry/SL/target per candidate idea, subject to the same G0-G9 CRM gates as any other signal.",
+    "_source": "2026-09-04 session -- built per user request for a fully-automated LLM-originated trading agent. execution_mode (see strategies_registry.json entry) is the ONE human-edited control deciding paper vs live for this strategy -- currently 'live' (2026-09-22 operator decision). This is a discretionary, unvalidated-by-backtest strategy by nature (there is no fixed rule set to backtest); every candidate it originates still passes through the full G0-G9 CRM gate sequence."
+  },
+  "meta": {
+    "name": "llm_swing_agent",
+    "display_name": "LLM Swing Agent",
+    "version": "1.0",
+    "product": "DELIVERY",
+    "direction": "LONG",
+    "timeframe": "DAILY"
+  },
+  "universe_filter": {
+    "min_price": 50,
+    "min_adv_crores": 50,
+    "exchanges": ["NSE"],
+    "index_filter": "NIFTY500"
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 10.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 3.0
+  },
+  "exit_conditions": {
+    "time_stop_days": 0
+  }
+}

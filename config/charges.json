@@ -1,0 +1,50 @@
+{
+  "_note": "Per-broker, per-segment charge rates used by src/risk/real_pnl.py for after-cost P&L. Edit here, not in code; changes apply without a restart. Active broker = config/global.json broker.name; paper trades use paper_rates_broker. Any key omitted falls back to the code default. Percent fields are fractions (0.001 = 0.10%). STT/exchange/SEBI/stamp/GST are statutory (same for all brokers); brokerage and DP differ per broker. angel_one values are COPIED from kite as a placeholder and are NOT verified against Angel One's tariff - check before going live on it.",
+  "paper_rates_broker": "kite",
+  "brokers": {
+    "kite": {
+      "equity": {
+        "brokerage_flat": 20.0,
+        "brokerage_max_pct": 0.0003,
+        "stt_delivery_sell_pct": 0.001,
+        "stt_intraday_sell_pct": 0.00025,
+        "exchange_pct": 0.0000297,
+        "sebi_per_crore": 10.0,
+        "stamp_delivery_buy_pct": 0.00015,
+        "stamp_intraday_buy_pct": 0.00003,
+        "gst_rate": 0.18,
+        "dp_charge_per_scrip": 15.93
+      },
+      "options": {
+        "brokerage_flat": 20.0,
+        "stt_sell_pct": 0.0015,
+        "exchange_pct": 0.0003553,
+        "sebi_per_crore": 10.0,
+        "stamp_buy_pct": 0.00003,
+        "gst_rate": 0.18
+      }
+    },
+    "angel_one": {
+      "equity": {
+        "brokerage_flat": 20.0,
+        "brokerage_max_pct": 0.0003,
+        "stt_delivery_sell_pct": 0.001,
+        "stt_intraday_sell_pct": 0.00025,
+        "exchange_pct": 0.0000297,
+        "sebi_per_crore": 10.0,
+        "stamp_delivery_buy_pct": 0.00015,
+        "stamp_intraday_buy_pct": 0.00003,
+        "gst_rate": 0.18,
+        "dp_charge_per_scrip": 15.93
+      },
+      "options": {
+        "brokerage_flat": 20.0,
+        "stt_sell_pct": 0.0015,
+        "exchange_pct": 0.0003553,
+        "sebi_per_crore": 10.0,
+        "stamp_buy_pct": 0.00003,
+        "gst_rate": 0.18
+      }
+    }
+  }
+}

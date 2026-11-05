@@ -1,0 +1,67 @@
+{
+  "circuit_breakers": {
+    "daily_loss_limit_rupees": 4000,
+    "consecutive_loss_count": 4,
+    "connectivity_timeout_seconds": 30,
+    "news_blackout_enabled": true,
+    "vix_halt_threshold": 35,
+    "vix_reduce_threshold": 25,
+    "vix_spike_intraday_pct": 15,
+    "exchange_anomaly_silent_symbols_pct": 10,
+    "spread_threshold_pct": 0.5,
+    "_absolute_floor_pct_removed_note": "2026-10-07 Phase 4: the 25% equity-floor kill-switch now reads config/capital.json account.stop_all_trading_if_equity_falls_below (src/risk/floor_config.py) instead of this key, so CRM and the Supervisor can't silently drift from capital.json. Edit capital.json instead.",
+    "drawdown_velocity_pct_per_hour": 3.0
+  },
+  "hard_limits": {
+    "max_new_trades_per_day": 10,
+    "max_open_positions": 10,
+    "max_entry_chase_r": 0.75
+  },
+  "position_sizing": {
+    "method": "risk_based",
+    "risk_per_trade_rupees": 2000,
+    "mis_leverage": 5.0,
+    "max_adv_participation_pct": 1.0,
+    "_max_adv_participation_note": "Intraday qty <= this % of the stock's 20-day average daily volume. Above ~1% your own order moves the price and the stop fills far worse than planned. Rarely binds at today's ticket sizes; it matters as capital grows."
+  },
+  "portfolio_risk": {
+    "max_intraday_open_risk_pct": 0.40,
+    "_note": "2026-09-22: intraday open risk (stop-to-fill, losing side only, per paper/live mode) may not exceed 0.40% of total capital = 4,000 on 10L, the same as the daily loss limit, so open intraday risk can never exceed what the day is allowed to lose. On 2026-09-22 three correlated shorts were open with ~4,110 at risk (the third would now be blocked). max_open_risk_pct (portfolio-wide, incl. real-money swing) deliberately left unset."
+  },
+  "volatility_adjustment": {
+    "vix_above_25_multiplier": 0.5,
+    "vix_above_35_multiplier": 0.0
+  },
+  "options_risk": {
+    "max_premium_at_risk_rupees": 4000,
+    "max_delta_exposure": 0.7,
+    "avoid_naked_selling": true
+  },
+  "drawdown_staircase": {
+    "tier_1_pct": 3, "tier_1_size_mult": 0.50, "tier_1_min_quality": 75,
+    "tier_2_pct": 5, "tier_2_size_mult": 0.25, "tier_2_regimes": ["STRONG_BULL"],
+    "tier_3_pct": 8, "tier_3_action": "HALT_ALL",
+    "tier_4_pct": 10, "tier_4_action": "CAPITAL_PRESERVATION",
+    "reset_on": "calendar_month_start"
+  },
+  "gap_risk": {
+    "enabled": true,
+    "low_max_pct": 3,
+    "medium_max_pct": 6,
+    "medium_reduce_pct": 50,
+    "high_action": "EXIT_FULLY",
+    "long_weekend_min": "MEDIUM"
+  },
+  "cost_tracking": {
+    "max_cost_pct_of_gross": 30,
+    "halt_after_negative_weeks": 4,
+    "auto_raise_quality_on_overtrade": 5
+  },
+  "backtest_override": {
+    "_note": "CRM G6 gate (src/risk/crm.py:_g6_strategy_health). When a strategy's periodic off-market backtest (src/orchestrator.py:_backtest_loop, startup + nightly 22:00 IST) fails, a live signal is not fully blocked — it may still trade if its own setup_quality_score (0-100) clears min_quality_score, sized down by size_mult.",
+    "min_quality_score": 85,
+    "min_quality_score_range": "0-100; higher = stricter. Must exceed the normal per-strategy min_quality_score (65/70) in config/strategies_registry.json to actually raise the bar for a backtest-failing strategy.",
+    "size_mult": 0.5,
+    "size_mult_range": "0.0-1.0 fraction of the CRM-approved quantity"
+  }
+}
