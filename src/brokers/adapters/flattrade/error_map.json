@@ -1,0 +1,14 @@
+{
+  "_note": "Substring match on Flattrade `emsg` (Not_Ok replies), first match wins. Messages are the ones documented in the Phase 0 findings A7; consumed by normalizer.py from task F3. The rate-limit text starts with 'Invalid Input', so it must stay above that entry. TOKEN is not retryable: there is no refresh, a human must re-login.",
+  "message_overrides": [
+    {"contains": "Session Expired",        "code": "TOKEN",      "retryable": false},
+    {"contains": "Invalid Session Key",    "code": "TOKEN",      "retryable": false},
+    {"contains": "exceeds Limit",          "code": "RATE_LIMIT", "retryable": true},
+    {"contains": "Server Timeout",         "code": "NETWORK",    "retryable": true},
+    {"contains": "No Data",                "code": "DATA",       "retryable": false},
+    {"contains": "Trigger price invalid",  "code": "INPUT",      "retryable": false},
+    {"contains": "Invalid AMO",            "code": "INPUT",      "retryable": false},
+    {"contains": "Order price cannot be zero", "code": "INPUT",  "retryable": false},
+    {"contains": "Invalid Input",          "code": "INPUT",      "retryable": false}
+  ]
+}

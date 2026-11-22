@@ -1,0 +1,126 @@
+{
+  "_note": "Details removed from the public copy.",
+  "strategies": [
+    {
+      "name": "minervini_vcp",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/minervini_vcp.json",
+      "enabled": false,
+      "min_quality_score": 65,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_disabled_note": "Details removed from the public copy."
+    },
+    {
+      "name": "oneil_canslim",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/oneil_canslim.json",
+      "enabled": false,
+      "min_quality_score": 70,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_disabled_note": "Details removed from the public copy."
+    },
+    {
+      "name": "news_catalyst_momentum",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/news_catalyst_momentum.json",
+      "enabled": false,
+      "min_quality_score": 60,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Entry is decided by the news-driven code path in orchestrator.py, not by entry_conditions (deliberately inert). See strategies/builtin/news_catalyst_momentum.json _options."
+    },
+    {
+      "name": "options_seller_desk_v3",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/options_seller_desk_v3.json",
+      "enabled": true,
+      "min_quality_score": 0,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "ASHWAX seller-first options desk. Real entry logic is _seller_desk_loop/SellerDesk.run_cycle() in orchestrator.py/seller_desk.py (not entry_conditions, deliberately inert -- matches news_catalyst_momentum's shim pattern). Real risk gating flows through CRM (G0-G10) via src/options/seller_crm_adapter.build_seller_crm_signal(). Live on/off switch remains config/execution.json options_execution.enabled + config/global.json system.segments.options.master_switch/paper_mode -- this registry entry is for listing/visibility only, toggling 'enabled' here has NO effect on the live loop (deliberate deviation from vcp_swing_pipeline's convention -- see CRM retrofit plan, section 1.6)."
+    },
+    {
+      "name": "breadth_gated_breakout",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/breadth_gated_breakout.json",
+      "enabled": true,
+      "min_quality_score": 65,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    },
+    {
+      "name": "flat_resistance_breakout",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/flat_resistance_breakout.json",
+      "enabled": true,
+      "min_quality_score": 65,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    },
+    {
+      "name": "options_intraday_short_premium2",
+      "llm_gate_required": false,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/options_intraday_short_premium2.json",
+      "enabled": true,
+      "min_quality_score": 0,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    },
+    {
+      "name": "options_expiry_day",
+      "llm_gate_required": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/options_expiry_day.json",
+      "enabled": true,
+      "min_quality_score": 0,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    },
+    {
+      "name": "options_intraday_short_premium",
+      "llm_gate_required": false,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/options_intraday_short_premium.json",
+      "enabled": true,
+      "min_quality_score": 0,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    },
+    {
+      "name": "llm_swing_agent",
+      "llm_originated": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/llm_swing_agent.json",
+      "enabled": true,
+      "min_quality_score": 65,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    },
+    {
+      "name": "llm_intraday_agent",
+      "llm_originated": true,
+      "source": "BUILTIN",
+      "spec_path": "strategies/builtin/llm_intraday_agent.json",
+      "enabled": true,
+      "min_quality_score": 65,
+      "execution_mode": "paper",
+      "broker": "paper",
+      "_note": "Details removed from the public copy."
+    }
+  ]
+}

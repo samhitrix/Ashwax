@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "name": "oneil_canslim",
+    "display_name": "O'Neil CANSLIM",
+    "version": "1.0",
+    "product": "DELIVERY",
+    "direction": "LONG",
+    "timeframe": "DAILY"
+  },
+  "universe_filter": {
+    "min_price": 100,
+    "min_adv_crores": 50,
+    "exchanges": ["NSE"],
+    "index_filter": "NIFTY500"
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "52w_breakout",
+        "type": "PRICE",
+        "params": {"operator": "price_above", "reference": "consolidation_high", "lookback": 260}
+      },
+      {
+        "name": "volume_confirmation",
+        "type": "VOLUME",
+        "params": {"operator": "volume_ratio_above", "ratio": 1.4, "avg_days": 50}
+      },
+      {
+        "name": "above_200_sma",
+        "type": "INDICATOR",
+        "params": {"indicator": "SMA", "period": 200, "operator": "price_above"}
+      },
+      {
+        "name": "rsi_range",
+        "type": "INDICATOR",
+        "params": {"indicator": "RSI", "period": 14, "operator": "value_between", "min": 50, "max": 80}
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 8.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 2.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "chandelier",
+      "chandelier_period": 22,
+      "chandelier_multiplier": 2.5
+    },
+    "time_stop_days": 45,
+    "partial_book_r": 1.0,
+    "trail_activation_r": 1.0,
+    "reversal_exit": true
+  }
+}

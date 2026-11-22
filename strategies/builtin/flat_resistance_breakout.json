@@ -1,0 +1,92 @@
+{
+  "_options": {
+    "_note": "Details removed from the public copy."
+  },
+  "meta": {
+    "name": "flat_resistance_breakout",
+    "display_name": "Flat Resistance Breakout",
+    "version": "1.0",
+    "product": "DELIVERY",
+    "direction": "LONG",
+    "timeframe": "DAILY"
+  },
+  "universe_filter": {
+    "min_price": 50,
+    "max_price": 5000,
+    "min_adv_crores": 10,
+    "exchanges": [
+      "NSE"
+    ],
+    "index_filter": "NIFTY500"
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "close_through_flat_weekly_resistance",
+        "type": "PRICE",
+        "params": {
+          "reference": "flat_resistance",
+          "buffer_pct": 1.0,
+          "min_close_location": 0.6,
+          "max_extension_atr": 2.0
+        }
+      },
+      {
+        "name": "volume_1_5x_50d_avg",
+        "type": "VOLUME",
+        "params": {
+          "condition": "volume_ratio_above",
+          "ratio": 1.5,
+          "average_days": 50
+        }
+      },
+      {
+        "name": "min_price",
+        "type": "PRICE",
+        "params": {
+          "condition": "price_above",
+          "threshold": 50
+        }
+      },
+      {
+        "name": "max_price",
+        "type": "PRICE",
+        "params": {
+          "condition": "price_below",
+          "threshold": 5000
+        }
+      },
+      {
+        "name": "turnover_10cr",
+        "type": "VOLUME",
+        "params": {
+          "condition": "turnover_above",
+          "threshold_crores": 10,
+          "average_days": 20
+        }
+      }
+    ]
+  },
+  "risk_pct": 0.25,
+  "stop_loss": {
+    "method": "resistance_level",
+    "atr_period": 14,
+    "atr_multiplier": 1.0,
+    "max_sl_pct": 8.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 20.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "atr_trail",
+      "atr_period": 14,
+      "atr_multiplier": 3.0
+    },
+    "trail_activation_r": 0.0,
+    "time_stop_days": null,
+    "reversal_exit": false
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "meta": {
+    "name": "minervini_vcp",
+    "display_name": "Minervini VCP",
+    "version": "1.2",
+    "product": "DELIVERY",
+    "direction": "LONG",
+    "timeframe": "DAILY"
+  },
+  "universe_filter": {
+    "min_price": 30,
+    "max_price": 3000,
+    "min_adv_crores": 25,
+    "max_market_cap_crores": 30000,
+    "exchanges": ["NSE"],
+    "index_filter": "NIFTY500"
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "trend_template",
+        "type": "INDICATOR",
+        "params": {"indicator": "TREND_TEMPLATE", "condition": "value_above", "threshold": 0.5}
+      },
+      {
+        "name": "weekly_low_floor",
+        "type": "INDICATOR",
+        "params": {"indicator": "WEEKLY_MAX_LOW", "condition": "price_above", "period": 52}
+      },
+      {
+        "name": "min_price",
+        "type": "PRICE",
+        "params": {"condition": "price_above", "threshold": 30}
+      },
+      {
+        "name": "max_price",
+        "type": "PRICE",
+        "params": {"condition": "price_below", "threshold": 3000}
+      },
+      {
+        "name": "min_volume",
+        "type": "VOLUME",
+        "params": {"condition": "volume_above", "threshold": 400000}
+      },
+      {
+        "name": "plus_di",
+        "type": "INDICATOR",
+        "params": {"indicator": "PLUS_DI", "condition": "value_above", "threshold": 25, "period": 14}
+      },
+      {
+        "name": "rsi_momentum",
+        "type": "INDICATOR",
+        "params": {"indicator": "RSI", "condition": "value_above", "threshold": 55, "period": 14}
+      },
+      {
+        "name": "rs_rating",
+        "type": "INDICATOR",
+        "params": {"indicator": "RS_PERCENTILE", "condition": "value_above", "threshold": 70, "period": 252}
+      },
+      {
+        "name": "vcp_contraction",
+        "type": "PATTERN",
+        "params": {"pattern": "vcp_contraction", "period1": 60, "period2": 30, "period3": 15}
+      },
+      {
+        "name": "breakout_or_pullback",
+        "type": "PATTERN",
+        "params": {"pattern": "breakout_or_pullback", "pivot_lookback_days": 15, "post_breakout_days": 10, "tight_days": 3, "max_daily_range_pct": 3.5, "volume_avg_days": 20, "volume_dryup_ratio": 0.8}
+      },
+      {
+        "name": "volume_surge",
+        "type": "VOLUME",
+        "params": {"condition": "volume_ratio_above", "ratio": 1.5, "avg_days": 20}
+      }
+    ]
+  },
+  "risk_pct": 0.25,
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 8.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 2.5
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "chandelier",
+      "chandelier_period": 22,
+      "chandelier_multiplier": 2.5
+    },
+    "time_stop_days": 20,
+    "partial_book_r": 1.0,
+    "trail_activation_r": 1.0,
+    "reversal_exit": true
+  }
+}

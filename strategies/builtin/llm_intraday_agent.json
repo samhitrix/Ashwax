@@ -1,0 +1,77 @@
+{
+  "_options": {
+    "_note": "Details removed from the public copy.",
+    "_source": "Details removed from the public copy."
+  },
+  "meta": {
+    "name": "llm_intraday_agent",
+    "display_name": "LLM Intraday Agent",
+    "version": "1.0",
+    "product": "MIS",
+    "direction": "BOTH",
+    "timeframe": "5MIN"
+  },
+  "universe_filter": {
+    "min_price": 100,
+    "min_adv_crores": 50,
+    "exchanges": [
+      "NSE"
+    ],
+    "index_filter": null
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 10.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 2.0
+  },
+  "exit_conditions": {
+    "trailing_stop": {
+      "method": "atr_trail",
+      "atr_period": 14,
+      "atr_multiplier": 1.5
+    },
+    "breakeven_at_r": 1.0,
+    "trail_activation_r": 1.5,
+    "reversal_exit": false,
+    "time_stop_days": 0,
+    "giveback_lock": {
+      "activate_mfe_r": 0.5,
+      "lock_fraction": 0.5
+    },
+    "time_decay": [
+      {
+        "at": "14:15",
+        "min_mfe_r": 0.3,
+        "lock_r": 0.0
+      },
+      {
+        "at": "14:45",
+        "lock_r": -0.5
+      }
+    ]
+  },
+  "intraday": {
+    "range_window": "0915-0920",
+    "entry_window": "0930-1430",
+    "exit_window": "1510-1514",
+    "timezone": "Asia/Kolkata"
+  }
+}

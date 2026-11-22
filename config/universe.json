@@ -1,0 +1,31 @@
+{
+  "_options": {
+    "_note": "JSON has no // comments, so this self-doc block is ignored by the loader.",
+    "cache_universe": "['NIFTY50', 'NIFTY100', 'NIFTY200', 'NIFTY500'] — consumed by src/market_data/ohlcv_downloader.py's --universe CLI default. Only nifty50/nifty500 currently wired there; nifty100/200 fall back to nifty50 until that script's dispatch is extended.",
+    "trade_universe": "['NIFTY50', 'NIFTY100', 'NIFTY200', 'NIFTY500'] — the GLOBAL default watchlist (src/orchestrator.py boot + intraday scan). Any other value silently falls back to NIFTY50. NIFTY100/200/500 require their data/nifty{100,200,500}_symbols.json cache to exist (fetched via `python -m src.market_data.ohlcv_downloader --universe nifty500`, etc.) — missing cache also falls back to NIFTY50 (logged as index_universe_cache_missing).",
+    "_per_strategy_override": "Swing (DAILY) strategies are NOT limited to trade_universe above — each strategy JSON's universe_filter.index_filter (e.g. minervini_vcp.json / oneil_canslim.json declare 'NIFTY500') is resolved independently by _swing_signal_scan_loop via the same NIFTY50/100/200/500 cache files. Set index_filter per-strategy to widen just that strategy's universe without changing the global default here."
+  },
+  "cache_universe": "NIFTY500",
+  "trade_universe": "NIFTY500",
+  "sectors": {
+    "enabled": true,
+    "rotation_tracking": true
+  },
+  "sector_indices": {
+    "symbols": [
+      "NIFTY AUTO", "NIFTY BANK", "NIFTY IT", "NIFTY FMCG", "NIFTY METAL",
+      "NIFTY PHARMA", "NIFTY REALTY", "NIFTY ENERGY", "NIFTY PSU BANK", "NIFTY FIN SERVICE",
+      "NIFTY HEALTHCARE", "NIFTY MEDIA", "NIFTY CONSR DURBL", "NIFTY OIL AND GAS", "NIFTY INFRA"
+    ],
+    "constituents_cache": "data/sector_constituents.json"
+  },
+  "rs_thresholds": {
+    "min_rs_to_trade": 65,
+    "blacklist_below": 30
+  },
+  "ohlcv": {
+    "history_years": 5,
+    "intraday_days_rolling": 100,
+    "max_concurrent_fetches": 9
+  }
+}

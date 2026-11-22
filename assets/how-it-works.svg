@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 760" width="1280" height="760" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#16a34a"/>
+    </marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+    <style>
+      .h   { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .t   { font-size: 13px; font-weight: 700; fill: #1e293b; }
+      .s   { font-size: 11.5px; fill: #334155; }
+      .m   { font-size: 10.5px; fill: #64748b; }
+      .chip{ font-size: 11px; font-weight: 600; }
+      .ln  { stroke: #64748b; stroke-width: 1.6; fill: none; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="760" rx="14" fill="#ffffff"/>
+
+  <!-- ===== 1 Data in ===== -->
+  <text x="24" y="34" class="h">① Data in</text>
+  <g>
+    <rect x="20" y="48" width="220" height="92" rx="10" fill="#fff7ed" stroke="#fdba74"/>
+    <text x="34" y="70" class="t">Prices &amp; ticks</text>
+    <rect x="34" y="80" width="88" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="78" y="94" class="chip" text-anchor="middle" fill="#c2410c">Kite Connect</text>
+    <rect x="128" y="80" width="98" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="177" y="94" class="chip" text-anchor="middle" fill="#c2410c">Angel One (opt.)</text>
+    <text x="34" y="124" class="m">live LTP · OHLCV downloader · option chains</text>
+  </g>
+  <g>
+    <rect x="20" y="152" width="220" height="92" rx="10" fill="#fff7ed" stroke="#fdba74"/>
+    <text x="34" y="174" class="t">Exchange reference</text>
+    <rect x="34" y="184" width="104" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="86" y="198" class="chip" text-anchor="middle" fill="#c2410c">NSE bhavcopy</text>
+    <rect x="144" y="184" width="82" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="185" y="198" class="chip" text-anchor="middle" fill="#c2410c">F&amp;O expiry</text>
+    <text x="34" y="228" class="m">instruments · holidays · lot sizes · corp. actions</text>
+  </g>
+  <g>
+    <rect x="20" y="256" width="220" height="92" rx="10" fill="#fff7ed" stroke="#fdba74"/>
+    <text x="34" y="278" class="t">Fundamentals &amp; news</text>
+    <rect x="34" y="288" width="72" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="70" y="302" class="chip" text-anchor="middle" fill="#c2410c">yfinance</text>
+    <rect x="112" y="288" width="114" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="169" y="302" class="chip" text-anchor="middle" fill="#c2410c">News → LLM tag</text>
+    <text x="34" y="332" class="m">P/E · growth · catalyst / veto headlines</text>
+  </g>
+  <g>
+    <rect x="20" y="360" width="220" height="92" rx="10" fill="#fff7ed" stroke="#fdba74"/>
+    <text x="34" y="382" class="t">Market mood</text>
+    <rect x="34" y="392" width="92" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="80" y="406" class="chip" text-anchor="middle" fill="#c2410c">Regime (DMA)</text>
+    <rect x="132" y="392" width="94" height="20" rx="10" fill="#fff" stroke="#fdba74"/><text x="179" y="406" class="chip" text-anchor="middle" fill="#c2410c">Breadth · VIX</text>
+    <text x="34" y="436" class="m">bull / bear / choppy — how bold to be</text>
+  </g>
+  <rect x="20" y="466" width="220" height="44" rx="10" fill="#f0fdfa" stroke="#5eead4" stroke-dasharray="5 4"/>
+  <text x="130" y="484" class="s" text-anchor="middle" font-weight="700" fill="#0f766e">PostgreSQL = source of truth</text>
+  <text x="130" y="500" class="m" text-anchor="middle">migrations/ auto-applied on start</text>
+
+  <!-- connector data -> engines -->
+  <path class="ln" d="M240 94 H252 M240 198 H252 M240 302 H252 M240 406 H252 M252 94 V406 M252 250 H270" marker-end="url(#ah)"/>
+
+  <!-- ===== 2 Strategy engines ===== -->
+  <text x="274" y="34" class="h">② Strategy engines</text>
+  <rect x="272" y="48" width="236" height="462" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+  <g>
+    <rect x="286" y="62" width="208" height="112" rx="9" fill="#f0fdf4" stroke="#86efac"/>
+    <text x="390" y="84" class="t" text-anchor="middle" fill="#15803d">Swing (CNC)</text>
+    <text x="390" y="104" class="s" text-anchor="middle">breadth-gated breakout</text>
+    <text x="390" y="121" class="s" text-anchor="middle">LLM swing agent (idea generation)</text>
+    <text x="390" y="138" class="s" text-anchor="middle">USS JSON specs → compiled rules</text>
+    <text x="390" y="160" class="m" text-anchor="middle">stops = broker GTT</text>
+  </g>
+  <g>
+    <rect x="286" y="184" width="208" height="88" rx="9" fill="#eff6ff" stroke="#93c5fd"/>
+    <text x="390" y="206" class="t" text-anchor="middle" fill="#1d4ed8">Intraday (MIS)</text>
+    <text x="390" y="226" class="s" text-anchor="middle">LLM intraday agent (paper-locked)</text>
+    <text x="390" y="243" class="s" text-anchor="middle">pooled batch → signal ranker</text>
+    <text x="390" y="261" class="m" text-anchor="middle">EOD square-off · profit lock</text>
+  </g>
+  <g>
+    <rect x="286" y="282" width="208" height="128" rx="9" fill="#fdf2f8" stroke="#f9a8d4"/>
+    <text x="390" y="304" class="t" text-anchor="middle" fill="#be185d">Index options seller desk</text>
+    <text x="390" y="324" class="s" text-anchor="middle">credit spreads · iron condors</text>
+    <text x="390" y="341" class="s" text-anchor="middle">expiry-day / intraday strangles</text>
+    <text x="390" y="358" class="s" text-anchor="middle">Greeks budget · IV rank · events</text>
+    <text x="390" y="375" class="s" text-anchor="middle">rule-based delta adjustments</text>
+    <text x="390" y="397" class="m" text-anchor="middle">defined risk + per-leg stop</text>
+  </g>
+  <rect x="286" y="420" width="208" height="40" rx="20" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="390" y="437" class="s" text-anchor="middle" font-weight="700">strategies_registry.json</text>
+  <text x="390" y="452" class="m" text-anchor="middle">enable / disable · paper | live per strategy</text>
+  <rect x="272" y="478" width="236" height="32" rx="0" fill="#f59e0b"/>
+  <rect x="272" y="496" width="236" height="14" rx="0" fill="#f59e0b"/>
+  <text x="390" y="499" class="t" text-anchor="middle" fill="#fff">Signal = symbol · side · entry · SL · target</text>
+
+  <!-- engines -> CRM -->
+  <path class="ln" d="M508 250 H540" marker-end="url(#ah)"/>
+  <text x="524" y="242" class="m" text-anchor="middle" transform="rotate(-90 524 242)">signal</text>
+
+  <!-- ===== 3 Central Risk Manager ===== -->
+  <text x="546" y="34" class="h">③ Central Risk Manager</text>
+  <rect x="544" y="48" width="240" height="462" rx="12" fill="#f5f3ff" stroke="#a78bfa" stroke-width="1.5"/>
+  <g class="s">
+    <rect x="558" y="62"  width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="82">G0  master / kill switch</text>
+    <rect x="558" y="98"  width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="118">G1  hard caps (operator.json)</text>
+    <rect x="558" y="134" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="154">G2  circuit &amp; daily-loss breakers</text>
+    <rect x="558" y="170" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="190">G3  time-of-day windows</text>
+    <rect x="558" y="206" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="226">G4  market regime</text>
+    <rect x="558" y="242" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="262">G5  news veto</text>
+    <rect x="558" y="278" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="298">G6  strategy health</text>
+    <rect x="558" y="314" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="334">G7  portfolio &amp; margin</text>
+    <rect x="558" y="350" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="370">G8  stop-loss &amp; % risk sizing</text>
+    <rect x="558" y="386" width="212" height="30" rx="7" fill="#fce7f3" stroke="#f9a8d4"/><text x="572" y="406">G9  LLM confirmation  →  ④</text>
+    <rect x="558" y="422" width="212" height="30" rx="7" fill="#fff" stroke="#ddd6fe"/><text x="572" y="442">G10 autonomy mode</text>
+  </g>
+  <text x="664" y="474" class="m" text-anchor="middle">every order, every segment, no bypass</text>
+  <text x="664" y="490" class="m" text-anchor="middle">risk = % of live equity (capital.json)</text>
+  <text x="664" y="504" class="m" text-anchor="middle" fill="#dc2626" font-weight="700">any gate fails → no trade</text>
+
+  <!-- CRM -> AI -->
+  <path class="ln" d="M770 401 H812 V170 H830" marker-end="url(#ah)"/>
+
+  <!-- ===== 4 AI second opinion ===== -->
+  <text x="832" y="34" class="h">④ AI second opinion</text>
+  <rect x="830" y="48" width="200" height="240" rx="12" fill="#fdf2f8" stroke="#f472b6" stroke-width="1.5"/>
+  <circle cx="930" cy="92" r="26" fill="#fbcfe8"/>
+  <text x="930" y="100" text-anchor="middle" font-size="24">🤖</text>
+  <text x="930" y="140" class="t" text-anchor="middle" fill="#9d174d">G9 LLM reviewer chain</text>
+  <text x="930" y="158" class="m" text-anchor="middle">Gemini · Cloudflare · Groq</text>
+  <text x="930" y="172" class="m" text-anchor="middle">Anthropic · Ollama (failover)</text>
+  <rect x="846" y="184" width="52" height="22" rx="11" fill="#dcfce7"/><text x="872" y="199" class="chip" text-anchor="middle" fill="#15803d">Agree</text>
+  <rect x="904" y="184" width="52" height="22" rx="11" fill="#fef9c3"/><text x="930" y="199" class="chip" text-anchor="middle" fill="#a16207">Caution</text>
+  <rect x="962" y="184" width="54" height="22" rx="11" fill="#fee2e2"/><text x="989" y="199" class="chip" text-anchor="middle" fill="#b91c1c">Reject</text>
+  <text x="930" y="230" class="m" text-anchor="middle">reviewer ≠ model that had the idea</text>
+  <text x="930" y="246" class="m" text-anchor="middle">can veto a trade — never start one</text>
+  <text x="930" y="262" class="m" text-anchor="middle">every verdict journaled in DB</text>
+
+  <!-- AI -> Execute -->
+  <path class="ln" d="M1030 170 H1062" marker-end="url(#ahg)" stroke="#16a34a"/>
+  <text x="1046" y="160" class="m" text-anchor="middle" fill="#16a34a">pass</text>
+  <path class="ln" d="M930 288 V318" stroke="#dc2626" marker-end="url(#ahr)"/>
+  <rect x="850" y="320" width="160" height="40" rx="8" fill="#fef2f2" stroke="#fca5a5"/>
+  <text x="930" y="337" class="s" text-anchor="middle" fill="#b91c1c" font-weight="700">Rejected</text>
+  <text x="930" y="352" class="m" text-anchor="middle">logged with reason, not sent</text>
+
+  <!-- ===== 5 Execute ===== -->
+  <text x="1066" y="34" class="h">⑤ Execute</text>
+  <rect x="1064" y="48" width="196" height="240" rx="12" fill="#eef2ff" stroke="#818cf8" stroke-width="1.5"/>
+  <rect x="1078" y="62" width="168" height="48" rx="8" fill="#fff" stroke="#c7d2fe"/>
+  <text x="1162" y="82" class="t" text-anchor="middle">Paper engine</text>
+  <text x="1162" y="99" class="m" text-anchor="middle">default · simulated fills + costs</text>
+  <rect x="1078" y="118" width="168" height="48" rx="8" fill="#fff" stroke="#c7d2fe"/>
+  <text x="1162" y="138" class="t" text-anchor="middle">Live broker</text>
+  <text x="1162" y="155" class="m" text-anchor="middle">opt-in per segment &amp; strategy</text>
+  <text x="1078" y="190" class="s">• protective stop placed first</text>
+  <text x="1078" y="208" class="s">• order monitor + reconciler</text>
+  <text x="1078" y="226" class="s">• trailing / time stops</text>
+  <text x="1078" y="244" class="s">• EOD square-off (intraday)</text>
+  <text x="1078" y="262" class="s">• append-only trade ledger</text>
+  <text x="1162" y="280" class="m" text-anchor="middle">brokerage · STT · GST modeled</text>
+
+  <!-- Execute -> Watch -->
+  <path class="ln" d="M1162 288 V392" marker-end="url(#ah)"/>
+
+  <!-- ===== 6 Watch & learn ===== -->
+  <rect x="1000" y="396" width="260" height="114" rx="14" fill="#2563eb"/>
+  <text x="1020" y="424" font-size="17" font-weight="700" fill="#fff">⑥ Watch &amp; learn</text>
+  <text x="1020" y="446" font-size="12" fill="#dbeafe">Supervisor invariants · Telegram alerts</text>
+  <text x="1020" y="464" font-size="12" fill="#dbeafe">React dashboard (real data only)</text>
+  <text x="1020" y="482" font-size="12" fill="#dbeafe">Learning engine: expectancy, PF, slippage</text>
+  <text x="1020" y="500" font-size="11" fill="#bfdbfe">you approve every promotion to live</text>
+
+  <!-- feedback loop -->
+  <path d="M1000 470 H860 V560 H390 V512" fill="none" stroke="#94a3b8" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#ah)"/>
+  <rect x="520" y="546" width="250" height="28" rx="14" fill="#fff" stroke="#cbd5e1"/>
+  <text x="645" y="565" class="s" text-anchor="middle">📊 feedback: health scores → G6, reports</text>
+
+  <!-- ===== Who does what ===== -->
+  <rect x="20" y="598" width="1240" height="146" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="40" y="624" class="t">Who does what</text>
+  <text x="40" y="648" class="s"><tspan font-weight="700">Data in:</tspan> prices, exchange files, fundamentals, news, market regime — stored in PostgreSQL.</text>
+  <text x="40" y="668" class="s"><tspan font-weight="700">Strategy engines:</tspan> each enabled strategy turns data into a signal with a stop already attached.</text>
+  <text x="40" y="688" class="s"><tspan font-weight="700">Central Risk Manager:</tspan> 11 gates in order; sizes the trade from % of equity; the first failing gate stops it.</text>
+  <text x="40" y="708" class="s"><tspan font-weight="700">AI second opinion:</tspan> an independent LLM may veto; it can never create or enlarge a trade.</text>
+  <text x="40" y="728" class="s"><tspan font-weight="700">Execute / Watch:</tspan> paper by default; live only when you switch it on per segment <tspan font-style="italic">and</tspan> per strategy.</text>
+  <text x="1240" y="728" class="m" text-anchor="end">Not financial advice.</text>
+</svg>

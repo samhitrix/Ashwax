@@ -1,0 +1,27 @@
+{
+  "ui": {
+    "theme": "dark",
+    "default_tab": "overview",
+    "auto_scroll_activity": true
+  },
+  "refresh_rates": {
+    "overview_sse_seconds": 2,
+    "order_monitor_seconds": 2,
+    "news_seconds": 30,
+    "signals_seconds": 15,
+    "trades_seconds": 30,
+    "strategies_seconds": 60,
+    "intelligence_minutes": 5,
+    "self_healing_seconds": 5,
+    "activity_seconds": 5,
+    "system_health_seconds": 10,
+    "agent_status_seconds": 5,
+    "paper_seconds": 5,
+    "learning_seconds": 60,
+    "logs_tail_seconds": 5
+  },
+  "sound": {
+    "enabled": true,
+    "volume": 70
+  }
+}

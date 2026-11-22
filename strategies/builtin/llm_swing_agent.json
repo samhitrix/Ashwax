@@ -1,0 +1,48 @@
+{
+  "_options": {
+    "_note": "Details removed from the public copy.",
+    "_source": "Details removed from the public copy."
+  },
+  "meta": {
+    "name": "llm_swing_agent",
+    "display_name": "LLM Swing Agent",
+    "version": "1.0",
+    "product": "DELIVERY",
+    "direction": "LONG",
+    "timeframe": "DAILY"
+  },
+  "universe_filter": {
+    "min_price": 50,
+    "min_adv_crores": 50,
+    "exchanges": [
+      "NSE"
+    ],
+    "index_filter": "NIFTY500"
+  },
+  "entry_conditions": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "name": "inert_never_fires",
+        "type": "INDICATOR",
+        "indicator": "RSI",
+        "period": 14,
+        "condition": "value_above",
+        "threshold": 1000
+      }
+    ]
+  },
+  "stop_loss": {
+    "method": "atr_based",
+    "atr_period": 14,
+    "atr_multiplier": 3.0,
+    "max_sl_pct": 10.0
+  },
+  "target": {
+    "method": "risk_reward",
+    "ratio": 3.0
+  },
+  "exit_conditions": {
+    "time_stop_days": 0
+  }
+}

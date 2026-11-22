@@ -1,0 +1,347 @@
+{
+  "_options": {
+    "_note": "Allowed values per field — JSON has no // comments, so this self-doc block is ignored by the loader (config is read via explicit .get() keys).",
+    "system.master_switch": "true => trading enabled; false => CRM gate G0 BLOCKS every trade (kill switch)",
+    "system.autonomy_mode": {
+      "manual": "CRM gate G10 BLOCKS every trade — each entry needs explicit human approval",
+      "assisted": "G10 passes; trades execute, but ask_mode (when enabled) surfaces them for review first — intended human-oversight mode",
+      "autonomous": "G10 passes; trades execute fully automatically with no human in the loop"
+    },
+    "system.paper_mode": "true => simulated paper_engine fills (no real orders); false => live broker orders (real money). Honors operator.json account.paper_mode_locked. GLOBAL ONLY — not yet segment-scoped.",
+    "system.shadow_mode": "true => evaluate/log signals without placing any order (observe-only); false => normal",
+    "system.log_level": [
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "system.log_retention_days": "Days to keep before deleting: service_stdout_stderr (NSSM-rotated service_std{out,err}-<timestamp>.log snapshots, one new file per restart, ops/service_setup.ps1) and audit (audit-YYYY-MM-DD.log, one new file per day). Per-component logs (src/infrastructure/logger.py _COMPONENTS) are NOT here -- those already self-cap via RotatingFileHandler (10MB x 5 backups). Cleanup runs once at every process start (src.infrastructure.logger.cleanup_old_logs) plus once/day via supervisor's retention loop for long uptimes.",
+    "system.segments": "Per-segment override for master_switch/autonomy_mode/shadow_mode/paper_mode, keyed by intraday (MIS) / swing (CNC) / options. A segment's master_switch is AND-ed with the top-level system.master_switch (top-level OFF always wins, whole-system kill switch). autonomy_mode/shadow_mode/paper_mode fall back to the top-level system.* value when a segment isn't listed here. paper_mode is per-segment and TRUE CONCURRENT: some segments can trade live while others trade paper in the same running process. operator.json account.paper_mode_locked still force-overrides every segment to paper regardless of this config.",
+    "broker.name": [
+      "kite",
+      "angel_one",
+      "paper"
+    ],
+    "market_data.providers": "ordered list of broker names; any of kite | angel_one | flattrade (flattrade serves REST-only data: one quote call per symbol at 200/min and no tick feed, so keep it BELOW kite as a fallback)",
+    "llm.trade_gate / llm.background / llm.discretionary": "Ordered provider chain, first available wins (skips any cloud provider missing its API key). Gemini/Groq are free-tier, Ollama is local/free, Anthropic/OpenAI are the only paid hops.",
+    "llm._model_roles": "Details removed from the public copy.",
+    "llm_swing.enabled": "true => src/strategies/llm_swing/ runs its once-daily reasoning pass and can originate trade ideas (still gated by strategies_registry.json's own enabled flag AND execution_mode); false => the module never runs (default).",
+    "fundamentals.enabled": "true => daily yfinance fetch runs and shadow-attaches fundamentals_shadow to signal.meta for logging (log-only, never read by CRM/G9 until a backtest validates it); false => the fetcher never runs, not even imported (default).",
+    "system.per_broker_equity": "false (default) => every live strategy is risk-gated exactly as before: one equity figure (the primary broker's), the operator.json total capital and the combined paper/live counters. true => each live broker is risk-gated on ITS OWN equity (fetched from that broker every 60 s; its baseline for the 25% floor and the drawdown staircase is its first-ever fetched equity, stored in the DB table broker_equity_baseline (migration 092) so a restart never resets it; only the operator resets it by deleting/updating that row and restarting), its own capital.json rupee caps (same percentages) and its own counters; a broker whose equity fetch fails, whose equity is below capital.json account.min_viable_equity_rupees, or whose live intraday daily-loss breaker fired takes NO new entries until it recovers / the next trading day (open positions are never auto-closed). Paper is unchanged either way. Turning this on changes live sizing: owner decision."
+  },
+  "system": {
+    "name": "ASHWAX",
+    "version": "3.0",
+    "master_switch": true,
+    "autonomy_mode": "autonomous",
+    "paper_mode": true,
+    "shadow_mode": false,
+    "per_broker_equity": false,
+    "log_level": "DEBUG",
+    "log_retention_days": {
+      "service_stdout_stderr": 14,
+      "audit": 30,
+      "master": 30
+    },
+    "_log_retention_days_note": "Details removed from the public copy.",
+    "segments": {
+      "intraday": {
+        "master_switch": true,
+        "autonomy_mode": "autonomous",
+        "shadow_mode": false,
+        "paper_mode": true
+      },
+      "swing": {
+        "master_switch": true,
+        "autonomy_mode": "autonomous",
+        "shadow_mode": false,
+        "paper_mode": true
+      },
+      "options": {
+        "master_switch": true,
+        "autonomy_mode": "autonomous",
+        "shadow_mode": false,
+        "paper_mode": true
+      }
+    }
+  },
+  "broker": {
+    "_note": "name: \"kite\" (Zerodha Kite Connect) | \"angel_one\" (Angel One SmartAPI) | \"paper\". Only one active at a time — see README.md Broker setup for credential setup per broker.",
+    "name": "kite",
+    "exchange": "NSE",
+    "currency": "INR",
+    "timezone": "Asia/Kolkata"
+  },
+  "market_data": {
+    "_note": "Details removed from the public copy.",
+    "providers": [
+      "kite",
+      "angel_one",
+      "flattrade"
+    ],
+    "failover": {
+      "max_consecutive_failures": 3,
+      "cooldown_seconds": 300
+    }
+  },
+  "llm": {
+    "trade_gate": [
+      "anthropic",
+      "cloudflare",
+      "groq",
+      "gemini"
+    ],
+    "background": [
+      "cloudflare",
+      "groq"
+    ],
+    "_background_note": "Details removed from the public copy.",
+    "discretionary": [
+      "anthropic",
+      "groq",
+      "cloudflare"
+    ],
+    "swing_g9": {
+      "providers": [
+        "gemini",
+        "cloudflare",
+        "groq"
+      ],
+      "chain_timeout_seconds": 60,
+      "_note": "Details removed from the public copy."
+    },
+    "intraday_g9": {
+      "providers": [
+        "gemini",
+        "cloudflare",
+        "groq"
+      ],
+      "chain_timeout_seconds": 60,
+      "_note": "Details removed from the public copy."
+    },
+    "options_g9": {
+      "providers": [
+        "anthropic",
+        "cloudflare",
+        "gemini",
+        "groq"
+      ],
+      "chain_timeout_seconds": 60,
+      "_note": "Details removed from the public copy."
+    },
+    "token_budgets": {
+      "enabled": true,
+      "daily_tokens": {
+        "news_classify": 30000,
+        "swing": 80000,
+        "intraday": 80000,
+        "options": 20000,
+        "background": 20000
+      },
+      "provider_daily_quota": {
+        "groq": 200000
+      },
+      "_note": "Details removed from the public copy."
+    },
+    "openai_compat": {
+      "_note": "Details removed from the public copy.",
+      "cloudflare": {
+        "base_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        "key_env": "CLOUDFLARE_API_TOKEN",
+        "account_env": "CLOUDFLARE_ACCOUNT_ID",
+        "model": "@cf/openai/gpt-oss-120b",
+        "timeout_seconds": 20
+      }
+    },
+    "gemini": {
+      "model": "gemini-3-flash-preview",
+      "models": [
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest"
+      ],
+      "model_timeout_seconds": 12,
+      "timeout_seconds": 40,
+      "_note": "Details removed from the public copy."
+    },
+    "groq": {
+      "model": "openai/gpt-oss-20b",
+      "timeout_seconds": 20
+    },
+    "ollama": {
+      "model": "qwen2.5:7b",
+      "base_url": "http://localhost:11434"
+    },
+    "_ollama_note": "Details removed from the public copy.",
+    "_ollama_news_model_placeholder": "unset -- add a real model name here once ollama is confirmed running, then reference it from llm.background ordering",
+    "anthropic": {
+      "model": "claude-sonnet-5",
+      "models": [
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5-1",
+        "claude-haiku-4-5-20251001"
+      ],
+      "model_timeout_seconds": 60,
+      "timeout_seconds": 75,
+      "_note": "Anthropic is used ONLY for origination (llm.discretionary) -- it is in no review chain, so these generous caps cannot slow any latency-sensitive gate. Sized to the origination caller's own budget (llm_swing.llm_timeout_secs 90): one frontier-model attempt gets a real 60s to think (cutting a reasoning model off mid-thought is what produced the truncated-JSON trade-day losses), and the 75s provider cap still leaves headroom for a groq fallback inside the caller's 90s if anthropic hangs outright. Genuine failures (quota / API errors) fail fast and hit the next model in `models` without consuming these caps."
+    },
+    "chain_models": {
+      "_note": "Details removed from the public copy.",
+      "trade_gate": {
+        "anthropic": [
+          "claude-haiku-4-5-20251001"
+        ]
+      },
+      "options_g9": {
+        "anthropic": [
+          "claude-haiku-4-5-20251001",
+          "claude-opus-5"
+        ]
+      }
+    },
+    "trade_gate_timeout_seconds": 3,
+    "health_probe": {
+      "startup_min_interval_minutes": 240,
+      "_note": "Details removed from the public copy."
+    },
+    "usage_guard": {
+      "alert_purposes": [
+        "swing",
+        "intraday",
+        "options"
+      ],
+      "soft_budget_purposes": [
+        "swing",
+        "intraday",
+        "options"
+      ],
+      "max_prompt_chars": {
+        "swing": 40000,
+        "intraday": 30000,
+        "options": 12000,
+        "default": 0
+      },
+      "duplicate_window_seconds": 900,
+      "reuse_duplicates": true,
+      "duplicate_retry_grace_seconds": 120,
+      "_reuse_duplicates_note": "Details removed from the public copy.",
+      "failover_alert_dedupe_minutes": 10,
+      "_note": "Details removed from the public copy."
+    },
+    "gate_transient_retries": 3,
+    "origination_transient_retries": 5,
+    "background_transient_retries": 1,
+    "_retries_note": "Details removed from the public copy."
+  },
+  "equity": {
+    "screener": {
+      "cache_universe": "NIFTY500",
+      "universe": "NIFTY500",
+      "ohlcv_history_years": 5,
+      "max_concurrent_fetches": 9
+    }
+  },
+  "agent_intelligence": {
+    "strategy_creation_mode": "suggest_only",
+    "can_create_strategies": true,
+    "max_active_agent_strategies": 3,
+    "paper_trial_days_before_live": 10
+  },
+  "llm_swing": {
+    "enabled": true,
+    "llm_timeout_secs": 90,
+    "memory_lookback_days": 14,
+    "memory_trades": 10,
+    "max_calls_per_day": 2,
+    "reentry_cooldown_days": 10,
+    "block_regimes": [
+      "STRONG_BEAR"
+    ],
+    "_block_regimes_2026_10_06_note": "Details removed from the public copy.",
+    "_block_regimes_note": "Details removed from the public copy.",
+    "_reentry_cooldown_days_note": "Details removed from the public copy.",
+    "_max_calls_per_day_note": "HARD CAP on how many times llm_swing_agent may ASK the LLM per IST day. Counts every call actually SENT (from DB table llm_call_log, written before the call), including calls that fail or are killed mid-flight, and survives restarts. A successful pass also latches the day (one good pass = done), so 2 means: one call, plus at most one retry if the first fails. If the count cannot be read, no call is made.",
+    "max_candidates_per_day": 3,
+    "max_proposals": 8,
+    "_note": "Details removed from the public copy."
+  },
+  "llm_intraday": {
+    "enabled": true,
+    "universe_size": 10,
+    "min_adv_crores": 50,
+    "_menu_note": "Details removed from the public copy.",
+    "max_ideas_per_llm_call": 2,
+    "_max_ideas_per_llm_call_note": "Details removed from the public copy.",
+    "trigger": {
+      "min_setup_score": 30,
+      "min_gap_minutes": 30,
+      "max_passes_per_day": 8,
+      "_max_passes_8_note": "Details removed from the public copy.",
+      "_max_passes_per_day_note": "HARD CAP on how many times llm_intraday_agent may ASK the LLM per IST day (one 'pass' = one LLM call, which returns up to max_ideas_per_llm_call ideas). Counted from DB table llm_call_log (written before each call), so restarts cannot reset it and a call killed mid-flight still counts. The first call of the day is the baseline pass at schedules.llm_intraday_first_pass. If the count cannot be read, no call is made. Was 8 (and ignored across restarts: 13 passes ran on 09-22 and 09-23).",
+      "re_offer_minutes": 60,
+      "features_max_age_seconds": 900,
+      "_note": "Details removed from the public copy."
+    },
+    "max_trades_per_day": 3,
+    "idea_ttl_minutes": 15,
+    "entry_tolerance_pct": 0.4,
+    "max_entry_drift_pct": 0.5,
+    "min_stop_pct": 0.5,
+    "min_stop_atr_mult": 2.0,
+    "max_stop_pct": 2.5,
+    "min_reward_risk": 1.8,
+    "min_target_pct": 0.6,
+    "reach_mult": 0.0,
+    "allowed_directions": [
+      "LONG",
+      "SHORT"
+    ],
+    "_allowed_directions_note": "Details removed from the public copy.",
+    "block_counter_trend_shorts": true,
+    "direction_gates_enabled": false,
+    "_direction_gates_enabled_note": "Details removed from the public copy.",
+    "_block_counter_trend_shorts_note": "Details removed from the public copy.",
+    "_reach_mult_note": "Details removed from the public copy.",
+    "memory_trades": 20,
+    "llm_timeout_secs": 90,
+    "_note": "Details removed from the public copy."
+  },
+  "exit_defaults": {
+    "enabled": true,
+    "_note": "Details removed from the public copy.",
+    "swing": {
+      "breakeven_at_r": 1.0,
+      "partial_book_r": 1.5,
+      "trail_activation_r": 1.0,
+      "trailing_stop": {
+        "method": "chandelier",
+        "chandelier_period": 22,
+        "chandelier_multiplier": 2.5
+      }
+    },
+    "intraday": {
+      "breakeven_at_r": 1.0,
+      "partial_book_r": 1.0,
+      "trail_activation_r": 1.5,
+      "trailing_stop": {
+        "method": "atr_trail",
+        "atr_period": 14,
+        "atr_multiplier": 2.0
+      }
+    }
+  },
+  "fundamentals": {
+    "enabled": true,
+    "source": "yfinance",
+    "refresh_hour_ist": 8
+  },
+  "ask_mode": {
+    "enabled": false,
+    "timeout_minutes": 30,
+    "auto_reject_on_timeout": true,
+    "min_rank_to_surface": 2,
+    "show_full_reasoning": true
+  }
+}

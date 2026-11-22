@@ -1,0 +1,36 @@
+{
+  "regime": {
+    "detection_interval_minutes": 5,
+    "vix_bull_max": 18,
+    "vix_bear_min": 25,
+    "breadth_bull_min_pct": 60,
+    "ema_periods": [50, 200],
+    "unknown_regime_go_cash": true
+  },
+  "rs_ranking": {
+    "compute_interval_minutes": 30,
+    "lookback_days": 252,
+    "top_n": 20,
+    "blacklist_bottom_pct": 20
+  },
+  "strategy_health": {
+    "evaluation_window_trades": 20,
+    "degraded_win_rate_threshold": 0.40,
+    "suspended_win_rate_threshold": 0.30,
+    "recovery_window_trades": 10,
+    "min_trades_for_suspension": 10
+  },
+  "learning": {
+    "autopsy_enabled": true,
+    "causal_memory_enabled": false,
+    "pattern_min_sample_size": 15,
+    "promotion_min_paper_trades": 20,
+    "promotion_min_win_rate": 0.55,
+    "promotion_min_profit_factor": 1.5
+  },
+  "calibration": {
+    "weekly_calibration_enabled": true,
+    "confidence_buckets": [0.5, 0.6, 0.7, 0.8, 0.9],
+    "recalibrate_on_brier_above": 0.25
+  }
+}

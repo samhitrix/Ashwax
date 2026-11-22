@@ -1,0 +1,32 @@
+{
+  "sources": {
+    "rss_feeds": [
+      {"name": "ET Markets",        "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
+      {"name": "MoneyControl",      "url": "https://www.moneycontrol.com/rss/business.xml"},
+      {"name": "Business Standard", "url": "https://www.business-standard.com/rss/markets-106.rss"},
+      {"name": "Livemint",          "url": "https://www.livemint.com/rss/markets"},
+      {"name": "Google News IN",    "url": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pKVGlnQVAB?hl=en-IN&gl=IN&ceid=IN:en"},
+      {"name": "CNBC TV18",         "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml"}
+    ],
+    "nse_enabled": true,
+    "bse_enabled": true,
+    "poll_interval_seconds": 300,
+    "dedup_window_minutes": 60
+  },
+  "impact_rules": {
+    "halt_keywords": ["SEBI", "investigation", "fraud", "ban", "suspended","RBI"],
+    "boost_keywords": ["beats estimates", "record profit", "upgrade", "buyback"],
+    "avoid_keywords": ["NPA", "downgrade", "miss", "probe"],
+    "avoid_duration_minutes": 120
+  },
+  "blackouts": {
+    "earnings_pre_hours": 24,
+    "earnings_post_hours": 4,
+    "rbi_policy_blackout": true,
+    "budget_blackout": true
+  },
+  "classifier": {
+    "timeout_seconds": 5,
+    "fallback_to_keyword": true
+  }
+}
